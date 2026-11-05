@@ -1,0 +1,285 @@
+[
+  {
+    "id": "gh360_1793898513376_zrtva",
+    "candidateId": "cand_nathanael_mesmer_example_com",
+    "createdAt": "2026-11-05T17:08:33.490Z",
+    "maxDurationSeconds": 600,
+    "candidateName": "Nathanael Mesmer",
+    "candidateEmail": "nathanael.mesmer@example.com",
+    "resumeFileName": "Nathanael_Mesmer_Customer_Service_Resume.pdf",
+    "detectedRole": "Customer Service",
+    "candidateExperienceSummary": "Resume examined for the Customer Service position with 3 essential skills selected.",
+    "keySkills": [
+      "CRM Management",
+      "Customer Support",
+      "Email and Chat Support"
+    ],
+    "questions": [
+      {
+        "id": "cs_q5",
+        "number": 1,
+        "category": "Value Proposition & Professionalism",
+        "question": "Why should we hire you?",
+        "expectedFocus": "Strong communication, patience, and focus on solving customer problems; representing the company with professionalism and accuracy; quick learning of systems/processes; and dependability/commitment to positive customer experience.",
+        "proposedAnswer": "You should hire me because I bring strong communication, patience and a genuine focus on solving customer problems. I understand that customer service represents the company, so I take professionalism and accuracy seriously. I’m also willing to learn new systems and processes quickly. I would bring a dependable attitude, a willingness to improve and a strong commitment to giving customers a positive experience.",
+        "isBehavioralStar": false
+      },
+      {
+        "id": "cs_q6",
+        "number": 2,
+        "category": "De-Escalation & Difficult Customers (STAR)",
+        "question": "Tell me about a time you dealt with a difficult customer.",
+        "expectedFocus": "STAR example: Situation/Task with a frustrated customer, Action of listening without interrupting, apologizing, checking details and explaining options within policy, and Result of following up to end on a positive note.",
+        "proposedAnswer": "Situation: A customer contacted us frustrated because an order had not arrived when expected. Task: My responsibility was to understand what happened and help resolve the issue while following our procedures. Action: I listened carefully without interrupting, apologized for the inconvenience, checked the order information and explained the options available. I also followed up to make sure the correct next step was completed. Result: The customer accepted the solution and the conversation ended much more positively. It reinforced for me that listening and clear communication are extremely important when dealing with difficult situations.",
+        "isBehavioralStar": true
+      },
+      {
+        "id": "cs_q9",
+        "number": 3,
+        "category": "Complex Problem Solving (STAR)",
+        "question": "Describe a time you solved a difficult problem.",
+        "expectedFocus": "STAR example: Complex issue beyond standard first step, gathering details and researching resources/asking for clarification, explaining the solution and next steps clearly, and resolving the problem.",
+        "proposedAnswer": "Situation: I once handled a customer issue that could not be resolved through the normal first step. Task: I needed to find a practical solution without giving the customer inaccurate information. Action: I gathered the relevant details, checked our available resources, reviewed the possible options and asked for clarification when necessary. I then explained the solution and next steps clearly to the customer. Result: The issue was resolved, and the experience helped me become more comfortable researching problems instead of immediately assuming there was no solution.",
+        "isBehavioralStar": true
+      },
+      {
+        "id": "cs_q8",
+        "number": 4,
+        "category": "Accountability & Mistake Recovery (STAR)",
+        "question": "Tell me about a time you made a mistake with a customer.",
+        "expectedFocus": "STAR example: Honest mistake with a customer, taking immediate ownership instead of hiding it, verifying the correct procedure and updating the customer promptly, and changing habits to prevent repeating the mistake.",
+        "proposedAnswer": "Situation: I once gave a customer incorrect information because I misunderstood part of a process. Task: As soon as I realized the mistake, my responsibility was to correct it quickly and make sure the customer had accurate information. Action: I verified the correct procedure, acknowledged my mistake rather than trying to hide it, contacted the customer with the corrected information and reviewed the process afterward. Result: The customer received the correct guidance, and I changed the way I verified information so I would be less likely to make the same mistake again.",
+        "isBehavioralStar": true
+      },
+      {
+        "id": "cs_q7",
+        "number": 5,
+        "category": "Working Under Pressure (STAR)",
+        "question": "Tell me about a time you had to work under pressure.",
+        "expectedFocus": "STAR example: High-volume or urgent situation, organizing requests by urgency, communicating clearly instead of rushing inaccurate answers, and completing priority work on time with accuracy.",
+        "proposedAnswer": "Situation: During a particularly busy period, our team received a much higher volume of customer requests than normal. Task: I needed to keep responses moving while making sure customers received accurate information. Action: I organized requests by urgency, handled the most time-sensitive issues first and used our available resources to work efficiently. When something required additional research, I communicated that clearly instead of rushing an incorrect answer. Result: I was able to complete the priority work on time while maintaining professional communication and accuracy.",
+        "isBehavioralStar": true
+      }
+    ],
+    "status": "completed_success",
+    "currentPhase": "finished",
+    "currentQuestionIndex": 4,
+    "currentQuestionAttempts": 1,
+    "questionEvaluations": [
+      {
+        "questionId": "cs_q5",
+        "questionNumber": 1,
+        "category": "Value Proposition & Professionalism",
+        "questionText": "Why should we hire you?",
+        "proposedAnswer": "You should hire me because I bring strong communication, patience and a genuine focus on solving customer problems. I understand that customer service represents the company, so I take professionalism and accuracy seriously. I’m also willing to learn new systems and processes quickly. I would bring a dependable attitude, a willingness to improve and a strong commitment to giving customers a positive experience.",
+        "candidateAnswer": "You should hire me because I bring strong communication, patience and a genuine focus on solving customer problems. I understand that customer service represents the company, so I take professionalism and accuracy seriously. I’m also willing to learn new systems and processes quickly. I would bring a dependable attitude, a willingness to improve and a strong commitment to giving customers a positive experience.",
+        "attemptsUsed": 1,
+        "timedOut": false,
+        "scoreOutOf5": 5,
+        "feedback": "Excellent response (5/5)! Your answer aligns closely in meaning and structure with our marking guide for \"Why should we hire you?\".",
+        "strengths": [
+          "Strong communication, patience & genuine focus on solving customer problems",
+          "Representing the company with professionalism and accuracy",
+          "Willingness to learn new systems, tools, and processes quickly"
+        ],
+        "improvementTip": "Excellent alignment with the Global Hire 360 marking guide for Value Proposition & Professionalism."
+      },
+      {
+        "questionId": "cs_q6",
+        "questionNumber": 2,
+        "category": "De-Escalation & Difficult Customers (STAR)",
+        "questionText": "Tell me about a time you dealt with a difficult customer.",
+        "proposedAnswer": "Situation: A customer contacted us frustrated because an order had not arrived when expected. Task: My responsibility was to understand what happened and help resolve the issue while following our procedures. Action: I listened carefully without interrupting, apologized for the inconvenience, checked the order information and explained the options available. I also followed up to make sure the correct next step was completed. Result: The customer accepted the solution and the conversation ended much more positively. It reinforced for me that listening and clear communication are extremely important when dealing with difficult situations.",
+        "candidateAnswer": "Situation: A customer contacted us frustrated because an order had not arrived when expected. Task: My responsibility was to understand what happened and help resolve the issue while following our procedures. Action: I listened carefully without interrupting, apologized for the inconvenience, checked the order information and explained the options available. I also followed up to make sure the correct next step was completed. Result: The customer accepted the solution and the conversation ended much more positively. It reinforced for me that listening and clear communication are extremely important when dealing with difficult situations.",
+        "attemptsUsed": 1,
+        "timedOut": false,
+        "scoreOutOf5": 5,
+        "feedback": "Excellent response (5/5)! Your answer aligns closely in meaning and structure with our marking guide for \"Tell me about a time you dealt with a difficult customer.\".",
+        "strengths": [
+          "Clear Situation/Task: frustrated or upset customer with a specific issue",
+          "Empathetic Action: listened carefully without interrupting & apologized",
+          "Resolution Action: investigated details, followed procedures & explained options"
+        ],
+        "improvementTip": "Excellent alignment with the Global Hire 360 marking guide for De-Escalation & Difficult Customers (STAR)."
+      },
+      {
+        "questionId": "cs_q9",
+        "questionNumber": 3,
+        "category": "Complex Problem Solving (STAR)",
+        "questionText": "Describe a time you solved a difficult problem.",
+        "proposedAnswer": "Situation: I once handled a customer issue that could not be resolved through the normal first step. Task: I needed to find a practical solution without giving the customer inaccurate information. Action: I gathered the relevant details, checked our available resources, reviewed the possible options and asked for clarification when necessary. I then explained the solution and next steps clearly to the customer. Result: The issue was resolved, and the experience helped me become more comfortable researching problems instead of immediately assuming there was no solution.",
+        "candidateAnswer": "Situation: I once handled a customer issue that could not be resolved through the normal first step. Task: I needed to find a practical solution without giving the customer inaccurate information. Action: I gathered the relevant details, checked our available resources, reviewed the possible options and asked for clarification when necessary. I then explained the solution and next steps clearly to the customer. Result: The issue was resolved, and the experience helped me become more comfortable researching problems instead of immediately assuming there was no solution.",
+        "attemptsUsed": 1,
+        "timedOut": false,
+        "scoreOutOf5": 5,
+        "feedback": "Excellent response (5/5)! Your answer aligns closely in meaning and structure with our marking guide for \"Describe a time you solved a difficult problem.\".",
+        "strengths": [
+          "Clear Situation/Task: complex or non-standard customer problem requiring deeper investigation",
+          "Investigation Action: gathered details, researched resources & asked for clarification",
+          "Communication Action: explained the practical solution and clear next steps to the customer"
+        ],
+        "improvementTip": "Excellent alignment with the Global Hire 360 marking guide for Complex Problem Solving (STAR)."
+      },
+      {
+        "questionId": "cs_q8",
+        "questionNumber": 4,
+        "category": "Accountability & Mistake Recovery (STAR)",
+        "questionText": "Tell me about a time you made a mistake with a customer.",
+        "proposedAnswer": "Situation: I once gave a customer incorrect information because I misunderstood part of a process. Task: As soon as I realized the mistake, my responsibility was to correct it quickly and make sure the customer had accurate information. Action: I verified the correct procedure, acknowledged my mistake rather than trying to hide it, contacted the customer with the corrected information and reviewed the process afterward. Result: The customer received the correct guidance, and I changed the way I verified information so I would be less likely to make the same mistake again.",
+        "candidateAnswer": "Situation: I once gave a customer incorrect information because I misunderstood part of a process. Task: As soon as I realized the mistake, my responsibility was to correct it quickly and make sure the customer had accurate information. Action: I verified the correct procedure, acknowledged my mistake rather than trying to hide it, contacted the customer with the corrected information and reviewed the process afterward. Result: The customer received the correct guidance, and I changed the way I verified information so I would be less likely to make the same mistake again.",
+        "attemptsUsed": 1,
+        "timedOut": false,
+        "scoreOutOf5": 5,
+        "feedback": "Excellent response (5/5)! Your answer aligns closely in meaning and structure with our marking guide for \"Tell me about a time you made a mistake with a customer.\".",
+        "strengths": [
+          "Clear Situation/Task: honest example of a mistake or misunderstanding and responsibility to fix it",
+          "Accountability Action: acknowledged and owned the mistake instead of hiding it",
+          "Correction Action: verified the right procedure and contacted the customer with accurate info"
+        ],
+        "improvementTip": "Excellent alignment with the Global Hire 360 marking guide for Accountability & Mistake Recovery (STAR)."
+      },
+      {
+        "questionId": "cs_q7",
+        "questionNumber": 5,
+        "category": "Working Under Pressure (STAR)",
+        "questionText": "Tell me about a time you had to work under pressure.",
+        "proposedAnswer": "Situation: During a particularly busy period, our team received a much higher volume of customer requests than normal. Task: I needed to keep responses moving while making sure customers received accurate information. Action: I organized requests by urgency, handled the most time-sensitive issues first and used our available resources to work efficiently. When something required additional research, I communicated that clearly instead of rushing an incorrect answer. Result: I was able to complete the priority work on time while maintaining professional communication and accuracy.",
+        "candidateAnswer": "Situation: During a particularly busy period, our team received a much higher volume of customer requests than normal. Task: I needed to keep responses moving while making sure customers received accurate information. Action: I organized requests by urgency, handled the most time-sensitive issues first and used our available resources to work efficiently. When something required additional research, I communicated that clearly instead of rushing an incorrect answer. Result: I was able to complete the priority work on time while maintaining professional communication and accuracy.",
+        "attemptsUsed": 1,
+        "timedOut": false,
+        "scoreOutOf5": 5,
+        "feedback": "Excellent response (5/5)! Your answer aligns closely in meaning and structure with our marking guide for \"Tell me about a time you had to work under pressure.\".",
+        "strengths": [
+          "Clear Situation/Task: high volume of customer requests or tight deadline",
+          "Triage Action: organized requests by urgency and handled time-sensitive issues first",
+          "Quality Action: used resources efficiently & communicated clearly rather than rushing wrong answers"
+        ],
+        "improvementTip": "Excellent alignment with the Global Hire 360 marking guide for Working Under Pressure (STAR)."
+      }
+    ],
+    "transcript": [
+      {
+        "id": "tr_1793898513490",
+        "speaker": "interviewer",
+        "speakerName": "Global Hire 360 AI Interviewer",
+        "text": "Hello Nathanael Mesmer! Welcome to the Global Hire 360 live interview room. I have reviewed your resume for the Customer Service position. Before we dive into our five interview questions, how are you doing today?",
+        "timestamp": "2026-11-05T17:08:33.490Z",
+        "eventTag": "greeting"
+      },
+      {
+        "id": "tr_1793898513777_c",
+        "speaker": "candidate",
+        "speakerName": "Nathanael Mesmer",
+        "text": "I am doing great today, thank you! Ready for the questions.",
+        "timestamp": "2026-11-05T17:08:33.777Z",
+        "eventTag": "answer"
+      },
+      {
+        "id": "tr_1793898513777_i",
+        "speaker": "interviewer",
+        "speakerName": "Global Hire 360 AI Interviewer",
+        "text": "That's wonderful to hear, Nathanael Mesmer! Let's get started with your interview for the Customer Service position. Remember, our interview session is up to 10 minutes maximum, and you have 90 seconds for each of the 5 questions. Here is Question 1 of 5: Why should we hire you?",
+        "timestamp": "2026-11-05T17:08:33.777Z",
+        "questionIndex": 0,
+        "eventTag": "question"
+      },
+      {
+        "id": "tr_1793898513780_c",
+        "speaker": "candidate",
+        "speakerName": "Nathanael Mesmer",
+        "text": "You should hire me because I bring strong communication, patience and a genuine focus on solving customer problems. I understand that customer service represents the company, so I take professionalism and accuracy seriously. I’m also willing to learn new systems and processes quickly. I would bring a dependable attitude, a willingness to improve and a strong commitment to giving customers a positive experience.",
+        "timestamp": "2026-11-05T17:08:33.780Z",
+        "questionIndex": 0,
+        "eventTag": "answer"
+      },
+      {
+        "id": "tr_1793898513782_i",
+        "speaker": "interviewer",
+        "speakerName": "Global Hire 360 AI Interviewer",
+        "text": "Thank you for sharing that, Nathanael Mesmer. Let's move on to Question 2 of 5 (De-Escalation & Difficult Customers (STAR)): Tell me about a time you dealt with a difficult customer.",
+        "timestamp": "2026-11-05T17:08:33.782Z",
+        "questionIndex": 1,
+        "eventTag": "question"
+      },
+      {
+        "id": "tr_1793898513966_c",
+        "speaker": "candidate",
+        "speakerName": "Nathanael Mesmer",
+        "text": "Situation: A customer contacted us frustrated because an order had not arrived when expected. Task: My responsibility was to understand what happened and help resolve the issue while following our procedures. Action: I listened carefully without interrupting, apologized for the inconvenience, checked the order information and explained the options available. I also followed up to make sure the correct next step was completed. Result: The customer accepted the solution and the conversation ended much more positively. It reinforced for me that listening and clear communication are extremely important when dealing with difficult situations.",
+        "timestamp": "2026-11-05T17:08:33.966Z",
+        "questionIndex": 1,
+        "eventTag": "answer"
+      },
+      {
+        "id": "tr_1793898513969_i",
+        "speaker": "interviewer",
+        "speakerName": "Global Hire 360 AI Interviewer",
+        "text": "Thank you for sharing that, Nathanael Mesmer. Let's move on to Question 3 of 5 (Complex Problem Solving (STAR)): Describe a time you solved a difficult problem.",
+        "timestamp": "2026-11-05T17:08:33.969Z",
+        "questionIndex": 2,
+        "eventTag": "question"
+      },
+      {
+        "id": "tr_1793898514194_c",
+        "speaker": "candidate",
+        "speakerName": "Nathanael Mesmer",
+        "text": "Situation: I once handled a customer issue that could not be resolved through the normal first step. Task: I needed to find a practical solution without giving the customer inaccurate information. Action: I gathered the relevant details, checked our available resources, reviewed the possible options and asked for clarification when necessary. I then explained the solution and next steps clearly to the customer. Result: The issue was resolved, and the experience helped me become more comfortable researching problems instead of immediately assuming there was no solution.",
+        "timestamp": "2026-11-05T17:08:34.194Z",
+        "questionIndex": 2,
+        "eventTag": "answer"
+      },
+      {
+        "id": "tr_1793898514195_i",
+        "speaker": "interviewer",
+        "speakerName": "Global Hire 360 AI Interviewer",
+        "text": "Thank you for sharing that, Nathanael Mesmer. Let's move on to Question 4 of 5 (Accountability & Mistake Recovery (STAR)): Tell me about a time you made a mistake with a customer.",
+        "timestamp": "2026-11-05T17:08:34.195Z",
+        "questionIndex": 3,
+        "eventTag": "question"
+      },
+      {
+        "id": "tr_1793898514457_c",
+        "speaker": "candidate",
+        "speakerName": "Nathanael Mesmer",
+        "text": "Situation: I once gave a customer incorrect information because I misunderstood part of a process. Task: As soon as I realized the mistake, my responsibility was to correct it quickly and make sure the customer had accurate information. Action: I verified the correct procedure, acknowledged my mistake rather than trying to hide it, contacted the customer with the corrected information and reviewed the process afterward. Result: The customer received the correct guidance, and I changed the way I verified information so I would be less likely to make the same mistake again.",
+        "timestamp": "2026-11-05T17:08:34.457Z",
+        "questionIndex": 3,
+        "eventTag": "answer"
+      },
+      {
+        "id": "tr_1793898514458_i",
+        "speaker": "interviewer",
+        "speakerName": "Global Hire 360 AI Interviewer",
+        "text": "Thank you for sharing that, Nathanael Mesmer. Let's move on to Question 5 of 5 (Working Under Pressure (STAR)): Tell me about a time you had to work under pressure.",
+        "timestamp": "2026-11-05T17:08:34.458Z",
+        "questionIndex": 4,
+        "eventTag": "question"
+      },
+      {
+        "id": "tr_1793898514689_c",
+        "speaker": "candidate",
+        "speakerName": "Nathanael Mesmer",
+        "text": "Situation: During a particularly busy period, our team received a much higher volume of customer requests than normal. Task: I needed to keep responses moving while making sure customers received accurate information. Action: I organized requests by urgency, handled the most time-sensitive issues first and used our available resources to work efficiently. When something required additional research, I communicated that clearly instead of rushing an incorrect answer. Result: I was able to complete the priority work on time while maintaining professional communication and accuracy.",
+        "timestamp": "2026-11-05T17:08:34.689Z",
+        "questionIndex": 4,
+        "eventTag": "answer"
+      },
+      {
+        "id": "tr_1793898514691_final",
+        "speaker": "interviewer",
+        "speakerName": "Global Hire 360 AI Interviewer",
+        "text": "Congratulations, Nathanael Mesmer! You completed all five questions for the Customer Service position with an impressive score of 25 out of 25 (100%). Your responses made strong sense and aligned well with our Global Hire 360 marking guide—you were successful in this interview assessment! I have sent your full scorecard and voice transcript to nathanael.mesmer@example.com.",
+        "timestamp": "2026-11-05T17:08:34.691Z",
+        "eventTag": "closing"
+      }
+    ],
+    "totalScoreOutOf25": 25,
+    "maxScore": 25,
+    "percentageScore": 100,
+    "successful": true,
+    "interviewerFinalImpression": "Congratulations, Nathanael Mesmer! You completed all five questions for the Customer Service position with an impressive score of 25 out of 25 (100%). Your responses made strong sense and aligned well with our Global Hire 360 marking guide—you were successful in this interview assessment! I have sent your full scorecard and voice transcript to nathanael.mesmer@example.com.",
+    "emailSent": false,
+    "supabaseSaved": true,
+    "completedAt": "2026-11-05T17:08:34.691Z"
+  }
+]

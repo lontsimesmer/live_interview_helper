@@ -1,0 +1,6 @@
+{
+  "name": "Global Hire 360 — Live Interview & Candidate Readiness Suite",
+  "description": "Interactive live AI voice interview room, resume analyser, and candidate evaluation platform built for Global Hire 360.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
