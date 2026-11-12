@@ -22,3 +22,25 @@
     font-variant-numeric: tabular-nums;
   }
 }
+
+@keyframes candidate-concentric-ripple {
+  0% {
+    transform: scale(0.35);
+    opacity: 0.95;
+  }
+  35% {
+    opacity: 0.85;
+  }
+  100% {
+    transform: scale(var(--ripple-max-scale, 2.35));
+    opacity: 0;
+  }
+}
+
+.candidate-acoustic-avatar .candidate-ripple-ring {
+  transform-origin: 120px 120px;
+  animation-name: candidate-concentric-ripple;
+  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  animation-iteration-count: infinite;
+}
+

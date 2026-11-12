@@ -2,6 +2,35 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      (function () {
+        window.addEventListener(
+          'unhandledrejection',
+          function (event) {
+            var reasonStr = String((event && event.reason && (event.reason.message || event.reason)) || '');
+            if (
+              reasonStr.indexOf('WebSocket closed without opened') !== -1 ||
+              reasonStr.indexOf('failed to connect to websocket') !== -1
+            ) {
+              event.preventDefault();
+              event.stopImmediatePropagation();
+            }
+          },
+          true
+        );
+        var origError = console.error;
+        console.error = function () {
+          var firstArg = arguments.length > 0 ? String(arguments[0] || '') : '';
+          if (
+            firstArg.indexOf('[vite] failed to connect to websocket') !== -1 ||
+            firstArg.indexOf('WebSocket closed without opened') !== -1
+          ) {
+            return;
+          }
+          return origError.apply(console, arguments);
+        };
+      })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Global Hire 360 — Live Interview &amp; Candidate Readiness Suite</title>
     <meta name="description" content="Interactive live interview simulator, page analyser, and candidate workshop evaluator built for the Global Hire 360 remote talent placement platform." />
@@ -12,13 +41,6 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
-    <script>
-      window.addEventListener('unhandledrejection', function (event) {
-        if (event && event.reason && String(event.reason.message || event.reason).includes('WebSocket closed without opened')) {
-          event.preventDefault();
-        }
-      });
-    </script>
   </head>
   <body class="bg-white text-slate-900 antialiased selection:bg-[#041E41] selection:text-white">
     <div id="root"></div>

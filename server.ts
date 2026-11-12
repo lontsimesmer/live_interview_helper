@@ -1,23 +1,166 @@
 import express from 'express';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { GoogleGenAI, Type, Modality, FunctionDeclaration } from '@google/genai';
+import {
+  GoogleGenAI,
+  Type,
+  Modality,
+  FunctionDeclaration,
+} from '@google/genai';
 import dotenv from 'dotenv';
+import {
+  ANSWER_STARTED_WORDS,
+  LIVE_MODELS,
+  LIVE_NOTES,
+  TURN_END_SILENCE_MS,
+  buildInterviewerPrompt,
+  buildLiveVoiceConfig,
+  interviewerTextAsksQuestion,
+  recentSpeechAsksQuestion,
+} from './interviewer-agent';
 import mammoth from 'mammoth';
 import path from 'path';
 import fs from 'fs';
 import zlib from 'zlib';
+import crypto from 'crypto';
+import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: '30mb' }));
+// ============================================================================
+// 0. BACKEND SECURITY: headers, body limits, rate limiting, admin & session auth
+// ============================================================================
+app.disable('x-powered-by');
+app.set('trust proxy', 1); // behind Cloud Run / reverse proxy: use X-Forwarded-For for client IP
+
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), payment=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  next();
+});
+
+// Resumes are sent base64-encoded (~1.37x); 12MB covers a ~8MB document.
+app.use(express.json({ limit: '12mb' }));
+
+/** Minimal fixed-window, per-IP rate limiter (no external dependency). */
+function rateLimit(opts: { windowMs: number; max: number; name: string }): express.RequestHandler {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (v.resetAt <= now) hits.delete(k);
+  }, Math.max(opts.windowMs, 60_000)).unref();
+
+  return (req, res, next) => {
+    const key = `${req.ip || req.socket.remoteAddress || 'unknown'}`;
+    const now = Date.now();
+    const entry = hits.get(key);
+    if (!entry || entry.resetAt <= now) {
+      hits.set(key, { count: 1, resetAt: now + opts.windowMs });
+      return next();
+    }
+    entry.count += 1;
+    if (entry.count > opts.max) {
+      res.setHeader('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: `Too many requests (${opts.name}). Please wait a moment and try again.` });
+    }
+    return next();
+  };
+}
+
+const limitResume = rateLimit({ windowMs: 10 * 60_000, max: 20, name: 'resume' });
+const limitStart = rateLimit({ windowMs: 10 * 60_000, max: 15, name: 'session start' });
+const limitTurn = rateLimit({ windowMs: 60_000, max: 60, name: 'interview turn' });
+const limitTts = rateLimit({ windowMs: 60_000, max: 90, name: 'tts' });
+const limitEmail = rateLimit({ windowMs: 60 * 60_000, max: 10, name: 'email' });
+const limitLookup = rateLimit({ windowMs: 60_000, max: 30, name: 'lookup' });
+
+app.use('/api/examine-resume', limitResume);
+app.use('/api/start-interview-session', limitStart);
+app.use(['/api/interview-turn', '/api/finalize-live-ws-session', '/api/resume-session'], limitTurn);
+app.use('/api/interviewer-tts', limitTts);
+app.use(['/api/candidate-history', '/api/candidate-status', '/api/candidate-profile-picture'], limitLookup);
+
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  return ab.length === bb.length && ab.length > 0 && crypto.timingSafeEqual(ab, bb);
+}
+
+/**
+ * Admin-only endpoints (candidate lists, answer key, DB sync) require ADMIN_API_KEY via the
+ * `x-admin-key` header. If ADMIN_API_KEY is not set, these endpoints are disabled entirely.
+ */
+function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const adminKey = (process.env.ADMIN_API_KEY || '').trim();
+  if (!adminKey || adminKey.length < 16) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  if (!safeEqual(String(req.header('x-admin-key') || ''), adminKey)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  return next();
+}
+
+function generateSessionAccessToken(): string {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function generateSessionId(): string {
+  return `gh360_${Date.now()}_${crypto.randomBytes(9).toString('base64url')}`;
+}
+
+function readSessionToken(req: express.Request): string {
+  return String(req.header('x-session-token') || '').trim();
+}
+
+/** Every session-scoped endpoint must present the session's secret token. */
+function sessionTokenMatches(session: { accessToken?: string } | undefined, token: string): boolean {
+  return Boolean(session?.accessToken) && safeEqual(token, session!.accessToken!);
+}
+
+/**
+ * What the browser is allowed to see of a session: never the access token, and the
+ * suggested answers / marking focus of questions are hidden until the interview is over
+ * (otherwise a candidate could read the answer key from the network tab).
+ */
+function toPublicSession(session: any) {
+  if (!session) return session;
+  const { accessToken: _token, ...rest } = session;
+  const finished = rest.currentPhase === 'finished';
+  return {
+    ...rest,
+    questions: (rest.questions || []).map((q: any) =>
+      finished ? q : { id: q.id, number: q.number, category: q.category, question: q.question, isBehavioralStar: q.isBehavioralStar }
+    ),
+  };
+}
+
+/** Wraps res.json so any `session` field in a response is passed through toPublicSession. */
+app.use((_req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = (body?: any) => {
+    if (body && typeof body === 'object' && !Array.isArray(body) && body.session) {
+      body = { ...body, session: toPublicSession(body.session) };
+    }
+    return originalJson(body);
+  };
+  next();
+});
+
+function clampText(value: unknown, max: number): string {
+  return String(value ?? '').slice(0, max);
+}
 
 // ============================================================================
 // 1. SUPABASE DATABASE CLIENT & PERSISTENCE (Direct PostgREST API)
 // ============================================================================
+let warnedAboutAnonSupabaseKey = false;
+
 function getSupabaseConfig(): { url: string; key: string; projectRef?: string } | null {
   const supabaseUrl = (
     process.env.SUPABASE_URL ||
@@ -29,13 +172,23 @@ function getSupabaseConfig(): { url: string; key: string; projectRef?: string } 
     .trim()
     .replace(/\/+$/, '');
 
-  const supabaseKey = (
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  // The backend must use the service-role key: the hardened schema (supabase-schema.sql)
+  // revokes all table access from the public anon/authenticated roles.
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const anonFallbackKey = (
     process.env.SUPABASE_ANON_KEY ||
     process.env.VITE_SUPABASE_ANON_KEY ||
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
     ''
   ).trim();
+  if (!serviceRoleKey && anonFallbackKey && !warnedAboutAnonSupabaseKey) {
+    warnedAboutAnonSupabaseKey = true;
+    console.warn(
+      'SECURITY: SUPABASE_SERVICE_ROLE_KEY is not set; falling back to the public anon key. ' +
+        'After applying the hardened supabase-schema.sql, anon writes are rejected — set SUPABASE_SERVICE_ROLE_KEY.'
+    );
+  }
+  const supabaseKey = serviceRoleKey || anonFallbackKey;
 
   if (
     supabaseUrl &&
@@ -115,7 +268,16 @@ export interface TranscriptEntry {
   text: string;
   timestamp: string;
   questionIndex?: number;
-  eventTag?: 'greeting' | 'question' | 'rephrase' | 'timeout' | 'termination' | 'closing' | 'answer';
+  eventTag?:
+    | 'greeting'
+    | 'question'
+    | 'rephrase'
+    | 'timeout'
+    | 'termination'
+    | 'closing'
+    | 'answer'
+    | 'misconduct_warning'
+    | 'misconduct_termination';
 }
 
 export interface QuestionEvaluation {
@@ -131,12 +293,17 @@ export interface QuestionEvaluation {
   feedback: string;
   strengths: string[];
   improvementTip: string;
+  alignmentPercent?: number;
+  matchedPoints?: string[];
+  missedPoints?: string[];
+  gradingMethod?: string;
 }
 
 export interface CandidateRecord {
   id: string;
   fullName: string;
   email: string;
+  googleAvatarUrl?: string;
   resumeFileName: string;
   extractedJobPosition: string;
   confirmedJobPosition: string;
@@ -146,7 +313,12 @@ export interface CandidateRecord {
   sessionsCount: number;
   latestSessionId?: string;
   latestSessionStatus?: string;
+  latestScoreOutOf20?: number;
   latestScoreOutOf25?: number;
+  completedSessionsCount?: number;
+  normalizedName?: string;
+  suspendedUntil?: string | null;
+  suspensionReason?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -159,6 +331,7 @@ export interface InterviewSessionRecord {
   maxDurationSeconds?: number;
   candidateName: string;
   candidateEmail: string;
+  candidateGoogleAvatarUrl?: string;
   resumeFileName: string;
   detectedRole: string;
   candidateExperienceSummary: string;
@@ -172,17 +345,51 @@ export interface InterviewSessionRecord {
     proposedAnswer?: string;
     isBehavioralStar?: boolean;
   }[];
-  status: 'in_progress' | 'completed_success' | 'completed_unsuccessful' | 'terminated_attempts';
-  currentPhase: 'greeting_how_are_you' | 'questioning' | 'finished';
+  status:
+    | 'in_progress'
+    | 'completed_success'
+    | 'completed_unsuccessful'
+    | 'terminated_attempts'
+    | 'terminated_misconduct'
+    | 'terminated_rules_violation'
+    | 'abandoned';
+  /** Secret bearer token for this session (never sent to Supabase, stripped from API payloads except on creation/resume). */
+  accessToken?: string;
+  /** True once the interview ran over the Gemini Live voice bridge (server builds the transcript). */
+  liveMode?: boolean;
+  /** Why the live call ended, decided by the server (never trusted from the browser). */
+  liveEndReason?:
+    | 'completed_all_questions'
+    | 'time_up'
+    | 'terminated_misconduct'
+    | 'terminated_rules_violation'
+    | 'terminated_after_two_attempts'
+    | 'ended_by_candidate';
+  isFirstTimeCandidate?: boolean;
+  resumedCount?: number;
+  /** Persistent email state so a result email is never sent twice, even across restarts. */
+  emailStatus?: 'not_sent' | 'sending' | 'sent' | 'failed';
+  emailId?: string;
+  currentPhase:
+    | 'greeting_how_are_you'
+    | 'process_walkthrough'
+    | 'questioning'
+    | 'candidate_questions'
+    | 'finished';
   currentQuestionIndex: number;
   currentQuestionAttempts: number;
   questionEvaluations: QuestionEvaluation[];
   transcript: TranscriptEntry[];
+  totalScoreOutOf20: number;
   totalScoreOutOf25: number;
   maxScore: number;
   percentageScore: number;
   successful: boolean;
   interviewerFinalImpression: string;
+  misconductCount?: number;
+  misconductPenaltyPoints?: number;
+  misconductNotes?: string[];
+  suspendedUntil?: string | null;
   emailSent: boolean;
   emailDeliveryNote?: string;
   supabaseSaved?: boolean;
@@ -248,21 +455,435 @@ function buildCandidateIdFromEmail(email: string): string {
   return `cand_${normalized || Date.now()}`;
 }
 
-async function saveCandidateToSupabase(
-  candidate: CandidateRecord
+const verifiedGoogleAvatarCache = new Map<string, string>();
+
+const GOOGLE_ACCOUNT_PALETTE = [
+  '#1A73E8', // Google Blue
+  '#1E8E3E', // Google Green
+  '#D93025', // Google Red
+  '#E37400', // Google Amber
+  '#9334E6', // Google Purple
+  '#00897B', // Google Teal
+  '#C2185B', // Google Magenta
+  '#041E41', // Global Hire 360 Navy
+];
+
+function getGoogleAccountColorForEmail(email: string): string {
+  const clean = (email || '').trim().toLowerCase();
+  let hash = 0;
+  for (let i = 0; i < clean.length; i++) {
+    hash = (hash * 31 + clean.charCodeAt(i)) >>> 0;
+  }
+  return GOOGLE_ACCOUNT_PALETTE[hash % GOOGLE_ACCOUNT_PALETTE.length];
+}
+
+export function findCandidateProfilePicture(
+  email: string,
+  fullName: string
+): {
+  primaryUrl: string;
+  gravatarUrl: string;
+  fallbackAvatarUrl: string;
+  emailHashMd5: string;
+  emailHashSha256: string;
+} {
+  const cleanEmail = (email || '').trim().toLowerCase();
+  const displayName = (fullName || '').trim() || cleanEmail || 'Candidate';
+  const emailHashMd5 = crypto.createHash('md5').update(cleanEmail).digest('hex');
+  const emailHashSha256 = crypto.createHash('sha256').update(cleanEmail).digest('hex');
+
+  const fallbackAvatarUrl = `/api/google-avatar.svg?email=${encodeURIComponent(
+    cleanEmail
+  )}&name=${encodeURIComponent(displayName)}`;
+
+  // Check if we already resolved a real photo for this Google account
+  const cached = cleanEmail ? verifiedGoogleAvatarCache.get(cleanEmail) : undefined;
+  const candidateId = cleanEmail ? buildCandidateIdFromEmail(cleanEmail) : '';
+  const existingCandidate = candidateId ? activeCandidates.get(candidateId) : undefined;
+  const savedCustomUrl =
+    existingCandidate?.googleAvatarUrl &&
+    !existingCandidate.googleAvatarUrl.includes('unavatar.io')
+      ? existingCandidate.googleAvatarUrl
+      : undefined;
+
+  const gravatarWithFallback = `https://www.gravatar.com/avatar/${emailHashMd5}?s=256&d=404`;
+  const primaryUrl = cached || savedCustomUrl || fallbackAvatarUrl;
+
+  return {
+    primaryUrl,
+    gravatarUrl: gravatarWithFallback,
+    fallbackAvatarUrl,
+    emailHashMd5,
+    emailHashSha256,
+  };
+}
+
+async function resolveGoogleAccountProfilePicture(
+  email: string,
+  fullName: string
+): Promise<{
+  primaryUrl: string;
+  source: 'saved_google_photo' | 'google_unavatar' | 'gravatar' | 'github' | 'google_account_monogram';
+  gravatarUrl: string;
+  fallbackAvatarUrl: string;
+  emailHashMd5: string;
+  emailHashSha256: string;
+}> {
+  const base = findCandidateProfilePicture(email, fullName);
+  const cleanEmail = (email || '').trim().toLowerCase();
+  if (!cleanEmail) {
+    return { ...base, source: 'google_account_monogram' };
+  }
+
+  // 1. Check if candidate already uploaded or synced a custom Google profile photo
+  const candidateId = buildCandidateIdFromEmail(cleanEmail);
+  const existingCandidate = activeCandidates.get(candidateId);
+  if (
+    existingCandidate?.googleAvatarUrl &&
+    !existingCandidate.googleAvatarUrl.includes('unavatar.io') &&
+    !existingCandidate.googleAvatarUrl.includes('/api/google-avatar.svg')
+  ) {
+    verifiedGoogleAvatarCache.set(cleanEmail, existingCandidate.googleAvatarUrl);
+    return {
+      ...base,
+      primaryUrl: existingCandidate.googleAvatarUrl,
+      source: 'saved_google_photo',
+    };
+  }
+
+  const cachedUrl = verifiedGoogleAvatarCache.get(cleanEmail);
+  if (cachedUrl && !cachedUrl.includes('/api/google-avatar.svg')) {
+    return {
+      ...base,
+      primaryUrl: cachedUrl,
+      source: 'google_unavatar',
+    };
+  }
+
+  // 2. Query Unavatar Google JSON endpoint and verify it is a REAL user image (not favicon.svg or fallback.png)
+  for (const endpoint of [
+    `https://unavatar.io/google/${encodeURIComponent(cleanEmail)}?json`,
+    `https://unavatar.io/${encodeURIComponent(cleanEmail)}?json`,
+  ]) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2200);
+      const resp = await fetch(endpoint, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'GlobalHire360-ProfileResolver/2.0' },
+      });
+      clearTimeout(timeout);
+      if (resp.ok) {
+        const data: any = await resp.json();
+        const resolvedUrl = String(data?.url || '').trim();
+        if (
+          resolvedUrl &&
+          resolvedUrl.startsWith('http') &&
+          !resolvedUrl.includes('favicon.svg') &&
+          !resolvedUrl.includes('fallback.png') &&
+          !resolvedUrl.includes('unavatar.io/fallback')
+        ) {
+          verifiedGoogleAvatarCache.set(cleanEmail, resolvedUrl);
+          return {
+            ...base,
+            primaryUrl: resolvedUrl,
+            source: 'google_unavatar',
+          };
+        }
+      }
+    } catch {
+      // Continue to next source
+    }
+  }
+
+  // 3. Check Gravatar with d=404 to see if a real profile picture is registered for this Google email
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1800);
+    const gravResp = await fetch(base.gravatarUrl, {
+      method: 'HEAD',
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (gravResp.ok) {
+      verifiedGoogleAvatarCache.set(cleanEmail, base.gravatarUrl);
+      return {
+        ...base,
+        primaryUrl: base.gravatarUrl,
+        source: 'gravatar',
+      };
+    }
+  } catch {
+    // Continue to GitHub check
+  }
+
+  // 4. Check public GitHub profile associated with this Google email
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1800);
+    const ghResp = await fetch(
+      `https://api.github.com/search/users?q=${encodeURIComponent(cleanEmail)}+in:email`,
+      {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'GlobalHire360-ProfileResolver/2.0' },
+      }
+    );
+    clearTimeout(timeout);
+    if (ghResp.ok) {
+      const ghData: any = await ghResp.json();
+      const ghAvatar = ghData?.items?.[0]?.avatar_url;
+      if (ghAvatar && typeof ghAvatar === 'string') {
+        verifiedGoogleAvatarCache.set(cleanEmail, ghAvatar);
+        return {
+          ...base,
+          primaryUrl: ghAvatar,
+          source: 'github',
+        };
+      }
+    }
+  } catch {
+    // Fallback to Google Account monogram SVG
+  }
+
+  return {
+    ...base,
+    primaryUrl: base.fallbackAvatarUrl,
+    source: 'google_account_monogram',
+  };
+}
+
+function buildGoogleProfileAvatarUrl(email: string, fullName: string): string {
+  return findCandidateProfilePicture(email, fullName).primaryUrl;
+}
+
+function getCandidateSuspensionStatus(email: string): {
+  isSuspended: boolean;
+  suspendedUntil?: string;
+  remainingText?: string;
+  reason?: string;
+} {
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!normalizedEmail) return { isSuspended: false };
+
+  const candidateId = buildCandidateIdFromEmail(normalizedEmail);
+  let candidate = activeCandidates.get(candidateId);
+  if (!candidate) {
+    for (const c of activeCandidates.values()) {
+      if (c.email.toLowerCase() === normalizedEmail) {
+        candidate = c;
+        break;
+      }
+    }
+  }
+
+  if (!candidate?.suspendedUntil) return { isSuspended: false };
+
+  const untilMs = new Date(candidate.suspendedUntil).getTime();
+  const nowMs = Date.now();
+  if (Number.isNaN(untilMs) || untilMs <= nowMs) {
+    // Suspension expired -> clear it
+    candidate.suspendedUntil = null;
+    candidate.suspensionReason = null;
+    activeCandidates.set(candidate.id, candidate);
+    flushCandidatesAndSessionsToDisk();
+    return { isSuspended: false };
+  }
+
+  const diffMs = untilMs - nowMs;
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const mins = Math.ceil((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+  const remainingText = `${hours}h ${mins}m`;
+
+  return {
+    isSuspended: true,
+    suspendedUntil: candidate.suspendedUntil,
+    remainingText,
+    reason:
+      candidate.suspensionReason ||
+      'Inappropriate language or professional misconduct during a live interview session.',
+  };
+}
+
+async function suspendCandidateFor24Hours(params: {
+  email: string;
+  candidateId?: string;
+  reason: string;
+}): Promise<string> {
+  const normalizedEmail = params.email.trim().toLowerCase();
+  const candId = params.candidateId || buildCandidateIdFromEmail(normalizedEmail);
+  const suspendedUntilIso = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+  let candidate = activeCandidates.get(candId);
+  if (!candidate) {
+    for (const c of activeCandidates.values()) {
+      if (c.email.toLowerCase() === normalizedEmail) {
+        candidate = c;
+        break;
+      }
+    }
+  }
+
+  if (candidate) {
+    candidate.suspendedUntil = suspendedUntilIso;
+    candidate.suspensionReason = params.reason;
+    candidate.latestSessionStatus = 'terminated_misconduct';
+    candidate.updatedAt = new Date().toISOString();
+    activeCandidates.set(candidate.id, candidate);
+    flushCandidatesAndSessionsToDisk();
+    await saveCandidateToSupabase(candidate);
+  }
+
+  return suspendedUntilIso;
+}
+
+function detectCandidateMisconduct(text: string): {
+  isMisconduct: boolean;
+  severity: 'mild' | 'severe';
+  reason: string;
+} {
+  const clean = (text || '').trim();
+  if (!clean) return { isMisconduct: false, severity: 'mild', reason: '' };
+
+  // Severe profanity, slurs, explicit abuse, or direct insults toward the interviewer
+  const severeRegex =
+    /\b(f+u+c+k+|f+u+c+k+i+n+g+|m+o+t+h+e+r+f+u+c+k+e+r+|b+i+t+c+h+|a+s+s+h+o+l+e+|c+u+n+t+|d+i+c+k+h+e+a+d+|s+l+u+t+|w+h+o+r+e+|b+a+s+t+a+r+d+|n+i+g+g+a+|n+i+g+g+e+r+|f+a+g+g+o+t+|r+e+t+a+r+d+|go\s+to\s+hell|shut\s+the\s+hell\s+up|shut\s+up\s+stupid|you\s+are\s+stupid|you'?re\s+an?\s+idiot|screw\s+you|piss\s+off)\b/i;
+
+  if (severeRegex.test(clean)) {
+    return {
+      isMisconduct: true,
+      severity: 'severe',
+      reason: 'Use of explicit profanity, abusive language, or direct disrespect during the interview.',
+    };
+  }
+
+  // Mild/moderate inappropriate language or vulgarity
+  const mildRegex =
+    /\b(s+h+i+t+|b+u+l+l+s+h+i+t+|d+a+m+n+\s+it|g+o+d+d+a+m+n+|c+r+a+p+|w+t+f+|stfu|lmaoo*\s+this\s+is\s+dumb|this\s+interview\s+is\s+stupid|you\s+suck|what\s+a\s+dumb\s+question)\b/i;
+
+  if (mildRegex.test(clean)) {
+    return {
+      isMisconduct: true,
+      severity: 'mild',
+      reason: 'Use of unprofessional or inappropriate language during the interview session.',
+    };
+  }
+
+  return { isMisconduct: false, severity: 'mild', reason: '' };
+}
+
+// ----------------------------------------------------------------------------
+// Identity normalization (used for duplicate detection)
+// ----------------------------------------------------------------------------
+export function normalizeEmail(email: string): string {
+  return String(email || '').trim().toLowerCase();
+}
+
+export function isValidEmail(email: string): boolean {
+  const e = normalizeEmail(email);
+  return e.length <= 254 && /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[a-z]{2,}$/i.test(e);
+}
+
+/** "  JOHN   o'Neil-Smith " -> "john o'neil-smith" (accents stripped, whitespace collapsed). */
+export function normalizePersonName(name: string): string {
+  return String(name || '')
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9' -]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ----------------------------------------------------------------------------
+// Generic PostgREST upsert that tolerates older tables missing newer columns
+// ----------------------------------------------------------------------------
+async function postgrestUpsert(
+  table: string,
+  rows: Record<string, unknown> | Record<string, unknown>[],
+  onConflict: string,
+  optionalColumns: string[] = []
 ): Promise<{ saved: boolean; error?: string }> {
   const config = getSupabaseConfig();
   if (!config) {
     return {
       saved: false,
-      error: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/SUPABASE_ANON_KEY are not configured yet.',
+      error: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not configured yet.',
     };
   }
 
+  const send = (body: unknown) =>
+    fetch(`${config.url}/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflict)}`, {
+      method: 'POST',
+      headers: {
+        apikey: config.key,
+        Authorization: `Bearer ${config.key}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=minimal',
+      },
+      body: JSON.stringify(body),
+    });
+
   try {
-    const payload = {
+    let response = await send(rows);
+    if (!response.ok && optionalColumns.length > 0) {
+      const errText = await response.text();
+      // PGRST204 = column not found in schema cache (table created before this column existed)
+      if (/PGRST204|column|schema cache/i.test(errText)) {
+        const strip = (r: Record<string, unknown>) => {
+          const copy = { ...r };
+          for (const col of optionalColumns) delete copy[col];
+          return copy;
+        };
+        console.warn(
+          `Supabase ${table}: newer columns missing (run supabase-schema.sql to add them). Retrying without: ${optionalColumns.join(', ')}`
+        );
+        response = await send(Array.isArray(rows) ? rows.map(strip) : strip(rows));
+      } else {
+        console.warn(`Supabase ${table} upsert warning:`, errText);
+        return { saved: false, error: errText };
+      }
+    }
+    if (!response.ok) {
+      const errText = await response.text();
+      console.warn(`Supabase ${table} upsert warning:`, errText);
+      return { saved: false, error: errText };
+    }
+    return { saved: true };
+  } catch (err: any) {
+    console.warn(`Supabase ${table} request exception:`, err?.message || err);
+    return { saved: false, error: err?.message || `Supabase ${table} request failed` };
+  }
+}
+
+async function postgrestSelect<T = any>(pathAndQuery: string): Promise<T[] | null> {
+  const config = getSupabaseConfig();
+  if (!config) return null;
+  try {
+    const resp = await fetch(`${config.url}/rest/v1/${pathAndQuery}`, {
+      method: 'GET',
+      headers: {
+        apikey: config.key,
+        Authorization: `Bearer ${config.key}`,
+        Accept: 'application/json',
+      },
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return Array.isArray(data) ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveCandidateToSupabase(
+  candidate: CandidateRecord
+): Promise<{ saved: boolean; error?: string }> {
+  return postgrestUpsert(
+    'candidates',
+    {
       id: candidate.id,
       full_name: candidate.fullName,
+      normalized_name: candidate.normalizedName || normalizePersonName(candidate.fullName),
       email: candidate.email,
       resume_file_name: candidate.resumeFileName,
       extracted_job_position: candidate.extractedJobPosition,
@@ -271,38 +892,140 @@ async function saveCandidateToSupabase(
       extracted_skills: candidate.extractedSkills,
       agreed_to_instructions: candidate.agreedToInstructions,
       sessions_count: candidate.sessionsCount,
+      completed_sessions_count: candidate.completedSessionsCount ?? 0,
       latest_session_id: candidate.latestSessionId || null,
       latest_session_status: candidate.latestSessionStatus || 'in_progress',
-      latest_score_out_of_25: candidate.latestScoreOutOf25 ?? 0,
+      latest_score_out_of_20: candidate.latestScoreOutOf20 ?? 0,
+      latest_score_out_of_25: candidate.latestScoreOutOf20 ?? candidate.latestScoreOutOf25 ?? 0,
+      suspended_until: candidate.suspendedUntil || null,
       created_at: candidate.createdAt,
       updated_at: candidate.updatedAt,
-    };
+    },
+    'email',
+    ['normalized_name', 'completed_sessions_count', 'latest_score_out_of_20', 'suspended_until']
+  );
+}
 
-    const response = await fetch(`${config.url}/rest/v1/candidates?on_conflict=email`, {
-      method: 'POST',
-      headers: {
-        apikey: config.key,
-        Authorization: `Bearer ${config.key}`,
-        'Content-Type': 'application/json',
-        Prefer: 'resolution=merge-duplicates,return=minimal',
-      },
-      body: JSON.stringify(payload),
-    });
+function candidateFromSupabaseRow(row: any): CandidateRecord {
+  return {
+    id: row.id,
+    fullName: row.full_name,
+    normalizedName: row.normalized_name || normalizePersonName(row.full_name),
+    email: normalizeEmail(row.email),
+    resumeFileName: row.resume_file_name || '',
+    extractedJobPosition: row.extracted_job_position || '',
+    confirmedJobPosition: row.confirmed_job_position || '',
+    experienceSummary: row.experience_summary || '',
+    extractedSkills: Array.isArray(row.extracted_skills) ? row.extracted_skills : [],
+    agreedToInstructions: Boolean(row.agreed_to_instructions),
+    sessionsCount: Number(row.sessions_count) || 0,
+    completedSessionsCount: Number(row.completed_sessions_count) || 0,
+    latestSessionId: row.latest_session_id || undefined,
+    latestSessionStatus: row.latest_session_status || undefined,
+    latestScoreOutOf20: row.latest_score_out_of_20 != null ? Number(row.latest_score_out_of_20) : undefined,
+    latestScoreOutOf25: row.latest_score_out_of_25 != null ? Number(row.latest_score_out_of_25) : undefined,
+    suspendedUntil: row.suspended_until || null,
+    suspensionReason: null,
+    createdAt: row.created_at || new Date().toISOString(),
+    updatedAt: row.updated_at || new Date().toISOString(),
+  };
+}
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.warn('Supabase candidate upsert warning:', errText);
-      return { saved: false, error: errText };
+function countCompletedSessionsLocally(candidate: CandidateRecord): number {
+  let count = 0;
+  for (const s of activeSessions.values()) {
+    if (
+      (s.candidateId === candidate.id || s.candidateEmail === candidate.email) &&
+      s.currentPhase === 'finished' &&
+      s.status !== 'abandoned'
+    ) {
+      count++;
     }
+  }
+  return count;
+}
 
-    return { saved: true };
-  } catch (err: any) {
-    console.warn('Supabase candidate save exception:', err?.message || err);
-    return { saved: false, error: err?.message || 'Supabase candidate request failed' };
+/**
+ * Recognizes a returning candidate. The email address is the identity key: it is checked
+ * in memory first, then in Supabase (so candidates are recognized after a restart or on
+ * another server instance), and the record is hydrated into memory.
+ * A name match alone is reported (nameMatchesExistingCandidate) but never merged, because
+ * different people can share a name and merging on name would expose someone else's file.
+ */
+async function findExistingCandidate(params: {
+  email: string;
+  name?: string;
+}): Promise<{ candidate: CandidateRecord | null; nameMatchesExistingCandidate: boolean }> {
+  const email = normalizeEmail(params.email);
+  const normalizedName = normalizePersonName(params.name || '');
+  let candidate: CandidateRecord | null = null;
+
+  if (email) {
+    candidate = activeCandidates.get(buildCandidateIdFromEmail(email)) || null;
+    if (!candidate) {
+      for (const c of activeCandidates.values()) {
+        if (normalizeEmail(c.email) === email) {
+          candidate = c;
+          break;
+        }
+      }
+    }
+    if (!candidate) {
+      const rows = await postgrestSelect(
+        `candidates?select=*&email=eq.${encodeURIComponent(email)}&limit=1`
+      );
+      if (rows && rows[0]) {
+        candidate = candidateFromSupabaseRow(rows[0]);
+        activeCandidates.set(candidate.id, candidate);
+        flushCandidatesAndSessionsToDisk();
+      }
+    }
+  }
+
+  if (candidate) {
+    const localCompleted = countCompletedSessionsLocally(candidate);
+    candidate.completedSessionsCount = Math.max(candidate.completedSessionsCount || 0, localCompleted);
+  }
+
+  let nameMatchesExistingCandidate = false;
+  if (!candidate && normalizedName.length >= 3) {
+    for (const c of activeCandidates.values()) {
+      if ((c.normalizedName || normalizePersonName(c.fullName)) === normalizedName) {
+        nameMatchesExistingCandidate = true;
+        break;
+      }
+    }
+    if (!nameMatchesExistingCandidate) {
+      const rows = await postgrestSelect(
+        `candidates?select=id&normalized_name=eq.${encodeURIComponent(normalizedName)}&limit=1`
+      );
+      nameMatchesExistingCandidate = Boolean(rows && rows.length > 0);
+    }
+  }
+
+  return { candidate, nameMatchesExistingCandidate };
+}
+
+/** Serializes check-ins per email so double-clicks / parallel tabs never create two rows. */
+const candidateCheckInLocks = new Map<string, Promise<unknown>>();
+async function withCandidateLock<T>(email: string, fn: () => Promise<T>): Promise<T> {
+  const key = normalizeEmail(email);
+  const previous = candidateCheckInLocks.get(key) || Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((r) => (release = r));
+  const chained = previous.then(() => current);
+  candidateCheckInLocks.set(key, chained);
+  try {
+    await previous.catch(() => undefined);
+    return await fn();
+  } finally {
+    release();
+    if (candidateCheckInLocks.get(key) === chained) candidateCheckInLocks.delete(key);
   }
 }
 
 async function upsertCandidateOnCheckIn(params: {
+  existing: CandidateRecord | null;
   fullName: string;
   email: string;
   resumeFileName: string;
@@ -313,31 +1036,27 @@ async function upsertCandidateOnCheckIn(params: {
   agreedToInstructions: boolean;
   sessionId: string;
 }): Promise<CandidateRecord> {
-  const normalizedEmail = params.email.trim().toLowerCase();
-  const candidateId = buildCandidateIdFromEmail(normalizedEmail);
+  const normalizedEmail = normalizeEmail(params.email);
   const nowIso = new Date().toISOString();
-
-  // Check if candidate already exists by ID or email
-  let existing = activeCandidates.get(candidateId);
-  if (!existing) {
-    for (const c of activeCandidates.values()) {
-      if (c.email.toLowerCase() === normalizedEmail) {
-        existing = c;
-        break;
-      }
-    }
-  }
+  const existing = params.existing;
+  const googleAvatarUrl = buildGoogleProfileAvatarUrl(normalizedEmail, params.fullName);
 
   const candidate: CandidateRecord = existing
     ? {
         ...existing,
-        fullName: params.fullName.trim(),
+        // Same email = same person: update the single existing record, never create a second one.
+        fullName: params.fullName.trim() || existing.fullName,
+        normalizedName: normalizePersonName(params.fullName.trim() || existing.fullName),
         email: normalizedEmail,
-        resumeFileName: params.resumeFileName,
-        extractedJobPosition: params.extractedJobPosition,
-        confirmedJobPosition: params.confirmedJobPosition,
-        experienceSummary: params.experienceSummary,
-        extractedSkills: params.extractedSkills,
+        googleAvatarUrl: existing.googleAvatarUrl || googleAvatarUrl,
+        resumeFileName: params.resumeFileName || existing.resumeFileName,
+        extractedJobPosition: params.extractedJobPosition || existing.extractedJobPosition,
+        confirmedJobPosition: params.confirmedJobPosition || existing.confirmedJobPosition,
+        experienceSummary: params.experienceSummary || existing.experienceSummary,
+        extractedSkills:
+          Array.isArray(params.extractedSkills) && params.extractedSkills.length > 0
+            ? params.extractedSkills
+            : existing.extractedSkills,
         agreedToInstructions: params.agreedToInstructions,
         sessionsCount: (existing.sessionsCount || 0) + 1,
         latestSessionId: params.sessionId,
@@ -345,9 +1064,11 @@ async function upsertCandidateOnCheckIn(params: {
         updatedAt: nowIso,
       }
     : {
-        id: candidateId,
+        id: buildCandidateIdFromEmail(normalizedEmail),
         fullName: params.fullName.trim(),
+        normalizedName: normalizePersonName(params.fullName),
         email: normalizedEmail,
+        googleAvatarUrl,
         resumeFileName: params.resumeFileName,
         extractedJobPosition: params.extractedJobPosition,
         confirmedJobPosition: params.confirmedJobPosition,
@@ -355,9 +1076,13 @@ async function upsertCandidateOnCheckIn(params: {
         extractedSkills: params.extractedSkills,
         agreedToInstructions: params.agreedToInstructions,
         sessionsCount: 1,
+        completedSessionsCount: 0,
         latestSessionId: params.sessionId,
         latestSessionStatus: 'in_progress',
+        latestScoreOutOf20: 0,
         latestScoreOutOf25: 0,
+        suspendedUntil: null,
+        suspensionReason: null,
         createdAt: nowIso,
         updatedAt: nowIso,
       };
@@ -368,34 +1093,77 @@ async function upsertCandidateOnCheckIn(params: {
   return candidate;
 }
 
+/**
+ * One row per answered question in public.candidate_answers (unique per session + question
+ * number, so re-saving a session updates rows instead of duplicating them).
+ */
+async function saveCandidateAnswersToSupabase(
+  session: InterviewSessionRecord
+): Promise<{ saved: boolean; error?: string }> {
+  const answered = session.questionEvaluations.filter((ev) => ev && ev.questionNumber);
+  if (answered.length === 0) return { saved: true };
+  const questionCount = Math.max(1, session.questions.length);
+  const rows = answered.map((ev) => {
+    const q = session.questions.find((qq) => qq.number === ev.questionNumber);
+    return {
+      id: `${session.id}_q${ev.questionNumber}`,
+      session_id: session.id,
+      candidate_id: session.candidateId,
+      candidate_email: session.candidateEmail,
+      candidate_name: session.candidateName,
+      job_position: session.detectedRole,
+      question_id: q?.id || ev.questionId,
+      question_number: ev.questionNumber,
+      question_category: ev.category,
+      question_text: ev.questionText,
+      candidate_answer: ev.candidateAnswer,
+      suggested_answer: ev.proposedAnswer || q?.proposedAnswer || null,
+      score_out_of_5: ev.scoreOutOf5,
+      score_contribution_out_of_20: Number(((ev.scoreOutOf5 / (questionCount * 5)) * INTERVIEW_MAX_SCORE).toFixed(2)),
+      alignment_percent: ev.alignmentPercent ?? null,
+      matched_points: ev.matchedPoints || [],
+      missed_points: ev.missedPoints || [],
+      feedback: ev.feedback,
+      improvement_tip: ev.improvementTip,
+      attempts_used: ev.attemptsUsed,
+      timed_out: ev.timedOut,
+      grading_method: ev.gradingMethod || 'marking_guide',
+      updated_at: new Date().toISOString(),
+    };
+  });
+  return postgrestUpsert('candidate_answers', rows, 'session_id,question_number');
+}
+
 async function saveSessionToSupabase(session: InterviewSessionRecord): Promise<{ saved: boolean; error?: string }> {
   // Always update linked candidate record & flush to local disk first
   const linkedCandidate = activeCandidates.get(session.candidateId);
   if (linkedCandidate) {
     linkedCandidate.latestSessionId = session.id;
     linkedCandidate.latestSessionStatus = session.status;
-    linkedCandidate.latestScoreOutOf25 = session.totalScoreOutOf25;
+    linkedCandidate.latestScoreOutOf20 = session.totalScoreOutOf20 ?? session.totalScoreOutOf25;
+    linkedCandidate.latestScoreOutOf25 = linkedCandidate.latestScoreOutOf20;
+    linkedCandidate.completedSessionsCount = countCompletedSessionsLocally(linkedCandidate);
     linkedCandidate.updatedAt = new Date().toISOString();
     activeCandidates.set(linkedCandidate.id, linkedCandidate);
   }
   activeSessions.set(session.id, session);
   flushCandidatesAndSessionsToDisk();
 
-  const config = getSupabaseConfig();
-  if (!config) {
+  if (!getSupabaseConfig()) {
     return {
       saved: false,
-      error: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/SUPABASE_ANON_KEY are not configured yet.',
+      error: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not configured yet.',
     };
   }
 
-  try {
-    // Ensure parent candidate exists in Supabase first to satisfy foreign key constraint (interview_sessions.candidate_id -> candidates.id)
-    if (linkedCandidate) {
-      await saveCandidateToSupabase(linkedCandidate);
-    }
+  // Ensure parent candidate exists in Supabase first to satisfy the FK (interview_sessions.candidate_id -> candidates.id)
+  if (linkedCandidate) {
+    await saveCandidateToSupabase(linkedCandidate);
+  }
 
-    const payloadWithFk = {
+  const sessionRes = await postgrestUpsert(
+    'interview_sessions',
+    {
       id: session.id,
       candidate_id: session.candidateId,
       candidate_name: session.candidateName,
@@ -405,190 +1173,256 @@ async function saveSessionToSupabase(session: InterviewSessionRecord): Promise<{
       experience_summary: session.candidateExperienceSummary,
       key_skills: session.keySkills,
       status: session.status,
-      total_score: session.totalScoreOutOf25,
-      max_score: session.maxScore,
+      current_phase: session.currentPhase,
+      question_count: session.questions.length,
+      is_first_time_candidate: session.isFirstTimeCandidate !== false,
+      total_score: session.totalScoreOutOf20 ?? 0,
+      max_score: INTERVIEW_MAX_SCORE,
       percentage_score: session.percentageScore,
       successful: session.successful,
       final_impression: session.interviewerFinalImpression,
       question_evaluations: session.questionEvaluations,
       transcript: session.transcript,
+      email_status: session.emailStatus || (session.emailSent ? 'sent' : 'not_sent'),
+      email_sent: Boolean(session.emailSent),
       created_at: session.createdAt,
-      completed_at: session.completedAt || new Date().toISOString(),
-    };
+      completed_at: session.completedAt || null,
+    },
+    'id',
+    ['current_phase', 'question_count', 'is_first_time_candidate', 'email_status', 'email_sent']
+  );
 
-    let response = await fetch(`${config.url}/rest/v1/interview_sessions?on_conflict=id`, {
-      method: 'POST',
-      headers: {
-        apikey: config.key,
-        Authorization: `Bearer ${config.key}`,
-        'Content-Type': 'application/json',
-        Prefer: 'resolution=merge-duplicates,return=minimal',
-      },
-      body: JSON.stringify(payloadWithFk),
-    });
-
-    // Fallback if remote interview_sessions table hasn't added candidate_id column yet
-    if (!response.ok) {
-      const errText = await response.text();
-      if (/candidate_id/i.test(errText)) {
-        const { candidate_id: _omit, ...payloadWithoutFk } = payloadWithFk;
-        response = await fetch(`${config.url}/rest/v1/interview_sessions?on_conflict=id`, {
-          method: 'POST',
-          headers: {
-            apikey: config.key,
-            Authorization: `Bearer ${config.key}`,
-            'Content-Type': 'application/json',
-            Prefer: 'resolution=merge-duplicates,return=minimal',
-          },
-          body: JSON.stringify(payloadWithoutFk),
-        });
-      } else {
-        console.warn('Supabase upsert warning (check if interview_sessions table exists):', errText);
-        return { saved: false, error: errText };
-      }
-    }
-
-    if (!response.ok) {
-      const errText = await response.text();
-      return { saved: false, error: errText };
-    }
-
-    return { saved: true };
-  } catch (err: any) {
-    console.warn('Supabase save exception:', err?.message || err);
-    return { saved: false, error: err?.message || 'Supabase request failed' };
+  const answersRes = await saveCandidateAnswersToSupabase(session);
+  if (!answersRes.saved) {
+    console.warn('candidate_answers not saved (run supabase-schema.sql to create the table):', answersRes.error);
   }
+  return sessionRes;
 }
 
 // ============================================================================
-// 2. BREVO TRANSACTIONAL EMAIL INTEGRATION
+// 2. RESEND TRANSACTIONAL EMAIL INTEGRATION (https://api.resend.com/emails)
 // ============================================================================
-async function sendBrevoAssessmentEmail(session: InterviewSessionRecord): Promise<{ sent: boolean; note: string }> {
-  const brevoApiKey = process.env.BREVO_API_KEY?.trim();
-  const senderEmail = process.env.BREVO_SENDER_EMAIL?.trim() || 'interviews@globalhire360.com';
-  const senderName = process.env.BREVO_SENDER_NAME?.trim() || 'Global Hire 360 Interview Coach';
+const sessionEmailLocks = new Set<string>();
 
-  const transcriptHtml = session.transcript
-    .map(
-      (t) => `
-      <div style="margin-bottom: 12px; padding: 12px 14px; border-radius: 8px; background: ${
-        t.speaker === 'interviewer' ? '#F0F4F8' : '#F2F9EE'
-      }; border-left: 4px solid ${t.speaker === 'interviewer' ? '#041E41' : '#339A05'};">
-        <div style="font-size: 12px; font-weight: 700; color: ${
-          t.speaker === 'interviewer' ? '#041E41' : '#339A05'
-        }; margin-bottom: 4px;">
-          ${t.speakerName} &bull; <span style="font-weight: 400; color: #64748B;">${new Date(
-        t.timestamp
-      ).toLocaleTimeString()}</span>
-        </div>
-        <div style="font-size: 14px; color: #1E293B; line-height: 1.55;">${t.text}</div>
-      </div>`
-    )
-    .join('');
+function escapeHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
-  const questionsHtml = session.questionEvaluations
-    .map(
-      (q) => `
-      <div style="margin-bottom: 14px; padding: 14px; border: 1px solid #E2E8F0; border-radius: 8px; background: #FFFFFF;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-          <strong style="color: #041E41; font-size: 14px;">Question ${q.questionNumber} (${q.category})</strong>
-          <span style="background: ${
-            q.scoreOutOf5 >= 3.5 ? '#339A05' : '#041E41'
-          }; color: #FFFFFF; padding: 3px 10px; border-radius: 4px; font-size: 12px; font-weight: 700;">
-            ${q.scoreOutOf5} / 5
-          </span>
-        </div>
-        <p style="margin: 0 0 8px 0; font-size: 13px; color: #334155; font-weight: 600;">${q.questionText}</p>
-        <p style="margin: 0 0 6px 0; font-size: 12px; color: #475569;"><strong>Your Answer:</strong> ${
-          q.candidateAnswer || 'No response recorded'
-        }</p>
-        <p style="margin: 0; font-size: 12px; color: #041E41;"><strong>Coach Feedback:</strong> ${q.feedback}</p>
-      </div>`
-    )
-    .join('');
+/** Strips CR/LF so user-controlled values can never inject extra email headers/subject lines. */
+function singleLine(value: unknown, max = 160): string {
+  return String(value ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, max);
+}
 
-  const htmlContent = `
-    <div style="font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif; max-width: 680px; margin: 0 auto; border: 1px solid #E2E8F0; border-radius: 12px; overflow: hidden; background: #FFFFFF;">
+/**
+ * Sends the results email exactly once per session.
+ * Duplicate protection (the cause of candidates receiving 3 result emails was several
+ * finalize paths — Gemini end_call fired more than once, the End Call button, the 10-minute
+ * timer and the manual "send email" endpoint — all racing on an in-memory flag):
+ *  1. Persistent emailStatus ('sending'/'sent') written to disk BEFORE calling Resend,
+ *     so a second caller, a restart, or a retry after a timeout never re-sends.
+ *  2. In-process lock for concurrent callers in the same tick.
+ *  3. Resend Idempotency-Key header derived from the session id, so even if two server
+ *     instances race, Resend itself delivers only one email (24h idempotency window).
+ */
+async function sendResendAssessmentEmail(
+  session: InterviewSessionRecord
+): Promise<{ sent: boolean; note: string; emailId?: string; inProgress?: boolean }> {
+  if (session.emailSent || session.emailStatus === 'sent') {
+    session.emailSent = true;
+    session.emailStatus = 'sent';
+    return {
+      sent: true,
+      note: session.emailDeliveryNote || `Assessment report has already been delivered to ${session.candidateEmail}.`,
+    };
+  }
+
+  // Only a send running in THIS process counts as "in progress". A 'sending' status left on
+  // disk by a restart/crash mid-send is retried; Resend's Idempotency-Key (same per session)
+  // guarantees the candidate still receives the email only once.
+  if (sessionEmailLocks.has(session.id)) {
+    return {
+      sent: false,
+      inProgress: true,
+      note: `Assessment email dispatch is already in progress for ${session.candidateEmail}.`,
+    };
+  }
+
+  const resendApiKey = process.env.RESEND_API_KEY?.trim();
+  if (!resendApiKey || resendApiKey === 're_your_resend_api_key') {
+    return {
+      sent: false,
+      note: `Report prepared for ${session.candidateEmail} (Add RESEND_API_KEY in Secrets to enable live Resend email delivery).`,
+    };
+  }
+
+  sessionEmailLocks.add(session.id);
+  session.emailStatus = 'sending';
+  activeSessions.set(session.id, session);
+  flushCandidatesAndSessionsToDisk();
+
+  try {
+    const rawSenderEmail = (
+      process.env.RESEND_FROM_EMAIL ||
+      process.env.RESEND_SENDER_EMAIL ||
+      'onboarding@resend.dev'
+    ).trim();
+    const senderName = singleLine(
+      process.env.RESEND_FROM_NAME || process.env.RESEND_SENDER_NAME || 'Global Hire 360 Interview Coach',
+      80
+    );
+
+    const formatFromHeader = (emailAddr: string) =>
+      emailAddr.includes('<') ? emailAddr : `${senderName} <${emailAddr}>`;
+
+    const appUrl = (process.env.APP_URL || 'https://www.globalhire360.com').replace(/\/+$/, '');
+    const passed = Boolean(session.successful);
+    const name = escapeHtml(session.candidateName);
+    const role = escapeHtml(session.detectedRole);
+    const appreciationTitle = passed
+      ? 'Congratulations — You Passed This Practice Interview!'
+      : 'Good Effort — Keep Practicing to Reach Placement Readiness';
+    const appreciationBodyText = passed
+      ? `Outstanding work, ${session.candidateName}! You demonstrated strong communication, clear role knowledge, and composure for the ${session.detectedRole} position. You are well-prepared for your upcoming employer interview.`
+      : `Thank you for practicing with us, ${session.candidateName}. Every practice conversation builds your confidence for the real ${session.detectedRole} interview. Review the suggested answers on your results page and retake the practice session whenever you are ready.`;
+
+    const totalDisplayScore = session.totalScoreOutOf20 ?? session.totalScoreOutOf25;
+    const maxScore = INTERVIEW_MAX_SCORE;
+
+    const htmlContent = `
+    <div style="font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; border: 1px solid #E2E8F0; border-radius: 14px; overflow: hidden; background: #FFFFFF;">
       <div style="background: #041E41; color: #FFFFFF; padding: 24px 28px; border-bottom: 4px solid #339A05;">
-        <h1 style="margin: 0; font-size: 20px; font-weight: 800;">Global Hire 360 — Live Interview Assessment</h1>
-        <p style="margin: 6px 0 0 0; font-size: 13px; color: #CBD5E1;">Candidate Performance Report &amp; Full Voice Transcript</p>
+        <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #86EFAC; font-weight: 700; margin-bottom: 4px;">Global Hire 360 &bull; Candidate Readiness</div>
+        <h1 style="margin: 0; font-size: 19px; font-weight: 800;">Interview Practice Summary</h1>
       </div>
       <div style="padding: 28px;">
-        <p style="font-size: 15px; color: #1E293B; margin-top: 0;">Hello <strong>${session.candidateName}</strong>,</p>
-        <p style="font-size: 14px; color: #475569; line-height: 1.6;">
-          Thank you for completing your live voice interview on the <strong>Global Hire 360</strong> platform for the <strong>${session.detectedRole}</strong> position. Below is your official evaluation summary and voice transcript.
-        </p>
-        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 18px; margin: 20px 0;">
-          <div style="font-size: 13px; color: #64748B; text-transform: uppercase; font-weight: 700;">Overall Verdict</div>
-          <div style="font-size: 22px; font-weight: 800; color: ${
-            session.successful ? '#339A05' : '#D97706'
-          }; margin: 4px 0;">
-            ${session.successful ? 'SUCCESSFUL — READY FOR PLACEMENT' : 'NEEDS FURTHER WORKSHOP PRACTICE'} (${
-    session.totalScoreOutOf25
-  } / ${session.maxScore})
+        <p style="font-size: 15px; color: #0F172A; margin: 0 0 14px 0;">Hello <strong>${name}</strong>,</p>
+
+        <div style="background: ${passed ? '#F0FDF4' : '#FFFBEB'}; border: 1px solid ${passed ? '#BBF7D0' : '#FDE68A'}; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 20px;">
+          <div style="font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; color: ${passed ? '#15803D' : '#B45309'};">
+            ${passed ? 'PASSED ASSESSMENT' : 'PRACTICE RECOMMENDED'}
           </div>
-          <p style="font-size: 13px; color: #334155; margin: 8px 0 0 0; line-height: 1.55;">
-            <strong>Interviewer Final Impression:</strong> ${session.interviewerFinalImpression}
-          </p>
+          <div style="font-size: 32px; font-weight: 900; color: #041E41; margin: 6px 0;">
+            ${escapeHtml(totalDisplayScore)} / ${maxScore} <span style="font-size: 16px; font-weight: 700; color: #339A05;">(${escapeHtml(session.percentageScore)}%)</span>
+          </div>
+          <div style="font-size: 14px; font-weight: 700; color: #1E293B; margin-top: 4px;">${appreciationTitle}</div>
+          <p style="font-size: 13px; color: #475569; line-height: 1.55; margin: 8px 0 0 0;">${escapeHtml(appreciationBodyText)}</p>
         </div>
-        <h3 style="color: #041E41; font-size: 16px; border-bottom: 2px solid #E2E8F0; padding-bottom: 8px;">Question-by-Question Scores (/ 5)</h3>
-        ${questionsHtml}
-        <h3 style="color: #041E41; font-size: 16px; border-bottom: 2px solid #E2E8F0; padding-bottom: 8px; margin-top: 26px;">Full Voice Call Transcript</h3>
-        ${transcriptHtml}
+
+        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 16px; margin-bottom: 24px;">
+          <div style="font-size: 12px; font-weight: 700; color: #041E41; text-transform: uppercase; margin-bottom: 6px;">Summary of Your Call (${role})</div>
+          <p style="font-size: 13px; color: #334155; line-height: 1.6; margin: 0;">${escapeHtml(session.interviewerFinalImpression)}</p>
+        </div>
+
+        <div style="text-align: center; margin: 26px 0 10px 0;">
+          <a href="${escapeHtml(appUrl)}" style="display: inline-block; background: #339A05; color: #FFFFFF; text-decoration: none; font-weight: 700; font-size: 14px; padding: 13px 26px; border-radius: 10px;">
+            ${passed ? 'Practice Another Interview Session' : 'Retake the Practice Interview'}
+          </a>
+        </div>
+      </div>
+      <div style="background: #F8FAFC; border-top: 1px solid #E2E8F0; padding: 14px 28px; text-align: center; font-size: 11px; color: #64748B;">
+        Global Hire 360 &bull; AI Interview Preparation &amp; Recruiting Readiness Platform
       </div>
     </div>
   `;
 
-  if (!brevoApiKey || brevoApiKey === 'xkeysib-your-brevo-api-key') {
-    return {
-      sent: false,
-      note: `Report prepared for ${session.candidateEmail} (Add BREVO_API_KEY in Secrets to enable live Brevo email delivery).`,
-    };
-  }
+    const plainTextContent = [
+      `GLOBAL HIRE 360 — INTERVIEW PRACTICE SUMMARY`,
+      `Candidate: ${session.candidateName}`,
+      `Role: ${session.detectedRole}`,
+      `Overall Score: ${totalDisplayScore} / ${maxScore} (${session.percentageScore}%) — ${passed ? 'PASSED' : 'PRACTICE RECOMMENDED'}`,
+      ``,
+      appreciationTitle,
+      appreciationBodyText,
+      ``,
+      `Summary of Your Call:`,
+      session.interviewerFinalImpression,
+      ``,
+      `Retake or Practice Again: ${appUrl}`,
+    ].join('\n');
 
-  try {
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        accept: 'application/json',
-        'api-key': brevoApiKey,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        sender: {
-          name: senderName,
-          email: senderEmail,
+    const subjectLine = singleLine(
+      `Global Hire 360 Interview Results: ${session.candidateName} (${session.detectedRole}) — ${totalDisplayScore}/${maxScore}`,
+      200
+    );
+
+    const sendWith = (fromAddress: string, idempotencyKey: string) =>
+      fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${resendApiKey}`,
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
         },
-        to: [
-          {
-            email: session.candidateEmail,
-            name: session.candidateName,
-          },
-        ],
-        subject: `Global Hire 360 Interview Results: ${session.candidateName} (${session.detectedRole}) — ${session.totalScoreOutOf25}/25`,
-        htmlContent,
-      }),
-    });
+        body: JSON.stringify({
+          from: formatFromHeader(fromAddress),
+          to: [session.candidateEmail],
+          subject: subjectLine,
+          html: htmlContent,
+          text: plainTextContent,
+        }),
+      });
+
+    const baseKey = `gh360-results-${session.id}`;
+    let response = await sendWith(rawSenderEmail, baseKey);
+
+    // If the custom sender domain is not verified yet (4xx validation), retry once with onboarding@resend.dev.
+    // The first attempt was rejected, so nothing was delivered; the fallback uses its own idempotency key.
+    if (!response.ok && rawSenderEmail.toLowerCase() !== 'onboarding@resend.dev') {
+      const firstErrText = await response.text();
+      if (response.status >= 400 && response.status < 500 && /domain|not verified|validation_error/i.test(firstErrText)) {
+        console.warn(`Resend custom sender (${rawSenderEmail}) not verified yet, retrying with onboarding@resend.dev...`);
+        response = await sendWith('onboarding@resend.dev', `${baseKey}-fallback`);
+      } else {
+        console.warn('Resend API non-200 response:', response.status, firstErrText);
+        session.emailStatus = 'failed';
+        return {
+          sent: false,
+          note: `Resend API returned status ${response.status}. Please verify RESEND_API_KEY and RESEND_FROM_EMAIL.`,
+        };
+      }
+    }
 
     if (!response.ok) {
       const errBody = await response.text();
-      console.warn('Brevo API non-200 response:', response.status, errBody);
+      console.warn('Resend API non-200 response:', response.status, errBody);
+      session.emailStatus = 'failed';
       return {
         sent: false,
-        note: `Brevo API returned status ${response.status}. Please verify BREVO_API_KEY and verified BREVO_SENDER_EMAIL.`,
+        note: `Resend API returned status ${response.status}. Please verify RESEND_API_KEY and verified sender domain in Resend.`,
       };
     }
 
+    const resData = (await response.json().catch(() => ({}))) as { id?: string };
+    session.emailSent = true;
+    session.emailStatus = 'sent';
+    session.emailId = resData?.id;
+    session.emailDeliveryNote = `Assessment report emailed to ${session.candidateEmail} via Resend${
+      resData?.id ? ` (ID: ${resData.id})` : ''
+    }.`;
+
     return {
       sent: true,
-      note: `Assessment report & transcript emailed to ${session.candidateEmail} via Brevo.`,
+      emailId: resData?.id,
+      note: session.emailDeliveryNote,
     };
   } catch (err: any) {
-    console.error('Brevo email error:', err);
+    console.error('Resend email error:', err);
+    // Network failure: we cannot know whether Resend accepted it. The idempotency key makes a
+    // later retry safe (Resend will not deliver a second copy), so mark as failed/retryable.
+    session.emailStatus = 'failed';
     return {
       sent: false,
-      note: `Could not reach Brevo API: ${err?.message || 'Unknown error'}`,
+      note: `Could not reach Resend API: ${err?.message || 'Unknown error'}`,
     };
+  } finally {
+    sessionEmailLocks.delete(session.id);
+    activeSessions.set(session.id, session);
+    flushCandidatesAndSessionsToDisk();
   }
 }
 
@@ -596,11 +1430,17 @@ async function sendBrevoAssessmentEmail(session: InterviewSessionRecord): Promis
 // 3. GEMINI CLIENT HELPER
 // ============================================================================
 function getGenAIClientOrNull(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     return null;
   }
-  return new GoogleGenAI({ apiKey });
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      apiVersion: 'v1alpha', // needed for affective dialog & proactive audio
+      headers: { 'User-Agent': 'aistudio-build' },
+    },
+  });
 }
 
 // ============================================================================
@@ -1455,47 +2295,61 @@ async function seedCustomerServiceQuestionsToSupabase(): Promise<{
   seeded: boolean;
   error?: string;
 }> {
-  const config = getSupabaseConfig();
-  if (!config) {
+  if (!getSupabaseConfig()) {
     return {
       seeded: false,
-      error: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY / SUPABASE_ANON_KEY are not configured.',
+      error: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not configured.',
     };
   }
 
-  try {
-    const payload = CUSTOMER_SERVICE_QUESTION_TABLE.map((row) => ({
-      id: row.id,
-      role_category: row.roleCategory,
-      category: row.category,
-      question_text: row.question,
-      proposed_answer: row.proposedAnswer,
-      expected_focus: row.expectedFocus,
-      is_behavioral_star: row.isBehavioralStar,
-    }));
+  const toRow = (row: CustomerServiceQuestionRow) => ({
+    id: row.id,
+    role_category: row.roleCategory,
+    category: row.category,
+    question_text: row.question,
+    proposed_answer: row.proposedAnswer,
+    expected_focus: row.expectedFocus,
+    is_behavioral_star: row.isBehavioralStar,
+  });
 
-    const response = await fetch(
-      `${config.url}/rest/v1/customer_service_questions?on_conflict=id`,
-      {
-        method: 'POST',
-        headers: {
-          apikey: config.key,
-          Authorization: `Bearer ${config.key}`,
-          'Content-Type': 'application/json',
-          Prefer: 'resolution=merge-duplicates,return=minimal',
-        },
-        body: JSON.stringify(payload),
-      }
-    );
+  // Legacy table (Customer Service only) kept for backward compatibility.
+  const legacy = await postgrestUpsert(
+    'customer_service_questions',
+    CUSTOMER_SERVICE_QUESTION_TABLE.map(toRow),
+    'id'
+  );
 
-    if (!response.ok) {
-      const errText = await response.text();
-      return { seeded: false, error: errText };
-    }
-    return { seeded: true };
-  } catch (err: any) {
-    return { seeded: false, error: err?.message || 'Failed to seed customer_service_questions' };
+  // All banks (Universal first question, Customer Service, Virtual Assistant, Technical Support).
+  const all = await postgrestUpsert(
+    'interview_questions',
+    ALL_STANDARD_QUESTION_ROWS.map((row) => ({
+      ...toRow(row),
+      alternative_wordings: row.id === UNIVERSAL_FIRST_QUESTION_ROW.id ? UNIVERSAL_FIRST_QUESTION_VARIANTS : [],
+      marking_points: row.markingPillars.map((p) => p.label),
+    })),
+    'id'
+  );
+
+  // One table per role, like customer_service_questions.
+  const withPoints = (row: CustomerServiceQuestionRow) => ({
+    ...toRow(row),
+    marking_points: row.markingPillars.map((p) => p.label),
+  });
+  const va = await postgrestUpsert(
+    'virtual_assistant_questions',
+    VIRTUAL_ASSISTANT_QUESTION_TABLE.map(withPoints),
+    'id'
+  );
+  const ts = await postgrestUpsert(
+    'technical_support_questions',
+    TECHNICAL_SUPPORT_QUESTION_TABLE.map(withPoints),
+    'id'
+  );
+
+  if (!all.saved || !va.saved || !ts.saved) {
+    return { seeded: false, error: all.error || va.error || ts.error || legacy.error };
   }
+  return { seeded: true };
 }
 
 async function fetchShuffledCustomerServiceQuestionsFromSupabase(
@@ -1581,6 +2435,1055 @@ export function selectShuffledCustomerServiceQuestions(
   }));
 }
 
+export const UNIVERSAL_FIRST_QUESTION_ROW: CustomerServiceQuestionRow = {
+  id: 'universal_q1',
+  roleCategory: 'Universal First Question',
+  category: 'Professional Experience & Role Fit',
+  question: 'Walk me through your professional experience and why are you the best fit for this job?',
+  proposedAnswer:
+    'Over my professional career, I have developed strong practical experience in organizing workflows, solving problems, and communicating clearly with teams and clients. I take pride in being dependable, detail-oriented, and quick to master new tools and responsibilities. What makes me the best fit for this job is my ability to deliver accurate work under deadlines while maintaining a positive, professional attitude. I am excited to bring my skills to this position, support the team\'s goals, and make an immediate, positive impact.',
+  expectedFocus:
+    'Clear overview of relevant professional experience, practical strengths in organization and communication, ability to learn tools quickly and meet deadlines, and compelling alignment on why you are the best fit for this position.',
+  isBehavioralStar: false,
+  markingPillars: [
+    {
+      label: 'Relevant professional experience & background',
+      tip: 'Walk through your relevant professional experience and key responsibilities.',
+      regex:
+        /\b(?:experience|background|career|work(?:ed|ing)?|role|history|field|track\s+record|professional)\b/i,
+    },
+    {
+      label: 'Core practical strengths: organization, communication & problem-solving',
+      tip: 'Highlight core strengths like organization, clear communication, or problem-solving.',
+      regex:
+        /\b(?:strength(?:s)?|organi[sz](?:ed|ation|ing)|communicat(?:e|ion|ing)|problem[\s-]?solv(?:e|ing|er)|detail[\s-]?oriented|dependab(?:le|ility)|accura(?:cy|te))\b/i,
+    },
+    {
+      label: 'Adaptability, learning tools & managing deadlines',
+      tip: 'Mention your ability to learn tools quickly and deliver accurate work under deadlines.',
+      regex:
+        /\b(?:learn(?:ing)?|tool(?:s)?|system(?:s)?|software|deadline(?:s)?|time\s+management|adapt(?:able|ability)?|priority|priorities)\b/i,
+    },
+    {
+      label: 'Fit for the position & making a positive team impact',
+      tip: 'Explain why you are the best fit and how you will make a positive impact on the team.',
+      regex:
+        /\b(?:best\s+fit|fit\s+for|contribut(?:e|ing)|team|impact|value|excite(?:d)?|goal(?:s)?|hire\s+me)\b/i,
+    },
+  ],
+};
+
+export const VIRTUAL_ASSISTANT_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
+  {
+    id: 'va_q1',
+    roleCategory: 'Virtual Assistant',
+    category: 'Organization, Time Management & Core VA Skills',
+    question: 'Tell me about yourself.',
+    proposedAnswer:
+      'I’m an organized and dependable professional who enjoys keeping tasks, information and communication moving efficiently. My strengths include attention to detail, time management and learning new tools quickly. I’m comfortable working with documents, schedules, email, data and multiple priorities. I’m interested in administrative or virtual assistant work because I enjoy creating structure and making it easier for a team to stay organized and productive.',
+    expectedFocus:
+      'Organized and dependable mindset, attention to detail, time management, quick learning of new software, comfort with schedules, email, data, and creating structure to keep a team productive.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Organized and dependable professional managing tasks & communication',
+        tip: 'Highlight your organizational skills, dependability, and experience managing communications.',
+        regex:
+          /\b(?:organiz(?:ed|ing|ation)|dependab(?:le|ility)|task(?:s)?|information|communicat(?:e|ion|ing)|efficient(?:ly)?)\b/i,
+      },
+      {
+        label: 'Attention to detail, time management & learning new tools quickly',
+        tip: 'Emphasize your attention to detail, time management, and ability to master software quickly.',
+        regex:
+          /\b(?:attention\s+to\s+detail|detail(?:s)?|time\s+management|learn(?:ing)?\s+new\s+tools|quick\s+learner|software)\b/i,
+      },
+      {
+        label: 'Comfort with documents, schedules, email, data & multiple priorities',
+        tip: 'Mention your day-to-day comfort handling documents, calendars, email, data, and multitasking.',
+        regex:
+          /\b(?:document(?:s)?|schedule(?:s)?|calendar(?:s)?|email(?:s)?|data|priorit(?:y|ies)|multi(?:ple|\s*tasking))\b/i,
+      },
+      {
+        label: 'Creating structure to make a team organized and productive',
+        tip: 'Explain how you create structure and make it easier for a team to stay productive.',
+        regex:
+          /\b(?:creat(?:e|ing)\s+structure|structure|team|productive|productivity|stay\s+organized|support)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q2',
+    roleCategory: 'Virtual Assistant',
+    category: 'Urgency, Deadlines & Work Prioritization',
+    question: 'How do you prioritize your work?',
+    proposedAnswer:
+      'I prioritize tasks based on urgency, importance and deadlines. I first identify anything time-sensitive or affecting other people, then I organize the remaining work into a clear list. If two priorities conflict, I communicate with the appropriate person rather than making assumptions. I also leave some flexibility for unexpected requests while still protecting important deadlines.',
+    expectedFocus:
+      'Prioritization based on urgency, importance, and deadlines; identifying time-sensitive items affecting others first; proactive communication when priorities clash; and flexibility for unexpected tasks.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Prioritizing based on urgency, importance and deadlines',
+        tip: 'Explain how you evaluate urgency, importance, and deadlines across your task list.',
+        regex:
+          /\b(?:urgency|urgent|importance|important|deadline(?:s)?|priorit(?:y|ize|izing|ies))\b/i,
+      },
+      {
+        label: 'Identifying time-sensitive items affecting other people first',
+        tip: 'Note that you first identify items that are time-sensitive or that unblock other team members.',
+        regex:
+          /\b(?:time[\s-]?sensitive|affecting\s+other(?:s|people)|unblock|first|clear\s+list|list)\b/i,
+      },
+      {
+        label: 'Communicating proactively rather than making assumptions during conflict',
+        tip: 'Highlight that when priorities conflict, you communicate directly rather than guessing.',
+        regex:
+          /\b(?:communicat(?:e|ing)|conflict(?:s)?|appropriate\s+person|clarif(?:y|ication)|assumptions?|ask(?:ing)?)\b/i,
+      },
+      {
+        label: 'Maintaining flexibility for unexpected requests while protecting deadlines',
+        tip: 'Mention leaving buffer room for unexpected requests while shielding core deliverables.',
+        regex:
+          /\b(?:flexib(?:le|ility)|unexpected|buffer|protect(?:ing)?|deliver(?:y|ing)?|schedule)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q3',
+    roleCategory: 'Virtual Assistant',
+    category: 'Attention to Detail & Quality Review',
+    question: 'How do you make sure your work is accurate?',
+    proposedAnswer:
+      'I build a review step into my workflow rather than assuming the first version is perfect. Depending on the task, I check names, numbers, dates, formatting and source information, and I use tools such as spellcheck when appropriate. For important work, I do a final review from the perspective of the person who will receive it. This helps me catch small errors before they become bigger problems.',
+    expectedFocus:
+      'Building an intentional review step into the workflow; verifying names, numbers, dates, formatting, and source data; leveraging tools; and reviewing through the recipient\'s perspective to catch errors early.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Building a review step into the workflow',
+        tip: 'Describe how you build an intentional review step instead of assuming the first draft is perfect.',
+        regex:
+          /\b(?:review\s+step|review(?:ing)?|check(?:ing)?|workflow|double[\s-]?check|audit|first\s+version)\b/i,
+      },
+      {
+        label: 'Auditing names, numbers, dates, formatting & source information',
+        tip: 'Mention specific checks: names, numbers, dates, formatting, and source data.',
+        regex:
+          /\b(?:name(?:s)?|number(?:s)?|date(?:s)?|format(?:ting)?|source|data|information)\b/i,
+      },
+      {
+        label: 'Utilizing proofreading & validation tools (e.g. spellcheck)',
+        tip: 'Point to using tools like spellcheck, formulas, or formatting tools.',
+        regex:
+          /\b(?:spellcheck|proofread(?:ing)?|tool(?:s)?|validation|grammarly|accuracy)\b/i,
+      },
+      {
+        label: 'Reviewing through the recipient\'s perspective to catch errors early',
+        tip: 'Explain doing a final pass from the recipient\'s viewpoint to catch issues before delivery.',
+        regex:
+          /\b(?:recipient|perspective|receive(?:r)?|catch\s+(?:small\s+)?errors?|before.*problem|client\s+view)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q4',
+    roleCategory: 'Virtual Assistant',
+    category: 'Software Adaptability & Self-Guided Learning',
+    question: 'How do you learn a new software tool quickly?',
+    proposedAnswer:
+      'When I need to learn a new tool, I first identify the tasks I will actually need to perform with it. I learn the basic workflow, practice those tasks and use documentation or tutorials when I get stuck. I also take notes on important steps so I don’t have to repeatedly ask the same question. Once I understand the basics, I look for shortcuts and features that improve efficiency.',
+    expectedFocus:
+      'Targeting required tasks first, practicing core workflows with documentation/tutorials, taking structured notes to retain steps, and looking for shortcuts/features that improve efficiency.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Identifying specific tasks required for the workflow',
+        tip: 'Explain how you target the specific tasks and workflows you actually need to perform.',
+        regex:
+          /\b(?:identify\s+tasks?|specific\s+tasks?|actual(?:ly)?\s+need|workflow|use\s+case)\b/i,
+      },
+      {
+        label: 'Hands-on practice using documentation and tutorials',
+        tip: 'Mention practicing the basics and referencing documentation, video tutorials, or guides.',
+        regex:
+          /\b(?:practic(?:e|ing)|documentation|tutorial(?:s)?|guide(?:s)?|hands[\s-]?on|learn\s+the\s+basic)\b/i,
+      },
+      {
+        label: 'Taking structured notes to remember key steps independently',
+        tip: 'Emphasize taking notes on key steps so you retain them and work independently.',
+        regex:
+          /\b(?:take\s+notes?|notetaking|documentation|steps?|repeatedly\s+ask|independent(?:ly)?)\b/i,
+      },
+      {
+        label: 'Finding shortcuts and features to improve efficiency',
+        tip: 'Share how you look for shortcuts and advanced features to boost overall speed and quality.',
+        regex:
+          /\b(?:shortcut(?:s)?|feature(?:s)?|efficien(?:t|cy)|speed|optimize|productivity)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q5',
+    roleCategory: 'Virtual Assistant',
+    category: 'Reliability, Administrative Value & Adaptability',
+    question: 'Why should we hire you?',
+    proposedAnswer:
+      'You should hire me because I’m organized, dependable and focused on completing work accurately. I understand that administrative support often involves many small details, deadlines and communication points, and I take those responsibilities seriously. I’m also comfortable learning new systems and adjusting when priorities change. My goal would be to become someone the team can trust to keep tasks moving and details under control.',
+    expectedFocus:
+      'Organized and dependable mindset; taking ownership of small details, deadlines, and communications; adaptability to new systems; and becoming a trusted partner who keeps tasks under control.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Organized, dependable and focused on accuracy',
+        tip: 'Highlight that you are organized, dependable, and focused on accurate deliverables.',
+        regex:
+          /\b(?:organiz(?:ed|ation)|dependab(?:le|ility)|accura(?:te|cy)|reliable|consistent)\b/i,
+      },
+      {
+        label: 'Taking ownership of small details, deadlines & communication points',
+        tip: 'Acknowledge the importance of managing small details, deadlines, and team communications.',
+        regex:
+          /\b(?:small\s+details?|deadline(?:s)?|communicat(?:e|ion|ing)|responsibilit(?:y|ies)|serious(?:ly)?)\b/i,
+      },
+      {
+        label: 'Comfortable learning new systems and adjusting when priorities change',
+        tip: 'Show adaptability when systems change or priorities shift throughout the day.',
+        regex:
+          /\b(?:learn(?:ing)?\s+new\s+systems?|adjust(?:ing)?|priorit(?:y|ies)\s+change|adaptab(?:le|ility)|flexib(?:le|ility))\b/i,
+      },
+      {
+        label: 'Becoming someone the team can trust to keep tasks under control',
+        tip: 'Express your goal of becoming a trusted contributor who keeps operations moving smoothly.',
+        regex:
+          /\b(?:trust(?:ed)?|keep\s+tasks?\s+moving|under\s+control|asset|contribut(?:e|ing)|team)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q6',
+    roleCategory: 'Virtual Assistant',
+    category: 'Managing Multiple Deadlines (STAR)',
+    question: 'Tell me about a time you had multiple deadlines at once.',
+    proposedAnswer:
+      'Situation: I had several important assignments with deadlines that were close together. Task: I needed to complete each one accurately without allowing one deadline to interfere with another. Action: I listed all deliverables, identified which tasks were most urgent and which depended on other work, and then created a schedule with focused blocks of time. When I saw a potential conflict, I communicated early instead of waiting until the deadline was close. Result: I completed the priority work on time and maintained quality across the remaining assignments.',
+    expectedFocus:
+      'STAR example: several close deadlines, listing deliverables, identifying urgency and dependencies, scheduling focused time blocks, communicating potential conflicts early, and delivering priority work on time without losing quality.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: several close deadlines that all had to be met accurately',
+        tip: 'Set the scene: several important assignments with deadlines close together, each needing to be done accurately.',
+        regex:
+          /\b(?:deadlines?|assignments?|several|multiple|close\s+together|overlapp(?:ed|ing)|same\s+(?:time|week|day)|accurate(?:ly)?)\b/i,
+      },
+      {
+        label: 'Action: listed deliverables, judged urgency & dependencies, scheduled focused time blocks',
+        tip: 'Explain how you listed every deliverable, worked out what was most urgent or dependent on other work, and scheduled focused blocks of time.',
+        regex:
+          /\b(?:list(?:ed)?|deliverables?|urgen(?:t|cy)|depend(?:ed|ent|ency|encies|s)?|schedul(?:e|ed)|time\s+blocks?|blocks?\s+of\s+time|priorit(?:y|ized|ised|ies))\b/i,
+      },
+      {
+        label: 'Action: communicated potential conflicts early instead of waiting',
+        tip: 'Mention that when you saw a potential conflict you raised it early rather than waiting until the deadline was close.',
+        regex:
+          /\b(?:communicat(?:e|ed|ing)|early|conflict|let\s+(?:them|my\s+\w+)\s+know|informed|flagged|raised|update(?:d)?)\b/i,
+      },
+      {
+        label: 'Result: priority work delivered on time with quality maintained',
+        tip: 'Close with the result: the priority work was completed on time and the quality of the remaining work was maintained.',
+        regex:
+          /\b(?:on\s+time|completed|delivered|met\s+(?:all|every|the)|quality|result|finished|successfully)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q7',
+    roleCategory: 'Virtual Assistant',
+    category: 'Catching Mistakes & Quality Control (STAR)',
+    question: 'Describe a time you caught an important mistake before it caused a problem.',
+    proposedAnswer:
+      'Situation: While reviewing a document before it was finalized, I noticed that one piece of information did not match the original source. Task: I needed to determine whether it was an error and correct it before the document moved forward. Action: I went back to the source, verified the information and updated the document before submission. I then reviewed the surrounding information to make sure there were no related errors. Result: The mistake was corrected before it caused a problem, and it reinforced for me why a final quality check is important even when a task appears finished.',
+    expectedFocus:
+      'STAR example: noticing a mismatch during a review, checking it against the original source, correcting it before submission, reviewing related information for further errors, and valuing a final quality check.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation: noticed information that did not match during a review',
+        tip: 'Describe how you spotted something that did not match (for example during a review before a document was finalized).',
+        regex:
+          /\b(?:notic(?:e|ed)|spotted|caught|found|review(?:ed|ing)?|did\s*n[o']?t\s+match|mismatch|discrepanc(?:y|ies)|incorrect|error|mistake|wrong)\b/i,
+      },
+      {
+        label: 'Action: went back to the source and verified the information',
+        tip: 'Explain that you went back to the original source and verified the information before changing anything.',
+        regex:
+          /\b(?:source|verif(?:y|ied|ying)|confirm(?:ed)?|double[\s-]?check(?:ed)?|cross[\s-]?check(?:ed)?|checked|original)\b/i,
+      },
+      {
+        label: 'Action: corrected it before submission & checked for related errors',
+        tip: 'Mention correcting the document before it moved forward, then reviewing the surrounding information for related errors.',
+        regex:
+          /\b(?:correct(?:ed)?|fix(?:ed)?|updat(?:e|ed)|amend(?:ed)?|before\s+(?:it\s+was\s+)?(?:submi(?:t|ssion|tted)|sent|finali[sz]ed|moved\s+forward)|related\s+errors?|surrounding)\b/i,
+      },
+      {
+        label: 'Result: problem prevented & value of a final quality check',
+        tip: 'Close with the result: the mistake was fixed before it caused a problem, and what it taught you about final quality checks.',
+        regex:
+          /\b(?:prevent(?:ed)?|avoid(?:ed)?|before\s+it\s+caused|quality\s+check|final\s+(?:check|review)|learn(?:ed|t)|reinforced|result|lesson)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q8',
+    roleCategory: 'Virtual Assistant',
+    category: 'Organizing a Difficult Task (STAR)',
+    question: 'Describe a time you had to organize a difficult task.',
+    proposedAnswer:
+      'Situation: I was given a task that involved several pieces of information and multiple steps, and it initially felt difficult to organize. Task: I needed to create enough structure to complete it accurately and on time. Action: I broke the project into smaller steps, created a checklist, identified which items depended on others and tracked progress as I worked. Result: The task became much more manageable, I was able to keep track of the details and the work was completed successfully.',
+    expectedFocus:
+      'STAR example: a complex multi-step task, creating structure, breaking it into smaller steps, using a checklist, identifying dependencies, tracking progress, and completing it accurately and on time.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: a complex, multi-step task that needed structure',
+        tip: 'Describe a task with many pieces of information or steps that was hard to organize at first.',
+        regex:
+          /\b(?:difficult|complex|complicated|challenging|multiple\s+steps|several\s+(?:pieces|parts|steps)|overwhelming|large|structure|organi[sz]e)\b/i,
+      },
+      {
+        label: 'Action: broke it into smaller steps and created a checklist',
+        tip: 'Explain how you broke the work into smaller steps and created a checklist or plan.',
+        regex:
+          /\b(?:br(?:oke|eak|eaking)\s+(?:it|the\s+\w+)?\s*(?:down|into)|smaller\s+(?:steps|tasks|parts)|checklist|to[\s-]?do\s+list|plan(?:ned)?|step[\s-]?by[\s-]?step)\b/i,
+      },
+      {
+        label: 'Action: identified dependencies and tracked progress',
+        tip: 'Mention identifying which items depended on others and tracking your progress as you worked.',
+        regex:
+          /\b(?:depend(?:ed|ent|ency|encies|s)?|track(?:ed|ing)?|progress|spreadsheet|tracker|monitor(?:ed)?|order|sequence)\b/i,
+      },
+      {
+        label: 'Result: task became manageable and was completed successfully',
+        tip: 'Close with the result: the task became manageable, details stayed under control, and it was completed successfully.',
+        regex:
+          /\b(?:manageable|completed|successfully|on\s+time|result|finished|delivered|kept\s+track|accurate(?:ly)?)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q9',
+    roleCategory: 'Virtual Assistant',
+    category: 'Working Independently (STAR)',
+    question: 'Tell me about a time you had to work independently.',
+    proposedAnswer:
+      "Situation: I was assigned a task while the person who normally provided guidance was not immediately available. Task: I needed to keep the work moving without making decisions outside my responsibility. Action: I reviewed the information I already had, used available resources to answer routine questions and identified the few items that genuinely required clarification. I communicated those questions clearly and continued with the work I could complete independently. Result: The task was completed successfully and I became more confident in knowing when to act independently and when to ask for help.",
+    expectedFocus:
+      'STAR example: working without immediate guidance, keeping work moving within your responsibility, using available resources for routine questions, isolating the few items needing clarification, communicating clearly, and knowing when to ask for help.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: no immediate guidance, but work had to keep moving within your responsibility',
+        tip: 'Describe a time your usual guidance was unavailable and you had to keep work moving without overstepping your responsibility.',
+        regex:
+          /\b(?:independent(?:ly)?|on\s+my\s+own|without\s+(?:guidance|supervision|help)|not\s+(?:immediately\s+)?available|away|unavailable|responsibilit(?:y|ies)|keep\s+(?:the\s+)?work\s+moving)\b/i,
+      },
+      {
+        label: 'Action: used available information & resources for routine questions',
+        tip: 'Explain how you reviewed the information you already had and used available resources to answer routine questions yourself.',
+        regex:
+          /\b(?:review(?:ed)?|resources?|information\s+i\s+(?:already\s+)?had|documentation|notes|guides?|research(?:ed)?|figured\s+out|routine)\b/i,
+      },
+      {
+        label: 'Action: identified what truly needed clarification and communicated it clearly',
+        tip: 'Mention that you identified the few items that genuinely needed clarification and communicated those questions clearly.',
+        regex:
+          /\b(?:clarif(?:y|ication|ied)|questions?|communicat(?:e|ed|ing)|ask(?:ed)?|email(?:ed)?|messag(?:e|ed)|follow(?:ed)?\s+up)\b/i,
+      },
+      {
+        label: 'Result: task completed & confidence in when to act alone vs. ask for help',
+        tip: 'Close with the result: the task was completed and you learned when to act independently and when to ask for help.',
+        regex:
+          /\b(?:completed|successfully|confiden(?:t|ce)|when\s+to\s+(?:act|ask)|ask\s+for\s+help|result|learn(?:ed|t)|finished)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'va_q10',
+    roleCategory: 'Virtual Assistant',
+    category: 'Learning a New Tool Quickly (STAR)',
+    question: 'Tell me about a time you had to learn a new tool quickly.',
+    proposedAnswer:
+      'Situation: I was asked to use a software tool that I had not worked with before. Task: I needed to learn the functions required for my work quickly so the project would not be delayed. Action: I focused first on the specific tasks I needed to perform, used available tutorials and documentation, practiced the workflow and wrote down important steps. Once I was comfortable with the basics, I explored shortcuts that could improve my efficiency. Result: I became productive with the tool quickly and was able to complete the required work without depending on someone else for every step.',
+    expectedFocus:
+      'STAR example: unfamiliar software needed quickly, focusing on the tasks actually required, using tutorials and documentation, practicing and writing down steps, exploring shortcuts, and becoming productive without depending on others.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: unfamiliar tool that had to be learned quickly to avoid delays',
+        tip: 'Describe the new tool you had never used before and why you needed to learn it quickly.',
+        regex:
+          /\b(?:new\s+(?:tool|software|system|platform|app)|never\s+(?:used|worked)|had\s+not\s+(?:used|worked)|unfamiliar|quickly|delay(?:ed)?)\b/i,
+      },
+      {
+        label: 'Action: focused on required tasks using tutorials & documentation',
+        tip: 'Explain how you focused on the specific tasks you needed first and used tutorials or documentation.',
+        regex:
+          /\b(?:specific\s+tasks?|tasks?\s+i\s+needed|tutorials?|documentation|videos?|guides?|help\s+(?:articles|center)|youtube|course)\b/i,
+      },
+      {
+        label: 'Action: practiced the workflow, noted key steps, then explored shortcuts',
+        tip: 'Mention practicing the workflow, writing down important steps, and later exploring shortcuts to work faster.',
+        regex:
+          /\b(?:practic(?:e|ed|ing)|wrote\s+down|notes?|steps?|shortcuts?|features?|efficien(?:t|cy)|hands[\s-]?on)\b/i,
+      },
+      {
+        label: 'Result: became productive quickly without depending on others',
+        tip: 'Close with the result: you became productive quickly and completed the work without relying on someone else for every step.',
+        regex:
+          /\b(?:productive|proficient|comfortable|without\s+(?:depending|relying|help)|independent(?:ly)?|result|completed|quickly)\b/i,
+      },
+    ],
+  },
+];
+
+export const TECHNICAL_SUPPORT_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
+  {
+    id: 'it_q1',
+    roleCategory: 'Technical Support',
+    category: 'Technical Support Introduction',
+    question: 'Tell me about yourself.',
+    proposedAnswer:
+      'I’m a technically minded professional who enjoys troubleshooting problems and helping people use technology effectively. I’m comfortable researching issues, following logical troubleshooting steps and learning new systems. I also understand that technical support is not only about fixing the technology — it is about communicating clearly with the person experiencing the problem. I’m interested in this role because it would allow me to combine problem-solving with customer support.',
+    expectedFocus:
+      'Technically minded, enjoys troubleshooting and helping people use technology, researching issues and following logical steps, learning new systems, communicating clearly with users, and combining problem-solving with customer support.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Technically minded & enjoys troubleshooting problems',
+        tip: 'Introduce yourself as someone technically minded who enjoys troubleshooting and solving technical problems.',
+        regex:
+          /\b(?:technical(?:ly)?|technology|tech|troubleshoot(?:ing)?|it\b|computers?|systems?|hardware|software|problem[\s-]?solv(?:e|ing))\b/i,
+      },
+      {
+        label: 'Research, logical troubleshooting steps & learning new systems',
+        tip: 'Mention being comfortable researching issues, following logical troubleshooting steps and learning new systems.',
+        regex:
+          /\b(?:research(?:ing)?|logical|step[\s-]?by[\s-]?step|steps|methodical|learn(?:ing)?\s+new|new\s+systems?|diagnos(?:e|ing))\b/i,
+      },
+      {
+        label: 'Support is also about communicating clearly with the user',
+        tip: 'Show you understand support is not only fixing technology but communicating clearly with the person affected.',
+        regex:
+          /\b(?:communicat(?:e|ing|ion)|clear(?:ly)?|users?|people|explain(?:ing)?|person\s+experiencing|patient|patience)\b/i,
+      },
+      {
+        label: 'Motivation: combining problem-solving with customer support',
+        tip: 'Explain why this role interests you — combining problem-solving with helping customers.',
+        regex:
+          /\b(?:interested|combine|customer\s+support|help(?:ing)?\s+(?:people|users|customers)|this\s+role|enjoy|passion(?:ate)?)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q2',
+    roleCategory: 'Technical Support',
+    category: 'Structured Troubleshooting Method',
+    question: 'How do you troubleshoot a technical problem?',
+    proposedAnswer:
+      'I start by clearly defining the problem and gathering information about what changed, what the user sees and when the issue started. Then I try to isolate the cause by testing the most likely possibilities one at a time. I avoid making several changes at once because that can make the problem harder to diagnose. After applying a solution, I verify that the issue is actually resolved and document the steps when appropriate.',
+    expectedFocus:
+      'Defining the problem and gathering information (what changed, what the user sees, when it started), isolating the cause by testing likely possibilities one at a time, avoiding multiple simultaneous changes, verifying the fix, and documenting steps.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Define the problem & gather information (what changed, what the user sees, when it started)',
+        tip: 'Start by explaining how you define the problem and gather details: what changed, what the user sees and when it started.',
+        regex:
+          /\b(?:defin(?:e|ing)|gather(?:ing)?|information|details|what\s+changed|when\s+(?:it|the\s+issue)\s+started|error\s+messages?|ask(?:ing)?\s+(?:the\s+)?(?:user|questions)|symptoms?)\b/i,
+      },
+      {
+        label: 'Isolate the cause by testing likely possibilities one at a time',
+        tip: 'Describe isolating the cause by testing the most likely possibilities one at a time.',
+        regex:
+          /\b(?:isolat(?:e|ing)|narrow(?:ing)?\s+down|one\s+at\s+a\s+time|test(?:ing)?|most\s+likely|possibilit(?:y|ies)|root\s+cause|reproduc(?:e|ing)|eliminat(?:e|ing))\b/i,
+      },
+      {
+        label: 'Avoid making several changes at once',
+        tip: 'Mention that you avoid changing several things at once because it makes the problem harder to diagnose.',
+        regex:
+          /\b(?:several\s+changes|multiple\s+changes|changes\s+at\s+once|one\s+change|at\s+once|simultaneous(?:ly)?|harder\s+to\s+diagnose|controlled)\b/i,
+      },
+      {
+        label: 'Verify the fix & document the steps',
+        tip: 'Finish by confirming the issue is actually resolved and documenting the steps when appropriate.',
+        regex:
+          /\b(?:verif(?:y|ied|ying)|confirm(?:ed|ing)?|actually\s+resolved|test(?:ed)?\s+again|document(?:ed|ing|ation)?|notes?|ticket|knowledge\s+base)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q3',
+    roleCategory: 'Technical Support',
+    category: 'Learning New Technology',
+    question: 'How do you learn new technology quickly?',
+    proposedAnswer:
+      'I focus first on understanding what I need the technology to accomplish rather than trying to learn every feature at once. I use official documentation, tutorials or knowledge bases, then practice the most common workflows. If I run into a problem, I research the specific issue and ask targeted questions when necessary. Once I understand the basics, I continue learning through hands-on use.',
+    expectedFocus:
+      'Focusing on what the technology must accomplish instead of every feature, using official documentation, tutorials and knowledge bases, practicing common workflows, researching specific issues and asking targeted questions, and continuing through hands-on use.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Focus on what the technology needs to accomplish, not every feature',
+        tip: 'Explain that you start with what you need the technology to accomplish rather than learning every feature at once.',
+        regex:
+          /\b(?:accomplish|purpose|what\s+i\s+need|goal|use\s+cases?|every\s+feature|core\s+functions?|basics|priorit(?:y|ize))\b/i,
+      },
+      {
+        label: 'Use official documentation, tutorials or knowledge bases',
+        tip: 'Mention using official documentation, tutorials or knowledge bases.',
+        regex:
+          /\b(?:documentation|docs|tutorials?|knowledge\s+bases?|manuals?|guides?|videos?|courses?|official)\b/i,
+      },
+      {
+        label: 'Practice common workflows; research specific issues & ask targeted questions',
+        tip: 'Describe practicing the most common workflows, researching specific issues and asking targeted questions when needed.',
+        regex:
+          /\b(?:practic(?:e|ing)|workflows?|research(?:ing)?|specific\s+issue|targeted\s+questions?|ask(?:ing)?\s+(?:questions|colleagues|for\s+help)|forums?|lab|sandbox)\b/i,
+      },
+      {
+        label: 'Keep learning through hands-on use',
+        tip: 'Close by explaining that you keep building your knowledge through hands-on use.',
+        regex:
+          /\b(?:hands[\s-]?on|continu(?:e|ing)\s+(?:to\s+)?learn(?:ing)?|keep\s+learning|daily\s+use|experience|over\s+time|experiment(?:ing)?)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q4',
+    roleCategory: 'Technical Support',
+    category: 'Handling Frustrated Users',
+    question: 'How do you handle a frustrated user?',
+    proposedAnswer:
+      'I first let the user explain the issue without interrupting and acknowledge the frustration. Then I ask focused questions so I can understand the technical problem. I explain what I’m going to check in simple language rather than using unnecessary technical terms. Once I identify the solution, I guide the user through it clearly and confirm that the issue is resolved before ending the interaction.',
+    expectedFocus:
+      'Letting the user explain without interrupting, acknowledging the frustration, asking focused questions, explaining checks in simple language without jargon, guiding the user through the fix, and confirming resolution before ending.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Let the user explain without interrupting & acknowledge the frustration',
+        tip: 'Start by letting the user explain without interrupting and acknowledging their frustration.',
+        regex:
+          /\b(?:listen(?:ing)?|without\s+interrupting|let\s+(?:them|the\s+user)\s+explain|acknowledg(?:e|ing)|empath(?:y|ize|ise)|understand\s+(?:their|the)\s+frustration|calm|apologi[sz]e)\b/i,
+      },
+      {
+        label: 'Ask focused questions to understand the technical problem',
+        tip: 'Mention asking focused questions to understand the actual technical problem.',
+        regex:
+          /\b(?:focused\s+questions?|ask(?:ing)?\s+(?:questions|them)|questions?|understand\s+the\s+(?:technical\s+)?problem|details|clarif(?:y|ying))\b/i,
+      },
+      {
+        label: 'Explain checks in simple language without unnecessary jargon',
+        tip: 'Explain what you are going to check in simple language rather than unnecessary technical terms.',
+        regex:
+          /\b(?:simple\s+(?:language|terms|words)|plain\s+(?:language|english)|jargon|technical\s+terms|explain(?:ing)?\s+what|non[\s-]?technical|easy\s+to\s+understand)\b/i,
+      },
+      {
+        label: 'Guide them through the fix & confirm it is resolved before ending',
+        tip: 'Finish by guiding the user through the solution and confirming it is resolved before ending the interaction.',
+        regex:
+          /\b(?:guide|walk(?:ed)?\s+(?:them|the\s+user)\s+through|step\s+by\s+step|confirm(?:ing)?|resolved|before\s+ending|follow(?:ing)?\s+up|make\s+sure)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q5',
+    roleCategory: 'Technical Support',
+    category: 'Value Proposition for Technical Support',
+    question: 'Why should we hire you for technical support?',
+    proposedAnswer:
+      'You should hire me because I combine technical problem-solving with patience and communication. I approach issues logically instead of guessing, and I’m comfortable researching unfamiliar problems when I don’t immediately know the answer. I also understand that users need clear explanations, not just technical jargon. I would bring a dependable attitude, a willingness to keep learning and a focus on resolving issues effectively.',
+    expectedFocus:
+      'Combining technical problem-solving with patience and communication, a logical approach instead of guessing, comfort researching unfamiliar problems, clear explanations instead of jargon, dependability, willingness to learn and a focus on resolving issues.',
+    isBehavioralStar: false,
+    markingPillars: [
+      {
+        label: 'Technical problem-solving combined with patience & communication',
+        tip: 'Highlight that you combine technical problem-solving with patience and communication.',
+        regex:
+          /\b(?:problem[\s-]?solv(?:e|ing|er)|technical\s+skills?|patien(?:ce|t)|communicat(?:e|ion|ing)|troubleshoot(?:ing)?)\b/i,
+      },
+      {
+        label: 'Logical approach & comfortable researching unfamiliar problems',
+        tip: 'Mention approaching issues logically instead of guessing, and researching problems you do not immediately know.',
+        regex:
+          /\b(?:logical(?:ly)?|instead\s+of\s+guessing|methodical|research(?:ing)?|unfamiliar|don'?t\s+(?:immediately\s+)?know|find\s+(?:the\s+)?answers?)\b/i,
+      },
+      {
+        label: 'Clear explanations for users, not just technical jargon',
+        tip: 'Show that you understand users need clear explanations, not just technical jargon.',
+        regex:
+          /\b(?:clear\s+explanations?|explain(?:ing)?|jargon|plain\s+language|simple\s+terms|users?\s+need|non[\s-]?technical)\b/i,
+      },
+      {
+        label: 'Dependable, keeps learning, focused on resolving issues',
+        tip: 'Finish with what you bring: dependability, willingness to keep learning and a focus on resolving issues effectively.',
+        regex:
+          /\b(?:dependab(?:le|ility)|reliab(?:le|ility)|keep\s+learning|willing(?:ness)?|resolv(?:e|ing)\s+issues|effective(?:ly)?|attitude|commit(?:ted|ment))\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q6',
+    roleCategory: 'Technical Support',
+    category: 'Solving a Difficult Technical Problem (STAR)',
+    question: 'Tell me about a difficult technical problem you solved.',
+    proposedAnswer:
+      "Situation: A user reported a technical issue that was not resolved by the normal first troubleshooting steps. Task: I needed to identify the likely cause and restore the user's ability to work. Action: I gathered information about when the issue started and what the user had already tried. I then isolated the problem by testing the likely causes one at a time rather than changing several things simultaneously. Once I identified the cause, I applied the appropriate fix and tested the system again. Result: The issue was resolved, the user was able to continue working and I documented the solution so it could be referenced if the problem appeared again.",
+    expectedFocus:
+      'STAR example: issue not fixed by first-line steps, gathering when it started and what was tried, isolating causes one at a time, applying the fix and retesting, restoring the user, and documenting the solution.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: issue not fixed by normal first steps; restore the user’s ability to work',
+        tip: 'Describe a technical issue the usual first steps did not fix, and your goal of getting the user working again.',
+        regex:
+          /\b(?:difficult|complex|unusual|not\s+resolved|first\s+(?:troubleshooting\s+)?steps|issue|problem|user\s+reported|restore|ability\s+to\s+work|couldn'?t\s+(?:log|connect|access))\b/i,
+      },
+      {
+        label: 'Action: gathered information — when it started & what was already tried',
+        tip: 'Explain how you gathered information: when the issue started and what the user had already tried.',
+        regex:
+          /\b(?:gather(?:ed|ing)|information|when\s+(?:it|the\s+issue)\s+started|already\s+tried|asked|logs?|error\s+messages?|details)\b/i,
+      },
+      {
+        label: 'Action: isolated the cause one at a time, applied the fix & retested',
+        tip: 'Describe testing likely causes one at a time, applying the right fix and testing the system again.',
+        regex:
+          /\b(?:isolat(?:e|ed|ing)|one\s+at\s+a\s+time|test(?:ed|ing)?|likely\s+causes?|root\s+cause|appl(?:y|ied)\s+(?:the\s+)?(?:appropriate\s+)?fix|reinstall(?:ed)?|reconfigur(?:e|ed)|updated|replaced)\b/i,
+      },
+      {
+        label: 'Result: issue resolved, user back to work & solution documented',
+        tip: 'Close with the result: the issue was resolved, the user could keep working and you documented the solution.',
+        regex:
+          /\b(?:resolved|fixed|solved|continue(?:d)?\s+working|back\s+to\s+work|document(?:ed|ation)?|knowledge\s+base|result|referenced)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q7',
+    roleCategory: 'Technical Support',
+    category: 'Troubleshooting Under Pressure (STAR)',
+    question: 'Describe a time you had to troubleshoot under pressure.',
+    proposedAnswer:
+      'Situation: A technical issue occurred during a time-sensitive period and was affecting an important task. Task: I needed to restore functionality quickly without making the situation worse. Action: I stayed calm, identified the immediate impact, gathered the key facts and focused first on the most likely causes. I tested solutions in a controlled way and communicated updates so the user knew what was happening. Result: The issue was resolved within the available time, and the user was able to continue the task. The experience reinforced the importance of staying methodical even when the situation feels urgent.',
+    expectedFocus:
+      'STAR example: time-sensitive outage affecting an important task, restoring function quickly without making it worse, staying calm, identifying impact and key facts, testing likely causes in a controlled way, communicating updates, and staying methodical.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: time-sensitive issue; restore quickly without making it worse',
+        tip: 'Describe the urgent, time-sensitive issue and your goal of restoring it quickly without making things worse.',
+        regex:
+          /\b(?:pressure|urgent|time[\s-]?sensitive|deadline|quickly|important\s+(?:task|meeting|presentation)|minutes|without\s+making\s+(?:it|the\s+situation)\s+worse|critical)\b/i,
+      },
+      {
+        label: 'Action: stayed calm, identified the impact & gathered key facts',
+        tip: 'Explain how you stayed calm, identified the immediate impact and gathered the key facts.',
+        regex:
+          /\b(?:calm|composed|focused|impact|key\s+facts|gather(?:ed|ing)|assess(?:ed)?|priorit(?:y|ized|ised))\b/i,
+      },
+      {
+        label: 'Action: tested likely causes in a controlled way & communicated updates',
+        tip: 'Mention testing the most likely causes in a controlled way and keeping the user updated.',
+        regex:
+          /\b(?:most\s+likely|controlled|test(?:ed|ing)?|one\s+at\s+a\s+time|communicat(?:e|ed|ing)|updat(?:e|es|ed)|kept\s+(?:them|the\s+user)\s+(?:informed|updated))\b/i,
+      },
+      {
+        label: 'Result: resolved in time & lesson about staying methodical',
+        tip: 'Close with the result: resolved within the time available, and how it reinforced staying methodical under urgency.',
+        regex:
+          /\b(?:resolved|fixed|restored|in\s+time|on\s+time|continue(?:d)?|methodical|result|learn(?:ed|t)|reinforced)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q8',
+    roleCategory: 'Technical Support',
+    category: 'Learning New Technology Quickly (STAR)',
+    question: 'Tell me about a time you learned a new technology quickly.',
+    proposedAnswer:
+      'Situation: I was required to work with a technology that I had not used before. Task: I needed to become productive with the core functions quickly. Action: I identified exactly what I needed to accomplish, reviewed the available documentation, practiced the workflow and researched specific questions as they came up. I focused on understanding why the system worked the way it did instead of simply memorizing clicks. Result: I became comfortable enough to complete the required work quickly and continued building my knowledge through hands-on use.',
+    expectedFocus:
+      'STAR example: unfamiliar technology needed quickly, identifying what had to be accomplished, reviewing documentation, practicing the workflow, researching questions as they arose, understanding why the system works rather than memorizing clicks, and continued hands-on learning.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: unfamiliar technology with core functions needed quickly',
+        tip: 'Describe the technology you had not used before and why you needed to become productive quickly.',
+        regex:
+          /\b(?:new\s+(?:technology|tool|software|system|platform)|never\s+used|had\s+not\s+used|unfamiliar|quickly|core\s+functions?)\b/i,
+      },
+      {
+        label: 'Action: identified goals, reviewed documentation & practiced the workflow',
+        tip: 'Explain how you identified exactly what you needed to accomplish, reviewed documentation and practiced the workflow.',
+        regex:
+          /\b(?:documentation|docs|tutorials?|practic(?:e|ed|ing)|workflow|identif(?:y|ied)\s+(?:exactly\s+)?what|accomplish|guides?)\b/i,
+      },
+      {
+        label: 'Action: researched questions & understood why the system works (not memorizing clicks)',
+        tip: 'Mention researching questions as they came up and understanding why the system worked rather than memorizing clicks.',
+        regex:
+          /\b(?:research(?:ed|ing)?|understand(?:ing)?\s+why|how\s+(?:it|the\s+system)\s+work(?:s|ed)|memori[sz](?:e|ing)|under\s+the\s+hood|concepts?|questions?)\b/i,
+      },
+      {
+        label: 'Result: productive quickly & kept learning hands-on',
+        tip: 'Close with the result: you completed the required work quickly and kept learning through hands-on use.',
+        regex:
+          /\b(?:productive|comfortable|proficient|completed|quickly|hands[\s-]?on|continu(?:e|ed)\s+(?:building|learning)|result)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q9',
+    roleCategory: 'Technical Support',
+    category: 'Supporting a Frustrated User (STAR)',
+    question: 'Describe a time you dealt with a frustrated user.',
+    proposedAnswer:
+      'Situation: A user was frustrated because a technical problem was preventing them from completing an important task. Task: I needed to troubleshoot the issue while keeping the interaction professional and productive. Action: I let the user explain what was happening, acknowledged the frustration and asked focused questions to narrow down the problem. I explained the troubleshooting steps in simple language and kept the user updated instead of leaving them wondering what was happening. Result: We identified and resolved the issue, and the user understood what had been done. It reminded me that good technical support requires both technical reasoning and empathy.',
+    expectedFocus:
+      'STAR example: frustrated user blocked from an important task, keeping it professional, letting them explain, acknowledging frustration, focused questions, simple-language explanations and regular updates, resolving the issue, and balancing technical reasoning with empathy.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: frustrated user blocked from an important task; keep it professional',
+        tip: 'Describe the frustrated user, what the problem was stopping them from doing, and your goal of keeping it professional.',
+        regex:
+          /\b(?:frustrat(?:ed|ion)|upset|angry|annoyed|stressed|important\s+task|deadline|professional|productive)\b/i,
+      },
+      {
+        label: 'Action: let them explain, acknowledged frustration & asked focused questions',
+        tip: 'Explain how you let the user explain, acknowledged their frustration and asked focused questions to narrow down the problem.',
+        regex:
+          /\b(?:listen(?:ed|ing)?|let\s+(?:them|the\s+user)\s+explain|acknowledg(?:ed|ing)|empath(?:y|ized|ised)|focused\s+questions?|narrow(?:ed)?\s+down|asked)\b/i,
+      },
+      {
+        label: 'Action: explained steps in simple language & kept the user updated',
+        tip: 'Mention explaining the troubleshooting steps in simple language and keeping the user updated throughout.',
+        regex:
+          /\b(?:simple\s+(?:language|terms)|plain\s+language|explain(?:ed|ing)|jargon|kept\s+(?:them|the\s+user)\s+(?:updated|informed)|updates?|reassur(?:e|ed))\b/i,
+      },
+      {
+        label: 'Result: resolved, user understood the fix & lesson: reasoning plus empathy',
+        tip: 'Close with the result: the issue was resolved, the user understood what was done, and support needs both technical reasoning and empathy.',
+        regex:
+          /\b(?:resolved|fixed|solved|understood|empathy|technical\s+reasoning|result|thank(?:ed|ful)|satisfied|reminded)\b/i,
+      },
+    ],
+  },
+  {
+    id: 'it_q10',
+    roleCategory: 'Technical Support',
+    category: 'Technical Mistake & Correction (STAR)',
+    question: 'Tell me about a technical mistake you made and how you corrected it.',
+    proposedAnswer:
+      'Situation: I once made a technical change that produced an unexpected result. Task: I needed to identify what happened, minimize the impact and restore the correct configuration. Action: I stopped making additional changes, reviewed the steps I had taken, corrected or restored the affected setting and then tested the system carefully before continuing. I also documented what happened and added an extra verification step to my process. Result: The issue was corrected, and the experience taught me to slow down and verify changes rather than assuming a configuration change will behave exactly as expected.',
+    expectedFocus:
+      'STAR example: a change with an unexpected result, owning it, minimizing impact, stopping further changes, reviewing the steps taken, restoring the correct setting and retesting, documenting it, adding a verification step, and learning to verify changes.',
+    isBehavioralStar: true,
+    markingPillars: [
+      {
+        label: 'Situation/Task: own technical change caused an unexpected result; minimize impact',
+        tip: 'Honestly describe a technical change you made that had an unexpected result and your goal of minimizing the impact.',
+        regex:
+          /\b(?:mistake|error|i\s+(?:made|changed|configured|deleted|broke)|unexpected|wrong\s+(?:setting|configuration)|misconfigur(?:ed|ation)|minimi[sz]e\s+(?:the\s+)?impact|accidentally)\b/i,
+      },
+      {
+        label: 'Action: stopped further changes & reviewed the steps taken',
+        tip: 'Explain that you stopped making additional changes and reviewed the steps you had taken.',
+        regex:
+          /\b(?:stopp(?:ed|ing)|no\s+(?:further|more)\s+changes|additional\s+changes|review(?:ed|ing)?\s+(?:the\s+)?steps|retrac(?:e|ed)|figured\s+out\s+what\s+happened|identif(?:y|ied)\s+what\s+happened)\b/i,
+      },
+      {
+        label: 'Action: restored the correct setting, retested & documented it',
+        tip: 'Describe restoring the correct setting, testing carefully before continuing, and documenting what happened.',
+        regex:
+          /\b(?:restor(?:e|ed)|revert(?:ed)?|roll(?:ed)?\s+back|correct(?:ed)?|test(?:ed|ing)?|document(?:ed|ation)?|undo|backup)\b/i,
+      },
+      {
+        label: 'Result: corrected & added a verification step — slow down and verify changes',
+        tip: 'Close with the result: it was corrected, and you added a verification step and learned to verify changes before assuming they work.',
+        regex:
+          /\b(?:verif(?:y|ication|ied)|extra\s+step|checklist|slow\s+down|double[\s-]?check|learn(?:ed|t)|taught|process|result|lesson)\b/i,
+      },
+    ],
+  },
+];
+
+export const ALL_STANDARD_QUESTION_ROWS: CustomerServiceQuestionRow[] = [
+  UNIVERSAL_FIRST_QUESTION_ROW,
+  ...CUSTOMER_SERVICE_QUESTION_TABLE,
+  ...VIRTUAL_ASSISTANT_QUESTION_TABLE,
+  ...TECHNICAL_SUPPORT_QUESTION_TABLE,
+];
+
+export function isVirtualAssistantRole(role: string): boolean {
+  return /\b(?:virtual\s+assistant|executive\s+assistant|administrative\s+assistant|remote\s+assistant|personal\s+assistant|general\s+va|admin\s+support|office\s+assistant|\bva\b)\b/i.test(
+    role || ''
+  );
+}
+
+export function isTechnicalSupportRole(role: string): boolean {
+  return /\b(?:tech(?:nical)?\s+support|it\s+support|help\s*desk|service\s*desk|desktop\s+support|systems?\s+support|network\s+support|tier\s*[123]\s*support|troubleshoot(?:er|ing)?|computer\s+technician|it\s+specialist)\b/i.test(
+    role || ''
+  );
+}
+
+/**
+ * Alternative ways of asking the universal opening question. First-time candidates
+ * always hear the canonical wording (UNIVERSAL_FIRST_QUESTION_ROW.question); returning
+ * candidates hear one of these so repeat sessions still feel like a real interview.
+ * All variants share the same id ('universal_q1') and therefore the same marking guide.
+ * The wording is role-neutral so it works for any job position.
+ */
+export const UNIVERSAL_FIRST_QUESTION_VARIANTS: string[] = [
+  'Can you take me through your work experience so far, and tell me what makes you the strongest candidate for this role?',
+  'Give me an overview of your professional background, and explain why you believe you are the right fit for this position.',
+  'Tell me about the experience you bring, and why you think you would be the best person for this job.',
+  'Walk me through your career path up to now, and what makes you a great match for this opportunity.',
+  'How has your professional experience prepared you for this role, and why should we choose you over other candidates?',
+];
+
+/** Max score every interview is marked on, regardless of how many questions were asked. */
+export const INTERVIEW_MAX_SCORE = 20;
+/** Passing benchmark on the /20 scale (65%). */
+export const INTERVIEW_PASSING_SCORE = 13;
+export const DEFAULT_QUESTION_COUNT = 4;
+export const EXTENDED_QUESTION_COUNT = 5;
+
+/**
+ * Decides how many questions a session gets: 4 by default, 5 for returning candidates who
+ * have already completed at least one interview (they get one extra role question so
+ * repeat practice covers more of the bank). The total is always normalized to /20.
+ */
+export function decideQuestionCount(params: { completedSessionsCount: number }): number {
+  return params.completedSessionsCount > 0 ? EXTENDED_QUESTION_COUNT : DEFAULT_QUESTION_COUNT;
+}
+
+/** Returns the role's question bank (used for selection and for marking-guide lookups). */
+export function getQuestionBankForRole(role: string): CustomerServiceQuestionRow[] | null {
+  if (isVirtualAssistantRole(role)) return VIRTUAL_ASSISTANT_QUESTION_TABLE;
+  if (isTechnicalSupportRole(role)) return TECHNICAL_SUPPORT_QUESTION_TABLE;
+  if (isCustomerServiceOrSupportRole(role)) return CUSTOMER_SERVICE_QUESTION_TABLE;
+  return null;
+}
+
+/**
+ * Builds the interview session question list:
+ * Question 1: Universal First Question — canonical wording for first-time candidates,
+ *             a rotating alternative wording for returning candidates.
+ * Questions 2..N: shuffled from the 10-question bank matching the candidate's role
+ *             (Q1 "Tell me about yourself" of each bank is skipped because the universal
+ *             question already covers it).
+ * N is 4 by default and 5 for returning candidates (see decideQuestionCount).
+ * Each answer is graded 0-5 and the session total is normalized to /20.
+ */
+export function selectQuestionsForInterviewSession(
+  role: string,
+  skills: string[],
+  options: { isFirstTimeCandidate?: boolean; questionCount?: number } = {}
+): ResumeExaminationResult['questions'] {
+  const isFirstTime = options.isFirstTimeCandidate !== false;
+  const questionCount = Math.max(
+    DEFAULT_QUESTION_COUNT,
+    Math.min(EXTENDED_QUESTION_COUNT, options.questionCount || DEFAULT_QUESTION_COUNT)
+  );
+  const roleQuestionsNeeded = questionCount - 1;
+
+  const q1Text = isFirstTime
+    ? UNIVERSAL_FIRST_QUESTION_ROW.question
+    : UNIVERSAL_FIRST_QUESTION_VARIANTS[crypto.randomInt(UNIVERSAL_FIRST_QUESTION_VARIANTS.length)];
+
+  const q1 = {
+    id: UNIVERSAL_FIRST_QUESTION_ROW.id,
+    number: 1,
+    category: UNIVERSAL_FIRST_QUESTION_ROW.category,
+    question: q1Text,
+    expectedFocus: UNIVERSAL_FIRST_QUESTION_ROW.expectedFocus,
+    proposedAnswer: UNIVERSAL_FIRST_QUESTION_ROW.proposedAnswer,
+    isBehavioralStar: false,
+  };
+
+  let pool: CustomerServiceQuestionRow[] = [];
+
+  if (isVirtualAssistantRole(role)) {
+    // Pick 3 from VA questions 2 through 10
+    pool = VIRTUAL_ASSISTANT_QUESTION_TABLE.slice(1);
+  } else if (isTechnicalSupportRole(role)) {
+    // Pick 3 from Tech Support questions 2 through 10
+    pool = TECHNICAL_SUPPORT_QUESTION_TABLE.slice(1);
+  } else if (isCustomerServiceOrSupportRole(role)) {
+    // Pick 3 from CS questions 2 through 10
+    pool = CUSTOMER_SERVICE_QUESTION_TABLE.slice(1);
+  } else {
+    // Fallback tailored questions
+    const tailored = buildTailoredQuestionsForRole(role, skills).slice(1);
+    const shuffledTailored = [...tailored]
+      .sort(() => Math.random() - 0.5)
+      .slice(0, roleQuestionsNeeded);
+    return [
+      q1,
+      ...shuffledTailored.map((q, idx) => ({
+        ...q,
+        number: idx + 2,
+      })),
+    ];
+  }
+
+  // Shuffle pool using Fisher-Yates
+  const shuffledPool = [...pool];
+  for (let i = shuffledPool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const temp = shuffledPool[i];
+    shuffledPool[i] = shuffledPool[j];
+    shuffledPool[j] = temp;
+  }
+
+  const selectedRoleQuestions = shuffledPool.slice(0, roleQuestionsNeeded);
+
+  return [
+    q1,
+    ...selectedRoleQuestions.map((item, idx) => ({
+      id: item.id,
+      number: idx + 2,
+      category: item.category,
+      question: item.question,
+      expectedFocus: item.expectedFocus,
+      proposedAnswer: item.proposedAnswer,
+      isBehavioralStar: item.isBehavioralStar,
+    })),
+  ];
+}
+
+/**
+ * Finds the marking-guide row for a question. Several banks share identical question text
+ * ("Tell me about yourself.", "Why should we hire you?"), so the lookup must be by id first;
+ * a text match is only attempted inside the candidate's own role bank (plus the universal row).
+ */
+export function findMarkingGuideRow(
+  questionId: string,
+  questionText: string,
+  role: string
+): CustomerServiceQuestionRow | null {
+  const byId = ALL_STANDARD_QUESTION_ROWS.find((r) => r.id === questionId);
+  if (byId) return byId;
+
+  const normalizedText = (questionText || '').toLowerCase().trim();
+  if (!normalizedText) return null;
+  const scopedRows = [UNIVERSAL_FIRST_QUESTION_ROW, ...(getQuestionBankForRole(role) || [])];
+  return (
+    scopedRows.find((r) => r.question.toLowerCase().trim() === normalizedText) ||
+    (UNIVERSAL_FIRST_QUESTION_VARIANTS.some((v) => v.toLowerCase() === normalizedText)
+      ? UNIVERSAL_FIRST_QUESTION_ROW
+      : null)
+  );
+}
+
+export interface AnswerAlignmentResult {
+  isOnTopic: boolean;
+  scoreOutOf5: number;
+  /** 0-100: how closely the answer follows the direction of the suggested answer. */
+  alignmentPercent: number;
+  /** Marking-guide points the answer covered / missed (from the question's pillars). */
+  matchedPoints: string[];
+  missedPoints: string[];
+  feedback: string;
+  strengths: string[];
+  improvementTip: string;
+  gradingMethod: 'marking_guide' | 'marking_guide+ai';
+}
+
+/**
+ * Grades an answer by how closely it follows the direction of the suggested answer for
+ * that position. The deterministic marking guide (pillars + concept overlap) is always
+ * computed; when an AI score is available it is blended (60% AI semantic judgement,
+ * 40% marking guide) and kept within 1.5 points of the guide score, so the mark stays
+ * anchored to the suggested answer instead of drifting with the model.
+ */
+export function gradeAnswerAgainstSuggestedAnswer(params: {
+  questionId: string;
+  questionText: string;
+  category: string;
+  expectedFocus: string;
+  proposedAnswer?: string;
+  candidateText: string;
+  role: string;
+  aiScoreOutOf5?: number | null;
+}): AnswerAlignmentResult {
+  const guide = evaluateCandidateResponseWithMarkingGuide(params);
+  const row = findMarkingGuideRow(params.questionId, params.questionText, params.role);
+  const matchedPoints: string[] = [];
+  const missedPoints: string[] = [];
+  if (row) {
+    for (const pillar of row.markingPillars) {
+      (pillar.regex.test(params.candidateText || '') ? matchedPoints : missedPoints).push(pillar.label);
+    }
+  }
+
+  let score = guide.isOnTopic ? guide.scoreOutOf5 : Math.min(guide.scoreOutOf5, 1);
+  let method: AnswerAlignmentResult['gradingMethod'] = 'marking_guide';
+  const ai = params.aiScoreOutOf5;
+  if (typeof ai === 'number' && Number.isFinite(ai)) {
+    const clampedAi = Math.max(0, Math.min(5, ai));
+    // The AI judges whether the answer makes sense against the suggested answer (meaning,
+    // not exact words), so it carries most of the weight; the marking guide keeps it honest
+    // (an AI score can never move the mark more than 2 points away from the guide).
+    const blended = clampedAi * 0.75 + score * 0.25;
+    score = Math.max(score - 2, Math.min(score + 2, blended));
+    method = 'marking_guide+ai';
+  }
+  score = Math.max(0, Math.min(5, Math.round(score * 2) / 2));
+
+  const totalPillars = matchedPoints.length + missedPoints.length;
+  const alignmentPercent = totalPillars
+    ? Math.round((matchedPoints.length / totalPillars) * 100)
+    : Math.round((score / 5) * 100);
+
+  return {
+    isOnTopic: guide.isOnTopic,
+    scoreOutOf5: score,
+    alignmentPercent,
+    matchedPoints,
+    missedPoints,
+    feedback: guide.feedback,
+    strengths: guide.strengths,
+    improvementTip: guide.improvementTip,
+    gradingMethod: method,
+  };
+}
+
+/**
+ * Normalizes a session's per-question scores (each 0-5) to the /20 scale, applies
+ * misconduct penalties (which are expressed in /20 points) and updates the session.
+ */
+export function recomputeSessionScore(
+  session: InterviewSessionRecord,
+  opts: { forceZero?: boolean } = {}
+): { rawOutOf20: number; totalOutOf20: number } {
+  const qCount = Math.max(1, session.questions.length || DEFAULT_QUESTION_COUNT);
+  const rawSum = session.questionEvaluations.reduce((sum, q) => sum + (Number(q.scoreOutOf5) || 0), 0);
+  const rawOutOf20 = Number(((rawSum / (qCount * 5)) * INTERVIEW_MAX_SCORE).toFixed(1));
+  const penalty = Number(session.misconductPenaltyPoints || 0);
+  const totalOutOf20 = opts.forceZero
+    ? 0
+    : Math.max(0, Math.min(INTERVIEW_MAX_SCORE, Number((rawOutOf20 - penalty).toFixed(1))));
+  session.totalScoreOutOf20 = totalOutOf20;
+  // Kept for backward compatibility with older clients/rows; holds the same /20 value.
+  session.totalScoreOutOf25 = totalOutOf20;
+  session.maxScore = INTERVIEW_MAX_SCORE;
+  session.percentageScore = Math.round((totalOutOf20 / INTERVIEW_MAX_SCORE) * 100);
+  return { rawOutOf20, totalOutOf20 };
+}
+
 /**
  * Evaluates a candidate's response against the question's Proposed Answer (Marking Guide).
  * - Does NOT require word-for-word memorization.
@@ -1625,15 +3528,9 @@ export function evaluateCandidateResponseWithMarkingGuide(params: {
     };
   }
 
-  // Look up the Customer Service table row if this question belongs to the CS Marking Guide
-  const csRow =
-    CUSTOMER_SERVICE_QUESTION_TABLE.find(
-      (r) =>
-        r.id === questionId ||
-        r.question.toLowerCase().trim() === (questionText || '').toLowerCase().trim()
-    ) || null;
+  const matchedRow = findMarkingGuideRow(questionId, questionText, role);
 
-  const refAnswer = proposedAnswer || csRow?.proposedAnswer || '';
+  const refAnswer = proposedAnswer || matchedRow?.proposedAnswer || '';
 
   // 2. Compute concept overlap with the Proposed Answer / Marking Guide
   const stopWords = new Set([
@@ -1711,12 +3608,12 @@ export function evaluateCandidateResponseWithMarkingGuide(params: {
     }
   }
 
-  // 3. Evaluate Marking Guide Pillars (if defined on the CS question row)
+  // 3. Evaluate Marking Guide Pillars (if defined on the question row)
   const matchedPillars: string[] = [];
   const missingTips: string[] = [];
 
-  if (csRow && csRow.markingPillars.length > 0) {
-    for (const pillar of csRow.markingPillars) {
+  if (matchedRow && matchedRow.markingPillars.length > 0) {
+    for (const pillar of matchedRow.markingPillars) {
       if (pillar.regex.test(clean)) {
         matchedPillars.push(pillar.label);
       } else {
@@ -1725,13 +3622,13 @@ export function evaluateCandidateResponseWithMarkingGuide(params: {
     }
   }
 
-  // Check general customer-service & professional sense signals
+  // Check general professional & domain sense signals
   const hasProfessionalSense =
-    /\b(?:customer(?:s)?|client(?:s)?|people|team|help(?:ed|ing)?|support(?:ed|ing)?|communicat(?:e|ed|ing|ion)|listen(?:ed|ing)?|solv(?:e|ed|ing)|solution(?:s)?|issue(?:s)?|problem(?:s)?|patient|patience|calm|polic(?:y|ies)|procedure(?:s)?|priorit(?:y|ize|ized|izing)|organiz(?:e|ed|ing)|accura(?:te|cy)|mistake|apologiz(?:e|ed)|follow(?:ed)?\s+up|resolv(?:e|ed|ing)|experience|work(?:ed|ing)?)\b/i.test(
+    /\b(?:customer(?:s)?|client(?:s)?|user(?:s)?|people|team|help(?:ed|ing)?|support(?:ed|ing)?|communicat(?:e|ed|ing|ion)|listen(?:ed|ing)?|solv(?:e|ed|ing)|solution(?:s)?|issue(?:s)?|problem(?:s)?|patient|patience|calm|polic(?:y|ies)|procedure(?:s)?|priorit(?:y|ize|ized|izing)|organiz(?:e|ed|ing)|accura(?:te|cy)|mistake|apologiz(?:e|ed)|follow(?:ed)?\s+up|resolv(?:e|ed|ing)|experience|work(?:ed|ing)?|troubleshoot(?:ing)?|software|hardware|network|deadline(?:s)?|schedule(?:s)?|notes?)\b/i.test(
       clean
     );
 
-  // If the answer has 0 matched pillars, 0 shared stems with the marking guide, and no professional/CS sense at all, it is off-topic!
+  // If the answer has 0 matched pillars, 0 shared stems with the marking guide, and no professional sense at all, it is off-topic!
   if (matchedPillars.length === 0 && sharedStemCount === 0 && !hasProfessionalSense) {
     return {
       isOnTopic: false,
@@ -1745,10 +3642,10 @@ export function evaluateCandidateResponseWithMarkingGuide(params: {
   // 4. Calculate Score on the 0 to 5 Scale based on Marking Guide alignment & sense
   let rawScore = 2.0;
 
-  if (csRow) {
+  if (matchedRow) {
     const pillarCount = matchedPillars.length; // 0 to 4
     // Base score from semantic marking pillars:
-    // 4 pillars -> 4.5, 3 pillars -> 3.8, 2 pillars -> 3.0, 1 pillar -> 2.3, 0 pillars (but on-topic) -> 2.0
+    // 4 pillars -> 4.6, 3 pillars -> 3.9, 2 pillars -> 3.1, 1 pillar -> 2.4, 0 pillars (but on-topic) -> 2.0
     if (pillarCount === 4) rawScore = 4.6;
     else if (pillarCount === 3) rawScore = 3.9;
     else if (pillarCount === 2) rawScore = 3.1;
@@ -1759,10 +3656,10 @@ export function evaluateCandidateResponseWithMarkingGuide(params: {
     const overlapBonus = Math.min(0.5, sharedStemCount * 0.08);
     rawScore += overlapBonus;
 
-    // For behavioral STAR questions (Q6-Q10), reward clear action + result explanation
-    if (csRow.isBehavioralStar) {
+    // For behavioral STAR questions, reward clear action + result explanation
+    if (matchedRow.isBehavioralStar) {
       const hasActionAndResult =
-        /\b(?:listened|checked|explained|organized|verified|acknowledged|contacted|gathered|followed|resolved|accepted|completed|satisfied)\b/i.test(
+        /\b(?:listened|checked|explained|organized|verified|acknowledged|contacted|gathered|followed|resolved|accepted|completed|satisfied|restored|diagnosed|delivered|isolated|repaired|corrected|updated|implemented)\b/i.test(
           clean
         );
       if (hasActionAndResult && wordCount >= 25) {
@@ -1777,7 +3674,7 @@ export function evaluateCandidateResponseWithMarkingGuide(params: {
       rawScore = Math.min(rawScore, 3.0);
     }
   } else {
-    // Non-CS role fallback scoring based on expectedFocus & depth
+    // Non-table role fallback scoring based on expectedFocus & depth
     rawScore = 2.5 + Math.min(2.0, wordCount / 25) + Math.min(0.5, sharedStemCount * 0.1);
   }
 
@@ -1824,9 +3721,13 @@ function buildTailoredQuestionsForRole(
       ? skills.slice(0, 4).join(', ')
       : 'your core professional tools and workflows';
 
-  // For ANY Customer Service or Customer Support role, draw 5 shuffled questions from the 10-question Customer Service table
-  if (isCustomerServiceOrSupportRole(role)) {
-    return selectShuffledCustomerServiceQuestions(5);
+  // For Virtual Assistant, Technical Support, or Customer Service, select 4 standard questions (Q1 = Universal First Question, followed by 3 shuffled role-specific questions)
+  if (
+    isVirtualAssistantRole(role) ||
+    isTechnicalSupportRole(role) ||
+    isCustomerServiceOrSupportRole(role)
+  ) {
+    return selectQuestionsForInterviewSession(role, skills);
   }
 
   if (normalizedRole.includes('virtual assistant')) {
@@ -3709,18 +5610,7 @@ CRITICAL INSTRUCTIONS:
           primaryText
         ).slice(0, 5);
 
-        const finalQuestions = isCustomerServiceOrSupportRole(finalRole)
-          ? selectShuffledCustomerServiceQuestions(5)
-          : Array.isArray(parsed.questions) && parsed.questions.length >= 5
-          ? parsed.questions.slice(0, 5).map((q: any, idx: number) => ({
-              id: `q${idx + 1}`,
-              number: idx + 1,
-              category: q.category || `Competency ${idx + 1}`,
-              question: q.question,
-              expectedFocus:
-                q.expectedFocus || 'Clear, structured STAR response with measurable results.',
-            }))
-          : buildTailoredQuestionsForRole(finalRole, finalSkills);
+        const finalQuestions = selectQuestionsForInterviewSession(finalRole, finalSkills);
 
         return {
           detectedRole: finalRole,
@@ -3750,40 +5640,57 @@ CRITICAL INSTRUCTIONS:
 // 5. EXPRESS API ROUTES
 // ============================================================================
 
-// 5.0 Customer Service Questions & Marking Guide Table Endpoint
-app.get('/api/customer-service-questions', async (_req, res) => {
+// 5.0 Question banks & marking guides (the answer key) — admin only
+app.get('/api/customer-service-questions', requireAdmin, async (_req, res) => {
   await seedCustomerServiceQuestionsToSupabase();
+  const mapRow = (q: CustomerServiceQuestionRow) => ({
+    id: q.id,
+    roleCategory: q.roleCategory,
+    category: q.category,
+    question: q.question,
+    proposedAnswer: q.proposedAnswer,
+    expectedFocus: q.expectedFocus,
+    isBehavioralStar: q.isBehavioralStar,
+  });
   return res.json({
-    role: 'Customer Service / Customer Support',
     maxSessionDurationMinutes: 10,
-    questionsPerSession: 5,
-    selectionMode: 'shuffled_non_chronological',
-    totalQuestionsInTable: CUSTOMER_SERVICE_QUESTION_TABLE.length,
-    questions: CUSTOMER_SERVICE_QUESTION_TABLE.map((q) => ({
-      id: q.id,
-      roleCategory: q.roleCategory,
-      category: q.category,
-      question: q.question,
-      proposedAnswer: q.proposedAnswer,
-      expectedFocus: q.expectedFocus,
-      isBehavioralStar: q.isBehavioralStar,
-    })),
+    questionsPerSession: { default: DEFAULT_QUESTION_COUNT, returningCandidates: EXTENDED_QUESTION_COUNT },
+    maxScore: INTERVIEW_MAX_SCORE,
+    passingScore: INTERVIEW_PASSING_SCORE,
+    universalFirstQuestion: {
+      ...mapRow(UNIVERSAL_FIRST_QUESTION_ROW),
+      alternativeWordingsForReturningCandidates: UNIVERSAL_FIRST_QUESTION_VARIANTS,
+    },
+    banks: {
+      customerService: CUSTOMER_SERVICE_QUESTION_TABLE.map(mapRow),
+      virtualAssistant: VIRTUAL_ASSISTANT_QUESTION_TABLE.map(mapRow),
+      technicalSupport: TECHNICAL_SUPPORT_QUESTION_TABLE.map(mapRow),
+    },
   });
 });
 
 // 5a. Examine Resume endpoint (called immediately when candidate selects resume on Homepage)
 app.post('/api/examine-resume', async (req, res) => {
   try {
-    const { resumeFileName, resumeMimeType, resumeBase64 } = req.body;
-    if (!resumeBase64) {
+    const { resumeFileName, resumeMimeType, resumeBase64 } = req.body || {};
+    if (!resumeBase64 || typeof resumeBase64 !== 'string') {
       return res.status(400).json({ error: 'Resume file data is required.' });
     }
     const result = await examineResumeForJobPosition({
-      resumeFileName: resumeFileName || 'resume.pdf',
-      resumeMimeType: resumeMimeType || 'application/pdf',
+      resumeFileName: clampText(resumeFileName || 'resume.pdf', 200),
+      resumeMimeType: clampText(resumeMimeType || 'application/pdf', 120),
       resumeBase64,
     });
-    return res.json(result);
+    // Never ship suggested answers to the browser before the interview.
+    return res.json({
+      ...result,
+      questions: (result.questions || []).map((q) => ({
+        id: q.id,
+        number: q.number,
+        category: q.category,
+        question: q.question,
+      })),
+    });
   } catch (err: any) {
     if (err instanceof ResumeValidationError || err?.isRejectedDocument) {
       return res.status(422).json({
@@ -3792,125 +5699,308 @@ app.post('/api/examine-resume', async (req, res) => {
       });
     }
     console.error('Error in /api/examine-resume:', err);
-    return res.status(500).json({ error: err?.message || 'Failed to examine resume.' });
+    return res.status(500).json({ error: 'Failed to examine resume.' });
   }
 });
 
-// 5b. Start Interview Session endpoint
+// 5b. Check candidate suspension status by email before starting a session
+app.get('/api/candidate-status', (req, res) => {
+  const email = normalizeEmail(clampText(req.query.email, 254));
+  if (!email) {
+    return res.json({ isSuspended: false });
+  }
+  const status = getCandidateSuspensionStatus(email);
+  return res.json({
+    ...status,
+    googleAvatarUrl: buildGoogleProfileAvatarUrl(email, clampText(req.query.name, 120)),
+  });
+});
+
+function findResumableSession(candidateId: string | undefined, email: string): InterviewSessionRecord | null {
+  const now = Date.now();
+  let best: InterviewSessionRecord | null = null;
+  for (const s of activeSessions.values()) {
+    if (s.candidateId !== candidateId && s.candidateEmail !== email) continue;
+    if (s.status !== 'in_progress' || s.currentPhase === 'finished') continue;
+    const expiresAt = new Date(s.createdAt).getTime() + (s.maxDurationSeconds || 600) * 1000;
+    if (expiresAt <= now) continue;
+    if (!best || s.createdAt > best.createdAt) best = s;
+  }
+  return best;
+}
+
+function remainingSessionSeconds(session: InterviewSessionRecord): number {
+  const expiresAt = new Date(session.createdAt).getTime() + (session.maxDurationSeconds || 600) * 1000;
+  return Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+}
+
+/** Builds the "welcome back, let's continue" response for a resumed, unfinished session. */
+function buildResumeResponse(session: InterviewSessionRecord) {
+  session.resumedCount = (session.resumedCount || 0) + 1;
+  const name = session.candidateName;
+  let continueLine: string;
+  if (session.currentPhase === 'questioning' && session.questions[session.currentQuestionIndex]) {
+    const q = session.questions[session.currentQuestionIndex];
+    session.currentQuestionAttempts = 0;
+    continueLine = `Welcome back, ${name}! Let's pick up right where we left off. Question ${q.number}: ${q.question}`;
+  } else if (session.currentPhase === 'candidate_questions') {
+    continueLine = `Welcome back, ${name}! We had finished the core questions. Before we wrap up, do you have any questions for me about the ${session.detectedRole} role or Global Hire 360?`;
+  } else if (session.currentPhase === 'process_walkthrough') {
+    const lastInterviewerLine = [...session.transcript].reverse().find((t) => t.speaker === 'interviewer');
+    continueLine = `Welcome back, ${name}! ${lastInterviewerLine?.text || 'Shall we get started?'}`;
+  } else {
+    continueLine = `Welcome back, ${name}! Thanks for rejoining the ${session.detectedRole} interview. How are you doing today?`;
+  }
+  session.transcript.push({
+    id: `tr_${Date.now()}_${crypto.randomBytes(3).toString('hex')}_resume`,
+    speaker: 'interviewer',
+    speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+    text: continueLine,
+    timestamp: new Date().toISOString(),
+    questionIndex: session.currentPhase === 'questioning' ? session.currentQuestionIndex : undefined,
+    eventTag: session.currentPhase === 'questioning' ? 'question' : 'greeting',
+  });
+  activeSessions.set(session.id, session);
+  flushCandidatesAndSessionsToDisk();
+  return {
+    resumed: true,
+    session,
+    accessToken: session.accessToken,
+    interviewerMessage: continueLine,
+    remainingSeconds: remainingSessionSeconds(session),
+    liveWsAvailable: Boolean(getGenAIClientOrNull()),
+  };
+}
+
+// Returning-candidate recognition. Deliberately minimal: it never returns transcripts,
+// scores or other personal data, because anyone can type any email into the form.
+app.get('/api/candidate-history', async (req, res) => {
+  const email = normalizeEmail(clampText(req.query.email, 254));
+  const name = clampText(req.query.name, 120);
+  if (!isValidEmail(email) && normalizePersonName(name).length < 3) {
+    return res.json({ exists: false });
+  }
+
+  const { candidate, nameMatchesExistingCandidate } = await findExistingCandidate({
+    email: isValidEmail(email) ? email : '',
+    name,
+  });
+
+  if (!candidate) {
+    return res.json({ exists: false, nameMatchesExistingCandidate });
+  }
+
+  return res.json({
+    exists: true,
+    firstName: (candidate.fullName || '').split(/\s+/)[0] || 'there',
+    sessionsCount: candidate.sessionsCount || 0,
+    completedSessionsCount: candidate.completedSessionsCount || 0,
+    savedJobPosition: candidate.confirmedJobPosition || candidate.extractedJobPosition || '',
+    hasSavedProfile: Boolean(candidate.confirmedJobPosition || candidate.extractedJobPosition),
+    hasResumableSession: Boolean(findResumableSession(candidate.id, candidate.email)),
+  });
+});
+
+// Continue an unfinished session directly (the browser keeps the session id + token).
+app.post('/api/resume-session', (req, res) => {
+  const sessionId = clampText(req.body?.sessionId, 100);
+  const session = activeSessions.get(sessionId);
+  if (!session || !sessionTokenMatches(session, readSessionToken(req))) {
+    return res.status(404).json({ error: 'Interview session not found.' });
+  }
+  if (session.currentPhase === 'finished' || session.status !== 'in_progress') {
+    return res.json({ resumed: false, finished: true, session });
+  }
+  if (remainingSessionSeconds(session) <= 0) {
+    return res.json({ resumed: false, expired: true });
+  }
+  return res.json(buildResumeResponse(session));
+});
+
 app.post('/api/start-interview-session', async (req, res) => {
   try {
-    const {
-      candidateName,
-      candidateEmail,
-      resumeFileName,
-      resumeMimeType,
-      resumeBase64,
-      confirmedJobPosition,
-      agreedToInstructions,
-      preExaminedData,
-    } = req.body;
+    const body = req.body || {};
+    const candidateName = clampText(body.candidateName, 120).trim();
+    const candidateEmail = normalizeEmail(clampText(body.candidateEmail, 254));
+    const resumeBase64 = typeof body.resumeBase64 === 'string' ? body.resumeBase64 : '';
+    const resumeFileName = clampText(body.resumeFileName || 'resume.pdf', 200);
+    const resumeMimeType = clampText(body.resumeMimeType || 'application/pdf', 120);
+    const confirmedJobPosition = clampText(body.confirmedJobPosition, 120).trim();
+    const agreedToInstructions = body.agreedToInstructions !== false;
+    const preExaminedData = body.preExaminedData;
+    const existingSessionToken = String(body.existingSessionToken || '');
 
-    if (!candidateName || !candidateEmail || !resumeBase64) {
+    if (!candidateName || !isValidEmail(candidateEmail)) {
       return res.status(400).json({
-        error: 'Name, Email, and Resume (.pdf or .docx) are all required fields.',
+        error: 'A valid full name and email address are required.',
       });
     }
 
-    let examined: ResumeExaminationResult;
-    if (
-      preExaminedData &&
-      preExaminedData.detectedRole &&
-      Array.isArray(preExaminedData.questions) &&
-      preExaminedData.questions.length === 5
-    ) {
-      examined = {
-        ...preExaminedData,
-        questions: [...preExaminedData.questions],
+    // Check 24-Hour Misconduct Suspension Status first!
+    const suspension = getCandidateSuspensionStatus(candidateEmail);
+    if (suspension.isSuspended) {
+      const unlockDateStr = suspension.suspendedUntil
+        ? new Date(suspension.suspendedUntil).toLocaleString()
+        : '24 hours from your last session';
+      return res.status(403).json({
+        error: `Account Suspended for 24 Hours: Your interview access was suspended due to inappropriate language or misconduct during your previous interview session. You may attempt a new interview after ${unlockDateStr} (${suspension.remainingText} remaining).`,
+        isSuspended: true,
+        suspendedUntil: suspension.suspendedUntil,
+        remainingText: suspension.remainingText,
+      });
+    }
+
+    const result = await withCandidateLock(candidateEmail, async () => {
+      // 1. Recognize the candidate by email (memory, then Supabase) — never create a duplicate row.
+      const { candidate: existing } = await findExistingCandidate({ email: candidateEmail, name: candidateName });
+
+      // 2. Continue directly into an unfinished, unexpired session instead of opening a second one.
+      const openSession = findResumableSession(existing?.id, candidateEmail);
+      if (openSession) {
+        const tokenOk = sessionTokenMatches(openSession, existingSessionToken);
+        const ageMs = Date.now() - new Date(openSession.createdAt).getTime();
+        const untouched =
+          ageMs < 2 * 60_000 && !openSession.transcript.some((t) => t.speaker === 'candidate');
+        if (tokenOk || untouched) {
+          return { status: 200, payload: buildResumeResponse(openSession) };
+        }
+        // Different device/browser without the token: close the stale session (no email) and start fresh.
+        openSession.status = 'abandoned';
+        openSession.currentPhase = 'finished';
+        openSession.completedAt = new Date().toISOString();
+        await saveSessionToSupabase(openSession);
+      }
+
+      // 3. Build the profile: from a new resume, or from the saved profile of a returning candidate.
+      let examined: ResumeExaminationResult;
+      if (resumeBase64) {
+        if (
+          preExaminedData &&
+          typeof preExaminedData.detectedRole === 'string' &&
+          Array.isArray(preExaminedData.questions) &&
+          preExaminedData.questions.length >= 1
+        ) {
+          examined = {
+            detectedRole: clampText(preExaminedData.detectedRole, 120),
+            candidateExperienceSummary: clampText(preExaminedData.candidateExperienceSummary, 2000),
+            keySkills: Array.isArray(preExaminedData.keySkills)
+              ? preExaminedData.keySkills.slice(0, 20).map((s: unknown) => clampText(s, 80))
+              : [],
+            questions: [],
+          } as ResumeExaminationResult;
+        } else {
+          examined = await examineResumeForJobPosition({ resumeFileName, resumeMimeType, resumeBase64 });
+        }
+      } else if (existing && (existing.confirmedJobPosition || existing.extractedJobPosition)) {
+        examined = {
+          detectedRole: existing.confirmedJobPosition || existing.extractedJobPosition,
+          candidateExperienceSummary: existing.experienceSummary || '',
+          keySkills: existing.extractedSkills || [],
+          questions: [],
+        } as ResumeExaminationResult;
+      } else {
+        return {
+          status: 400,
+          payload: { error: 'Please upload your Resume or CV (.pdf or .docx) to start your first interview.' },
+        };
+      }
+
+      const extractedRoleFromResume = examined.detectedRole;
+      const finalRole = (confirmedJobPosition || examined.detectedRole).trim();
+      examined.detectedRole = finalRole;
+
+      // 4. Questions: universal opener (exact wording for first-timers, a variant for returning
+      //    candidates) + role-bank questions; 4 questions by default, 5 for returning candidates.
+      const completedSessionsCount = existing?.completedSessionsCount || 0;
+      const isFirstTimeCandidate = completedSessionsCount === 0;
+      examined.questions = selectQuestionsForInterviewSession(finalRole, examined.keySkills, {
+        isFirstTimeCandidate,
+        questionCount: decideQuestionCount({ completedSessionsCount }),
+      });
+
+      const sessionId = generateSessionId();
+
+      const candidateRecord = await upsertCandidateOnCheckIn({
+        existing,
+        fullName: candidateName,
+        email: candidateEmail,
+        resumeFileName: resumeBase64 ? resumeFileName : existing?.resumeFileName || '',
+        extractedJobPosition: extractedRoleFromResume,
+        confirmedJobPosition: finalRole,
+        experienceSummary: examined.candidateExperienceSummary,
+        extractedSkills: examined.keySkills,
+        agreedToInstructions,
+        sessionId,
+      });
+
+      const greetingText = isFirstTimeCandidate
+        ? `Hi, good morning ${candidateName}! I'm Sarah, the Operations and Talent Manager here at Global Hire 360. Thanks for joining me today for the ${examined.detectedRole} interview. How are you doing today?`
+        : `Hi ${candidateName}, welcome back! It's Sarah from Global Hire 360 again. Great to see you practicing for the ${examined.detectedRole} role once more. How are you doing today?`;
+
+      const newSession: InterviewSessionRecord = {
+        id: sessionId,
+        accessToken: generateSessionAccessToken(),
+        candidateId: candidateRecord.id,
+        createdAt: new Date().toISOString(),
+        maxDurationSeconds: 600, // 10 minutes max session duration
+        candidateName,
+        candidateEmail,
+        candidateGoogleAvatarUrl:
+          candidateRecord.googleAvatarUrl || buildGoogleProfileAvatarUrl(candidateEmail, candidateName),
+        resumeFileName: candidateRecord.resumeFileName || resumeFileName,
+        detectedRole: examined.detectedRole,
+        candidateExperienceSummary: examined.candidateExperienceSummary,
+        keySkills: examined.keySkills,
+        questions: examined.questions,
+        isFirstTimeCandidate,
+        status: 'in_progress',
+        currentPhase: 'greeting_how_are_you',
+        currentQuestionIndex: 0,
+        currentQuestionAttempts: 0,
+        questionEvaluations: [],
+        transcript: [
+          {
+            id: `tr_${Date.now()}_init`,
+            speaker: 'interviewer',
+            speakerName: 'Global Hire 360 AI Interviewer',
+            text: greetingText,
+            timestamp: new Date().toISOString(),
+            eventTag: 'greeting',
+          },
+        ],
+        totalScoreOutOf20: 0,
+        totalScoreOutOf25: 0,
+        maxScore: INTERVIEW_MAX_SCORE,
+        percentageScore: 0,
+        successful: false,
+        interviewerFinalImpression: '',
+        misconductCount: 0,
+        misconductPenaltyPoints: 0,
+        misconductNotes: [],
+        suspendedUntil: null,
+        emailSent: false,
+        emailStatus: 'not_sent',
       };
-    } else {
-      examined = await examineResumeForJobPosition({
-        resumeFileName: resumeFileName || 'resume.pdf',
-        resumeMimeType: resumeMimeType || 'application/pdf',
-        resumeBase64,
-      });
-    }
 
-    const extractedRoleFromResume = examined.detectedRole;
-    // If the candidate confirmed or refined their exact job title on the form, honor it and tailor questions if changed
-    const finalRole = (confirmedJobPosition || examined.detectedRole).trim();
-    examined.detectedRole = finalRole;
+      activeSessions.set(sessionId, newSession);
+      const supRes = await saveSessionToSupabase(newSession);
+      newSession.supabaseSaved = supRes.saved;
 
-    // For ANY Customer Service or Customer Support role, ALWAYS freshly query & shuffle 5 questions from the 10-question Customer Service table in Supabase!
-    if (isCustomerServiceOrSupportRole(finalRole)) {
-      examined.questions = await fetchShuffledCustomerServiceQuestionsFromSupabase(5);
-    } else if (finalRole.toLowerCase() !== (preExaminedData?.detectedRole || '').toLowerCase()) {
-      examined.questions = buildTailoredQuestionsForRole(finalRole, examined.keySkills);
-    }
-
-    const sessionId = `gh360_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-
-    // 1. Track the candidate in public.candidates (creates or updates the candidate row & increments sessions_count)
-    const candidateRecord = await upsertCandidateOnCheckIn({
-      fullName: candidateName.trim(),
-      email: candidateEmail.trim(),
-      resumeFileName: resumeFileName || 'resume.pdf',
-      extractedJobPosition: extractedRoleFromResume,
-      confirmedJobPosition: finalRole,
-      experienceSummary: examined.candidateExperienceSummary,
-      extractedSkills: examined.keySkills,
-      agreedToInstructions: agreedToInstructions !== false,
-      sessionId,
-    });
-
-    const greetingText = `Hello ${candidateName}! Welcome to the Global Hire 360 live interview room. I have reviewed your resume for the ${examined.detectedRole} position. Before we dive into our five interview questions, how are you doing today?`;
-
-    // 2. Create the interview session linked to candidateRecord.id via candidateId foreign key
-    const newSession: InterviewSessionRecord = {
-      id: sessionId,
-      candidateId: candidateRecord.id,
-      createdAt: new Date().toISOString(),
-      maxDurationSeconds: 600, // 10 minutes max session duration
-      candidateName: candidateName.trim(),
-      candidateEmail: candidateEmail.trim().toLowerCase(),
-      resumeFileName: resumeFileName || 'resume.pdf',
-      detectedRole: examined.detectedRole,
-      candidateExperienceSummary: examined.candidateExperienceSummary,
-      keySkills: examined.keySkills,
-      questions: examined.questions,
-      status: 'in_progress',
-      currentPhase: 'greeting_how_are_you',
-      currentQuestionIndex: 0,
-      currentQuestionAttempts: 0,
-      questionEvaluations: [],
-      transcript: [
-        {
-          id: `tr_${Date.now()}`,
-          speaker: 'interviewer',
-          speakerName: 'Global Hire 360 AI Interviewer',
-          text: greetingText,
-          timestamp: new Date().toISOString(),
-          eventTag: 'greeting',
+      return {
+        status: 200,
+        payload: {
+          resumed: false,
+          returningCandidate: Boolean(existing),
+          session: newSession,
+          accessToken: newSession.accessToken,
+          interviewerMessage: greetingText,
+          remainingSeconds: newSession.maxDurationSeconds,
+          liveWsAvailable: Boolean(getGenAIClientOrNull()),
         },
-      ],
-      totalScoreOutOf25: 0,
-      maxScore: 25,
-      percentageScore: 0,
-      successful: false,
-      interviewerFinalImpression: '',
-      emailSent: false,
-    };
-
-    activeSessions.set(sessionId, newSession);
-    // Persist initial session record (and parent candidate relation) to Supabase & disk
-    const supRes = await saveSessionToSupabase(newSession);
-    newSession.supabaseSaved = supRes.saved;
-
-    return res.json({
-      candidate: candidateRecord,
-      session: newSession,
-      interviewerMessage: greetingText,
-      liveWsAvailable: Boolean(getGenAIClientOrNull()),
+      };
     });
+
+    return res.status(result.status).json(result.payload);
   } catch (err: any) {
     if (err instanceof ResumeValidationError || err?.isRejectedDocument) {
       return res.status(422).json({
@@ -3919,26 +6009,37 @@ app.post('/api/start-interview-session', async (req, res) => {
       });
     }
     console.error('Error in /api/start-interview-session:', err);
-    return res.status(500).json({ error: err?.message || 'Failed to start interview session.' });
+    return res.status(500).json({ error: 'Failed to start interview session.' });
   }
 });
 
 // 5c. Interactive Turn Handler (Supports conversational turns, 90s question timeout, 10m session timeout, rephrase, 2-attempt rule, and Marking Guide grading)
 app.post('/api/interview-turn', async (req, res) => {
   try {
-    const { sessionId, candidateText, timedOut, sessionTimedOut, requestedRephrase } = req.body;
-    const session = activeSessions.get(sessionId);
-    if (!session) {
+    const { sessionId, candidateText, timedOut, sessionTimedOut, requestedRephrase } = req.body || {};
+    const session = activeSessions.get(clampText(sessionId, 100));
+    if (!session || !sessionTokenMatches(session, readSessionToken(req))) {
       return res.status(404).json({ error: 'Interview session not found.' });
     }
 
+    // A finished session is immutable: late timer ticks or duplicate submissions must not
+    // re-grade it, re-append the closing message or trigger another results email.
+    if (session.currentPhase === 'finished') {
+      return res.json({
+        session,
+        interviewerMessage: session.interviewerFinalImpression || 'The interview is complete.',
+        resetQuestionTimer: false,
+        interviewEnded: true,
+      });
+    }
+
     const nowIso = new Date().toISOString();
-    const cleanText = (candidateText || '').trim();
+    const cleanText = clampText(candidateText, 6000).trim();
 
     // Record candidate utterance into transcript
     if (cleanText || timedOut || sessionTimedOut || requestedRephrase) {
       session.transcript.push({
-        id: `tr_${Date.now()}_c`,
+        id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_c`,
         speaker: 'candidate',
         speakerName: session.candidateName,
         text: sessionTimedOut
@@ -3958,12 +6059,78 @@ app.post('/api/interview-turn', async (req, res) => {
       });
     }
 
+    // PROFESSIONAL CONDUCT & MISCONDUCT CHECK (Point Reduction or Immediate Call Termination + 24h Suspension)
+    if (cleanText && !timedOut && !sessionTimedOut) {
+      const misconductCheck = detectCandidateMisconduct(cleanText);
+      if (misconductCheck.isMisconduct) {
+        session.misconductCount = (session.misconductCount || 0) + 1;
+        session.misconductNotes = session.misconductNotes || [];
+
+        // Severe misconduct OR 2nd misconduct offense -> Immediately terminate call & suspend candidate for 24 hours!
+        if (misconductCheck.severity === 'severe' || session.misconductCount >= 2) {
+          session.misconductPenaltyPoints = (session.misconductPenaltyPoints || 0) + 5;
+          const reasonNote = `Session terminated for misconduct (${misconductCheck.reason}). Candidate suspended for 24 hours.`;
+          session.misconductNotes.push(reasonNote);
+          session.status = 'terminated_misconduct';
+
+          const suspendedUntilIso = await suspendCandidateFor24Hours({
+            email: session.candidateEmail,
+            candidateId: session.candidateId,
+            reason: misconductCheck.reason,
+          });
+          session.suspendedUntil = suspendedUntilIso;
+
+          return await concludeAndFinalizeSession(session, res, false, true);
+        } else {
+          // 1st mild misconduct offense -> Deduct 3.0 points and issue a firm professional warning
+          session.misconductPenaltyPoints = (session.misconductPenaltyPoints || 0) + 3;
+          const warningNote = `Warning #1: -3.0 points deducted for unprofessional language (${misconductCheck.reason}).`;
+          session.misconductNotes.push(warningNote);
+
+          const activePromptToRepeat =
+            session.currentPhase === 'questioning' && session.questions[session.currentQuestionIndex]
+              ? `Now, let's reset your timer and try Question ${
+                  session.questions[session.currentQuestionIndex].number
+                } again in a strictly professional manner: ${
+                  session.questions[session.currentQuestionIndex].question
+                }`
+              : `Now, let's keep things strictly professional—how are you doing today, and are you ready for Question 1?`;
+
+          const warningReply = `Hold on right there, ${session.candidateName}. While I enjoy keeping our interview warm and engaging, this is an official Global Hire 360 assessment and inappropriate language is strictly not acceptable. I have deducted 3 points from your overall score for misconduct. Please note that if any further inappropriate language is used, I will immediately end this call and your profile will be suspended from attempting another interview for the next 24 hours. ${activePromptToRepeat}`;
+
+          session.transcript.push({
+            id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_warn`,
+            speaker: 'interviewer',
+            speakerName: 'Global Hire 360 AI Interviewer',
+            text: warningReply,
+            timestamp: new Date().toISOString(),
+            questionIndex:
+              session.currentPhase === 'questioning' ? session.currentQuestionIndex : undefined,
+            eventTag: 'misconduct_warning',
+          });
+
+          await saveSessionToSupabase(session);
+          return res.json({
+            session,
+            interviewerMessage: warningReply,
+            resetQuestionTimer: true,
+            interviewEnded: false,
+            misconductWarning: {
+              pointsDeducted: 3,
+              totalPenaltyPoints: session.misconductPenaltyPoints,
+              message: warningNote,
+            },
+          });
+        }
+      }
+    }
+
     // If the 10-minute overall session timer expired, evaluate any partial response on the active question and conclude the session
     if (sessionTimedOut) {
       if (session.currentPhase === 'questioning') {
         const activeQ = session.questions[session.currentQuestionIndex];
         if (activeQ && cleanText.length > 0) {
-          const mgEval = evaluateCandidateResponseWithMarkingGuide({
+          const mgEval = gradeAnswerAgainstSuggestedAnswer({
             questionId: activeQ.id,
             questionText: activeQ.question,
             category: activeQ.category,
@@ -3972,6 +6139,9 @@ app.post('/api/interview-turn', async (req, res) => {
             candidateText: cleanText,
             role: session.detectedRole,
           });
+          session.questionEvaluations = session.questionEvaluations.filter(
+            (ev) => ev.questionNumber !== activeQ.number
+          );
           session.questionEvaluations.push({
             questionId: activeQ.id,
             questionNumber: activeQ.number,
@@ -3981,41 +6151,130 @@ app.post('/api/interview-turn', async (req, res) => {
             candidateAnswer: cleanText,
             attemptsUsed: session.currentQuestionAttempts + 1,
             timedOut: true,
-            scoreOutOf5: mgEval.isOnTopic ? mgEval.scoreOutOf5 : 1,
+            scoreOutOf5: mgEval.isOnTopic ? mgEval.scoreOutOf5 : Math.min(1, mgEval.scoreOutOf5),
             feedback: mgEval.feedback,
             strengths: mgEval.strengths,
             improvementTip: mgEval.improvementTip,
+            alignmentPercent: mgEval.alignmentPercent,
+            matchedPoints: mgEval.matchedPoints,
+            missedPoints: mgEval.missedPoints,
+            gradingMethod: mgEval.gradingMethod,
           });
         }
       }
       return await concludeAndFinalizeSession(session, res, false);
     }
 
-    // PHASE 1: Candidate responds to initial greeting ("How are you doing today?")
+    // PHASE 1: STAGE 1 Greeting & Small Talk -> Transition smoothly to STAGE 2 Process Walkthrough
     if (session.currentPhase === 'greeting_how_are_you') {
+      session.currentPhase = 'process_walkthrough';
+
+      const isNervous =
+        /\b(nervous|scared|stressed|anxious|worried|tense|jittery|afraid|intimidated|first\s+time)\b/i.test(
+          cleanText
+        );
+      const askedHowInterviewerIs =
+        /\b(how\s+are\s+you|how\s+about\s+you|and\s+you|how'?s\s+your\s+day|doing\s+well\s+too)\b/i.test(
+          cleanText
+        );
+
+      let stage1Ack = `Glad to hear that, ${session.candidateName}.`;
+      if (isNervous) {
+        stage1Ack = `That's completely normal, ${session.candidateName}, don't worry at all. This is a safe, stress-free space to practice, and we're just having a comfortable conversation.`;
+      } else if (askedHowInterviewerIs) {
+        stage1Ack = `I'm doing really well, thank you for asking, ${session.candidateName}!`;
+      }
+
+      const walkthroughReply = `${stage1Ack} Before we dive in, let me quickly walk you through how our interview will go. We have about ten minutes together: I'll ask you ${session.questions.length === 5 ? 'five' : 'four'} questions about your background and realistic scenarios for the ${session.detectedRole} role, with up to 90 seconds per question, and at the end you'll have time to ask me any questions of your own. Does that sound good, or do you have any questions before we start?`;
+
+      session.transcript.push({
+        id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
+        speaker: 'interviewer',
+        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        text: walkthroughReply,
+        timestamp: new Date().toISOString(),
+        eventTag: 'greeting',
+      });
+
+      await saveSessionToSupabase(session);
+
+      return res.json({
+        session,
+        interviewerMessage: walkthroughReply,
+        resetQuestionTimer: false,
+        interviewEnded: false,
+      });
+    }
+
+    // PHASE 2: STAGE 2 Process Walkthrough -> Answer any pre-interview question, then launch Question 1
+    if (session.currentPhase === 'process_walkthrough') {
       session.currentPhase = 'questioning';
       session.currentQuestionIndex = 0;
       session.currentQuestionAttempts = 0;
       const firstQ = session.questions[0];
 
-      const reply = `That's wonderful to hear, ${session.candidateName}! Let's get started with your interview for the ${session.detectedRole} position. Remember, our interview session is up to 10 minutes maximum, and you have 90 seconds for each of the 5 questions. Here is Question 1 of 5: ${firstQ.question}`;
+      const hasPreQuestion =
+        /\?|\b(how\s+long|how\s+many|what\s+if|can\s+i|tell\s+me\s+about|what\s+does|who\s+is)\b/i.test(
+          cleanText
+        ) && !/\b(no\s+questions|nothing|ready|let'?s\s+go|sounds\s+good|all\s+good|okay|yes|sure)\b/i.test(cleanText);
+
+      let preAnswerBridge = `Wonderful, let's get started.`;
+      if (hasPreQuestion) {
+        preAnswerBridge = `Good question—this session is designed to feel just like a real conversation with a hiring manager. Take your time with each answer, and if you ever want me to rephrase a question or help guide you through a tricky spot, just let me know.`;
+      }
+
+      const startQ1Reply = `${preAnswerBridge} Let's start with Question 1: ${firstQ.question}`;
 
       session.transcript.push({
-        id: `tr_${Date.now()}_i`,
+        id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
         speaker: 'interviewer',
-        speakerName: 'Global Hire 360 AI Interviewer',
-        text: reply,
+        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        text: startQ1Reply,
         timestamp: new Date().toISOString(),
         questionIndex: 0,
         eventTag: 'question',
       });
 
+      await saveSessionToSupabase(session);
+
       return res.json({
         session,
-        interviewerMessage: reply,
+        interviewerMessage: startQ1Reply,
         resetQuestionTimer: true,
         interviewEnded: false,
       });
+    }
+
+    // PHASE 4: STAGE 5 Candidate's Questions -> Answer candidate's question like a hiring manager, then close & score
+    if (session.currentPhase === 'candidate_questions') {
+      const noQuestions =
+        timedOut ||
+        !cleanText ||
+        /\b(no\s+questions|not\s+right\s+now|none|nothing|that'?s\s+all|i'?m\s+good|all\s+clear|no\s+thank\s+you|nope)\b/i.test(
+          cleanText
+        );
+
+      if (!noQuestions) {
+        let managerAnswer = `That's a really thoughtful question, ${session.candidateName}. At Global Hire 360, we work closely with global teams where clear communication, reliability, and a collaborative mindset are valued from day one, and new team members receive structured onboarding support.`;
+        if (/\b(salary|pay|compensation|rate|benefits)\b/i.test(cleanText)) {
+          managerAnswer = `That's a fair question, ${session.candidateName}. Compensation for the ${session.detectedRole} role is competitive and aligned with your experience level and region; our HR placement team shares the exact figures during the final offer stage.`;
+        } else if (/\b(remote|schedule|hours|time\s+zone|work\s+from\s+home|flexib)\b/i.test(cleanText)) {
+          managerAnswer = `Great question. The ${session.detectedRole} role at Global Hire 360 is remote, with a steady, predictable schedule coordinated with your assigned client team.`;
+        } else if (/\b(next\s+step|when\s+will\s+i\s+hear|timeline|decision|feedback)\b/i.test(cleanText)) {
+          managerAnswer = `Good question. In a live hiring round, we typically review all candidate interviews within a few business days, and since this is a practice session, I've prepared your full scorecard and suggested answers right away.`;
+        }
+
+        session.transcript.push({
+          id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
+          speaker: 'interviewer',
+          speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+          text: managerAnswer,
+          timestamp: new Date().toISOString(),
+          eventTag: 'closing',
+        });
+      }
+
+      return await concludeAndFinalizeSession(session, res, false, false, !noQuestions);
     }
 
     const currentQ = session.questions[session.currentQuestionIndex];
@@ -4023,23 +6282,63 @@ app.post('/api/interview-turn', async (req, res) => {
       return res.json({ session, interviewerMessage: 'The interview is complete.', interviewEnded: true });
     }
 
-    // CASE A: Candidate explicitly asks to rephrase the question
+    // CASE A0: The candidate is talking TO the interviewer (asks something, checks the line)
+    // instead of answering — answer them like a real interviewer and repeat the question.
+    // This is not graded and does not use one of their attempts.
+    if (!timedOut && !requestedRephrase && isCandidateTalkingToInterviewer(cleanText)) {
+      let replyText = /\b(there|hear\s+me|repeating)\b/i.test(cleanText)
+        ? `Yes, I'm here and I can hear you clearly, ${session.candidateName}. Here's the question again: ${currentQ.question}`
+        : `Good question, ${session.candidateName}. I'll make sure we cover it at the end of the interview. For now, here's the question again: ${currentQ.question}`;
+      const ai = getGenAIClientOrNull();
+      if (ai) {
+        try {
+          const resp = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: `You are Sarah, Operations and Talent Manager at Global Hire 360, interviewing ${session.candidateName} for the ${session.detectedRole} position in a live spoken interview.
+You just asked Question ${currentQ.number}: "${currentQ.question}"
+Instead of answering, the candidate said: "${clampText(cleanText, 600)}"
+Reply as a real, intelligent hiring manager in at most 2 short spoken sentences: answer their question correctly and briefly (or reassure them that you are here and can hear them). Then ask the question again using exactly this wording: "${currentQ.question}". No lists, no markdown, never reveal how answers are scored.`,
+          });
+          const aiText = (resp.text || '').trim();
+          if (aiText) {
+            replyText = interviewerTextAsksQuestion(aiText, currentQ.question)
+              ? aiText
+              : `${aiText} ${currentQ.question}`;
+          }
+        } catch {
+          // keep the scripted reply
+        }
+      }
+      session.transcript.push({
+        id: `tr_${Date.now()}_i`,
+        speaker: 'interviewer',
+        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        text: replyText,
+        timestamp: new Date().toISOString(),
+        questionIndex: session.currentQuestionIndex,
+        eventTag: 'rephrase',
+      });
+      return res.json({ session, interviewerMessage: replyText, resetQuestionTimer: false, interviewEnded: false });
+    }
+
+    // CASE A: Candidate asks to repeat, clarify, or rephrase the question
     if (
       requestedRephrase ||
-      /\b(rephrase|repeat\s+the\s+question|say\s+that\s+again|didn'?t\s+understand\s+the\s+question|clarify\s+the\s+question)\b/i.test(
+      /\b(rephrase|repeat(?:ing)?|say\s+that\s+again|come\s+again|pardon|didn'?t\s+understand|didn'?t\s+catch|clarify|what\s+do\s+you\s+mean)\b/i.test(
         cleanText
       )
     ) {
-      let rephrasedText = `Of course, ${session.candidateName}! Let me put Question ${currentQ.number} another way: Focusing on ${currentQ.category.toLowerCase()}, think about ${currentQ.expectedFocus.toLowerCase()}. How would you approach or describe that in your own words? Take your time—your 90-second timer is refreshed.`;
+      // Without AI the question is repeated exactly as written (never the hidden marking notes).
+      let rephrasedText = `Of course, ${session.candidateName}. Here's Question ${currentQ.number} again: ${currentQ.question} Take your time.`;
 
       const ai = getGenAIClientOrNull();
       if (ai) {
         try {
           const resp = await ai.models.generateContent({
             model: 'gemini-3-flash-preview',
-            contents: `You are the warm, encouraging African American female Global Hire 360 Interview Coach.
-The candidate (${session.candidateName}, applying for ${session.detectedRole}) asked you to rephrase Question ${currentQ.number}: "${currentQ.question}".
-Rephrase this question clearly, warmly, and simply in 2-3 sentences so they understand what key points (${currentQ.expectedFocus}) to share without giving away the answer.`,
+            contents: `You are Sarah, Operations and Talent Manager at Global Hire 360.
+The candidate (${session.candidateName}, applying for ${session.detectedRole}) asked you to repeat or clarify Question ${currentQ.number}: "${currentQ.question}".
+Rephrase this question calmly and warmly in simpler words, keeping exactly the same meaning, in at most 2 short spoken sentences. Do not hint at the answer, do not list what to include, no markdown.`,
           });
           if (resp.text) rephrasedText = resp.text.trim();
         } catch {
@@ -4050,7 +6349,7 @@ Rephrase this question clearly, warmly, and simply in 2-3 sentences so they unde
       session.transcript.push({
         id: `tr_${Date.now()}_i`,
         speaker: 'interviewer',
-        speakerName: 'Global Hire 360 AI Interviewer',
+        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
         text: rephrasedText,
         timestamp: new Date().toISOString(),
         questionIndex: session.currentQuestionIndex,
@@ -4069,7 +6368,7 @@ Rephrase this question clearly, warmly, and simply in 2-3 sentences so they unde
     if (timedOut) {
       const partialEval =
         cleanText.length > 0
-          ? evaluateCandidateResponseWithMarkingGuide({
+          ? gradeAnswerAgainstSuggestedAnswer({
               questionId: currentQ.id,
               questionText: currentQ.question,
               category: currentQ.category,
@@ -4080,12 +6379,10 @@ Rephrase this question clearly, warmly, and simply in 2-3 sentences so they unde
             })
           : null;
 
-      const partialScore = partialEval
-        ? Math.min(3.5, partialEval.scoreOutOf5)
-        : 0;
+      const partialScore = partialEval ? Math.min(3.5, partialEval.scoreOutOf5) : 0;
 
-      session.questionEvaluations.push({
-        questionId: currentQ.id,
+      const timeoutEval: QuestionEvaluation = {
+        questionId: currentQ.id || `q${currentQ.number}`,
         questionNumber: currentQ.number,
         category: currentQ.category,
         questionText: currentQ.question,
@@ -4102,24 +6399,36 @@ Rephrase this question clearly, warmly, and simply in 2-3 sentences so they unde
         improvementTip:
           partialEval?.improvementTip ||
           'Aim to cover the core points concisely within 60–75 seconds.',
-      });
+        alignmentPercent: partialEval?.alignmentPercent ?? 0,
+        matchedPoints: partialEval?.matchedPoints || [],
+        missedPoints: partialEval?.missedPoints || [],
+        gradingMethod: partialEval?.gradingMethod || 'marking_guide',
+      };
+      session.questionEvaluations = [
+        ...session.questionEvaluations.filter(
+          (ev) => ev.questionNumber !== currentQ.number && ev.questionId !== currentQ.id
+        ),
+        timeoutEval,
+      ];
 
-      // Advance to next question or finish
+      // Advance to next question or move to Stage 5 candidate questions
       if (session.currentQuestionIndex < session.questions.length - 1) {
         session.currentQuestionIndex += 1;
         session.currentQuestionAttempts = 0;
         const nextQ = session.questions[session.currentQuestionIndex];
-        const timeoutMsg = `I have to gently step in there, ${session.candidateName}, as our 90-second timer for Question ${currentQ.number} is up! Let's keep our momentum going and move straight to Question ${nextQ.number} of 5: ${nextQ.question}`;
+        const timeoutMsg = `Thank you, ${session.candidateName}—our 90 seconds for Question ${currentQ.number} are up, so let's move smoothly to Question ${nextQ.number}: ${nextQ.question}`;
 
         session.transcript.push({
-          id: `tr_${Date.now()}_i`,
+          id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
           speaker: 'interviewer',
-          speakerName: 'Global Hire 360 AI Interviewer',
+          speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
           text: timeoutMsg,
           timestamp: new Date().toISOString(),
           questionIndex: session.currentQuestionIndex,
           eventTag: 'timeout',
         });
+
+        await saveSessionToSupabase(session);
 
         return res.json({
           session,
@@ -4128,13 +6437,33 @@ Rephrase this question clearly, warmly, and simply in 2-3 sentences so they unde
           interviewEnded: false,
         });
       } else {
-        // That was the final question (Q5)
-        return await concludeAndFinalizeSession(session, res);
+        session.currentPhase = 'candidate_questions';
+        const stage5Msg = `Thank you, ${session.candidateName}—our 90 seconds on that final question are up. That's everything from my side. Before we wrap up, do you have any questions for me about the ${session.detectedRole} role or Global Hire 360?`;
+        session.transcript.push({
+          id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
+          speaker: 'interviewer',
+          speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+          text: stage5Msg,
+          timestamp: new Date().toISOString(),
+          eventTag: 'question',
+        });
+        await saveSessionToSupabase(session);
+        return res.json({
+          session,
+          interviewerMessage: stage5Msg,
+          resetQuestionTimer: true,
+          interviewEnded: false,
+        });
       }
     }
 
-    // CASE C: Evaluate Candidate's Spoken Answer Against the Proposed Marking Guide Answer!
+    // CASE C: Evaluate Candidate's Spoken Answer & Detect when Candidate Seems Not to Know
     session.currentQuestionAttempts += 1;
+
+    const seemsNotToKnow =
+      /\b(i\s+don'?t\s+know|do\s+not\s+know|no\s+idea|not\s+sure|i'?m\s+not\s+sure|i\s+am\s+not\s+sure|i'?m\s+stuck|i\s+have\s+no\s+clue|can'?t\s+think|cannot\s+think|pass\s+on\s+this|skip\s+this|help\s+me|not\s+familiar)\b/i.test(
+        cleanText
+      );
 
     const markingGuideEval = evaluateCandidateResponseWithMarkingGuide({
       questionId: currentQ.id,
@@ -4146,19 +6475,20 @@ Rephrase this question clearly, warmly, and simply in 2-3 sentences so they unde
       role: session.detectedRole,
     });
 
-    let isOnTopic = markingGuideEval.isOnTopic;
-    let scoreOutOf5 = markingGuideEval.scoreOutOf5;
+    let isOnTopic = seemsNotToKnow ? false : markingGuideEval.isOnTopic;
+    let scoreOutOf5 = seemsNotToKnow ? 1.0 : markingGuideEval.scoreOutOf5;
     let feedback = markingGuideEval.feedback;
     let strengths = markingGuideEval.strengths;
     let improvementTip = markingGuideEval.improvementTip;
     let coachingRephraseMessage = '';
+    let aiScoreOutOf5: number | null = null;
 
     const ai = getGenAIClientOrNull();
-    if (ai) {
+    if (ai && !seemsNotToKnow) {
       try {
         const evalResp = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
-          contents: `You are the Global Hire 360 Senior Interview Evaluator & Coach (warm, professional African American female persona).
+          contents: `You are Sarah, Operations and Talent Manager at Global Hire 360.
 Candidate: ${session.candidateName}
 Target Job Position: ${session.detectedRole}
 Question ${currentQ.number} (${currentQ.category}): "${currentQ.question}"
@@ -4168,15 +6498,9 @@ Attempt Number on this question: ${session.currentQuestionAttempts} of 2
 Candidate's Spoken Response: "${cleanText}"
 
 MARKING GUIDE SCORING PROTOCOL:
-- The candidate does NOT need to repeat the Proposed Marking Guide Answer word-for-word.
 - Evaluate whether the candidate's response makes sense and aligns in meaning and reasoning with the Proposed Marking Guide Answer.
-- Score on a 0 to 5 scale (increments of 0.5 allowed):
-  * 0 - 1.0: Off-topic, refusal ("I don't know"), or under 6 meaningful words (set isOnTopic = false).
-  * 2.0 - 2.5: Makes basic sense and is on-topic, but only touches on a small part of the marking guide.
-  * 3.0 - 3.5: Good, sensible answer that covers about half of the core ideas in the proposed answer.
-  * 4.0 - 4.5: Strong answer that aligns well with most of the proposed marking guide answer.
-  * 5.0: Excellent, well-structured answer that captures the full essence and key points of the proposed marking guide answer.
-- If isOnTopic is false and this is Attempt 1, write a warm, motivating intervention (coachingRephraseMessage) that gently stops them, encourages them, and rephrases Question ${currentQ.number} in simpler terms so they can try one more time.`,
+- Score on a 0 to 5 scale (increments of 0.5 allowed).
+- If isOnTopic is false and this is Attempt 1, write a calm, supportive hiring manager response (coachingRephraseMessage) in 2 short sentences that reassures them and rephrases Question ${currentQ.number} with a concrete angle to think about.`,
           config: {
             responseMimeType: 'application/json',
             responseSchema: {
@@ -4197,7 +6521,7 @@ MARKING GUIDE SCORING PROTOCOL:
         const parsedEval = JSON.parse(evalResp.text || '{}');
         if (typeof parsedEval.isOnTopic === 'boolean') isOnTopic = parsedEval.isOnTopic;
         if (typeof parsedEval.scoreOutOf5 === 'number') {
-          scoreOutOf5 = Math.max(0, Math.min(5, Math.round(parsedEval.scoreOutOf5 * 2) / 2));
+          aiScoreOutOf5 = parsedEval.scoreOutOf5;
         }
         if (parsedEval.feedback) feedback = parsedEval.feedback;
         if (Array.isArray(parsedEval.strengths) && parsedEval.strengths.length > 0) {
@@ -4212,23 +6536,41 @@ MARKING GUIDE SCORING PROTOCOL:
       }
     }
 
-    // 2-ATTEMPT RULE ENFORCEMENT WHEN OFF-TOPIC:
-    if (!isOnTopic) {
+    // Final mark: how closely the answer follows the suggested answer for this position
+    // (marking-guide pillars, blended with the AI judgement when available).
+    const alignment = gradeAnswerAgainstSuggestedAnswer({
+      questionId: currentQ.id,
+      questionText: currentQ.question,
+      category: currentQ.category,
+      expectedFocus: currentQ.expectedFocus,
+      proposedAnswer: currentQ.proposedAnswer,
+      candidateText: cleanText,
+      role: session.detectedRole,
+      aiScoreOutOf5,
+    });
+    if (!seemsNotToKnow) scoreOutOf5 = alignment.scoreOutOf5;
+
+    // WHEN CANDIDATE SEEMS NOT TO KNOW OR IS OFF-TOPIC:
+    // Attempt 1: Empathetically reassure & guide them with a simpler angle.
+    // Attempt 2: Smooth AI Coach Takeover — briefly share the key hiring manager insight and advance to the next question so they complete the practice interview!
+    if (!isOnTopic || seemsNotToKnow) {
       if (session.currentQuestionAttempts === 1) {
-        // Attempt 1 failed -> Motivate and rephrase the question for Attempt 2
-        const rephraseMsg =
-          coachingRephraseMessage ||
-          `Hold on just a second, ${session.candidateName}—I know interviews can feel intense, and you are doing great! Let me help you refocus on what Question ${currentQ.number} ("${currentQ.question}") is looking for: think about ${currentQ.expectedFocus.toLowerCase()}. Let's reset your 90-second timer and give this question one more try!`;
+        const rephraseMsg = seemsNotToKnow
+          ? `That's completely okay, ${session.candidateName}—it's normal to pause on a question like this. Think of it simply from a day-to-day perspective: ${currentQ.expectedFocus.toLowerCase()}. Even a brief example from past work or how you'd approach it is great—give it a try!`
+          : coachingRephraseMessage ||
+            `I see what you mean, ${session.candidateName}. Let me reframe Question ${currentQ.number} slightly so we connect it directly to the role: think about ${currentQ.expectedFocus.toLowerCase()}. How would you handle that situation?`;
 
         session.transcript.push({
-          id: `tr_${Date.now()}_i`,
+          id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
           speaker: 'interviewer',
-          speakerName: 'Global Hire 360 AI Interviewer',
+          speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
           text: rephraseMsg,
           timestamp: new Date().toISOString(),
           questionIndex: session.currentQuestionIndex,
           eventTag: 'rephrase',
         });
+
+        await saveSessionToSupabase(session);
 
         return res.json({
           session,
@@ -4237,33 +6579,89 @@ MARKING GUIDE SCORING PROTOCOL:
           interviewEnded: false,
         });
       } else {
-        // Attempt 2 ALSO off-topic -> Record 1/5 for this question, give warm encouraging words to practice further, and end the call!
-        session.questionEvaluations.push({
-          questionId: currentQ.id,
+        // Attempt 2: AI Hiring Manager smoothly takes over, offers a quick helpful pointer, records 1/5, and moves to the next question!
+        const coachedEval: QuestionEvaluation = {
+          questionId: currentQ.id || `q${currentQ.number}`,
           questionNumber: currentQ.number,
           category: currentQ.category,
           questionText: currentQ.question,
           proposedAnswer: currentQ.proposedAnswer,
-          candidateAnswer: cleanText,
+          candidateAnswer: cleanText || 'Candidate needed coaching guidance on this question.',
           attemptsUsed: 2,
           timedOut: false,
           scoreOutOf5: 1,
           feedback:
-            'After two attempts and a rephrased prompt, the response remained off-topic or did not align with the marking guide criteria.',
-          strengths: ['Participated in the live coaching session'],
+            'You seemed unsure on this question during the live call, so the interviewer stepped in to guide you and keep the conversation moving.',
+          strengths: ['Stayed composed and engaged during the practice conversation'],
           improvementTip:
             currentQ.expectedFocus ||
-            'Review the Global Hire 360 Candidate Workshop and practice structuring clear answers before your next live session.',
-        });
+            'Review the Suggested Answer for this question on your results page.',
+          alignmentPercent: alignment.alignmentPercent,
+          matchedPoints: alignment.matchedPoints,
+          missedPoints: alignment.missedPoints,
+          gradingMethod: alignment.gradingMethod,
+        };
+        session.questionEvaluations = [
+          ...session.questionEvaluations.filter(
+            (ev) => ev.questionNumber !== currentQ.number && ev.questionId !== currentQ.id
+          ),
+          coachedEval,
+        ];
 
-        session.status = 'terminated_attempts';
-        return await concludeAndFinalizeSession(session, res, true);
+        recomputeSessionScore(session);
+
+        if (session.currentQuestionIndex < session.questions.length - 1) {
+          session.currentQuestionIndex += 1;
+          session.currentQuestionAttempts = 0;
+          const nextQ = session.questions[session.currentQuestionIndex];
+          const takeoverMsg = `No problem at all, ${session.candidateName}—let me help you out here. In a real interview for ${session.detectedRole}, employers mainly look for how you focus on ${currentQ.expectedFocus.toLowerCase()}, and I've included a full suggested answer for you on your score page. Let's keep going with Question ${nextQ.number}: ${nextQ.question}`;
+
+          session.transcript.push({
+            id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
+            speaker: 'interviewer',
+            speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+            text: takeoverMsg,
+            timestamp: new Date().toISOString(),
+            questionIndex: session.currentQuestionIndex,
+            eventTag: 'question',
+          });
+
+          await saveSessionToSupabase(session);
+
+          return res.json({
+            session,
+            interviewerMessage: takeoverMsg,
+            resetQuestionTimer: true,
+            interviewEnded: false,
+          });
+        } else {
+          session.currentPhase = 'candidate_questions';
+          const takeoverFinalQMsg = `No problem at all, ${session.candidateName}. On that question, employers mainly look for ${currentQ.expectedFocus.toLowerCase()}, and I've included a full suggested answer on your score page. That wraps up my ${session.questions.length} questions—do you have any questions for me about the ${session.detectedRole} role or Global Hire 360?`;
+
+          session.transcript.push({
+            id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
+            speaker: 'interviewer',
+            speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+            text: takeoverFinalQMsg,
+            timestamp: new Date().toISOString(),
+            eventTag: 'question',
+          });
+
+          await saveSessionToSupabase(session);
+
+          return res.json({
+            session,
+            interviewerMessage: takeoverFinalQMsg,
+            resetQuestionTimer: true,
+            interviewEnded: false,
+          });
+        }
       }
     }
 
-    // Candidate's answer is ON-TOPIC -> Record score out of 5 and move to next question (or finish)
-    session.questionEvaluations.push({
-      questionId: currentQ.id,
+    // Candidate's answer is ON-TOPIC -> Record score out of 5 and engage in natural employer-to-candidate dialogue
+    const passedEval: QuestionEvaluation = {
+      questionId: currentQ.id || `q${currentQ.number}`,
       questionNumber: currentQ.number,
       category: currentQ.category,
       questionText: currentQ.question,
@@ -4275,24 +6673,47 @@ MARKING GUIDE SCORING PROTOCOL:
       feedback,
       strengths,
       improvementTip,
-    });
+      alignmentPercent: alignment.alignmentPercent,
+      matchedPoints: alignment.matchedPoints,
+      missedPoints: alignment.missedPoints,
+      gradingMethod: alignment.gradingMethod,
+    };
+    session.questionEvaluations = [
+      ...session.questionEvaluations.filter(
+        (ev) => ev.questionNumber !== currentQ.number && ev.questionId !== currentQ.id
+      ),
+      passedEval,
+    ];
 
-    session.totalScoreOutOf25 = Number(
-      session.questionEvaluations.reduce((sum, q) => sum + q.scoreOutOf5, 0).toFixed(1)
-    );
-    session.percentageScore = Math.round((session.totalScoreOutOf25 / 25) * 100);
+    recomputeSessionScore(session);
+
+    const neutralAcknowledgments = [
+      `Okay, I see. That makes sense.`,
+      `Got it, thank you for sharing how you approach that.`,
+      `I see. That gives me a clear sense of your workflow.`,
+      `Alright, thank you for walking me through that.`,
+    ];
+    const strongAcknowledgments = [
+      `Great, thank you. That's a very practical example.`,
+      `That makes sense, and I like how clearly you structured that.`,
+      `Got it, thank you. That aligns really well with how our ${session.detectedRole} team operates.`,
+      `Okay, great. I appreciate the concrete detail you shared there.`,
+    ];
+    const ackPool = scoreOutOf5 >= 4.0 ? strongAcknowledgments : neutralAcknowledgments;
+    // Random pick so candidates don't hear the same line at the same point of every interview.
+    const bridgeText = ackPool[crypto.randomInt(ackPool.length)];
 
     if (session.currentQuestionIndex < session.questions.length - 1) {
       session.currentQuestionIndex += 1;
       session.currentQuestionAttempts = 0;
       const nextQ = session.questions[session.currentQuestionIndex];
 
-      const nextMsg = `Thank you for sharing that, ${session.candidateName}. Let's move on to Question ${nextQ.number} of 5 (${nextQ.category}): ${nextQ.question}`;
+      const nextMsg = `${bridgeText} Let's move on to Question ${nextQ.number}: ${nextQ.question}`;
 
       session.transcript.push({
-        id: `tr_${Date.now()}_i`,
+        id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
         speaker: 'interviewer',
-        speakerName: 'Global Hire 360 AI Interviewer',
+        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
         text: nextMsg,
         timestamp: new Date().toISOString(),
         questionIndex: session.currentQuestionIndex,
@@ -4308,8 +6729,27 @@ MARKING GUIDE SCORING PROTOCOL:
         interviewEnded: false,
       });
     } else {
-      // Completed all 5 questions!
-      return await concludeAndFinalizeSession(session, res, false);
+      // Completed all 5 questions -> Transition smoothly to Stage 5 (Candidate's Questions)
+      session.currentPhase = 'candidate_questions';
+      const stage5Invite = `${bridgeText} That's everything from my side on the core questions. Before we wrap up our interview, do you have any questions for me about the ${session.detectedRole} role or Global Hire 360?`;
+
+      session.transcript.push({
+        id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
+        speaker: 'interviewer',
+        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        text: stage5Invite,
+        timestamp: new Date().toISOString(),
+        eventTag: 'question',
+      });
+
+      await saveSessionToSupabase(session);
+
+      return res.json({
+        session,
+        interviewerMessage: stage5Invite,
+        resetQuestionTimer: true,
+        interviewEnded: false,
+      });
     }
   } catch (err: any) {
     console.error('Error in /api/interview-turn:', err);
@@ -4317,30 +6757,86 @@ MARKING GUIDE SCORING PROTOCOL:
   }
 });
 
-// 5d. Finalize Session (Called either at the end of 5 questions, after 2-attempt termination, or when Live WebSocket call ends)
+// 5d. Finalize Session (Called either at the end of Stage 5/6, after 2-attempt termination, misconduct termination, or when Live WebSocket call ends)
+const sessionFinalizeLocks = new Map<string, Promise<string>>();
+
+/**
+ * Finalizes a session exactly once. Several paths can end an interview (last answer,
+ * 10-minute timer, Gemini end_call — which may fire more than once —, the End Call button,
+ * misconduct termination). Concurrent callers share the same in-flight finalization and
+ * later callers get the stored result, so scoring, DB writes and the results email happen once.
+ */
 async function concludeAndFinalizeSession(
   session: InterviewSessionRecord,
   res: express.Response,
-  terminatedEarlyForAttempts = false
+  terminatedEarlyForAttempts = false,
+  terminatedForMisconduct = false,
+  alreadyAppendedManagerAnswer = false
 ) {
-  // Fill any unreached questions with 0/5 so all 5 questions appear on the /scoring page
+  const finishedPayload = (spoken?: string) => ({
+    session,
+    interviewerMessage: spoken || session.interviewerFinalImpression || 'The interview is complete.',
+    resetQuestionTimer: false,
+    interviewEnded: true,
+  });
+
+  if (session.currentPhase === 'finished' && session.completedAt) {
+    return res.json(finishedPayload());
+  }
+
+  let inflight = sessionFinalizeLocks.get(session.id);
+  if (!inflight) {
+    inflight = runSessionFinalization(
+      session,
+      terminatedEarlyForAttempts,
+      terminatedForMisconduct,
+      alreadyAppendedManagerAnswer
+    ).finally(() => sessionFinalizeLocks.delete(session.id));
+    sessionFinalizeLocks.set(session.id, inflight);
+    return res.json(finishedPayload(await inflight));
+  }
+  await inflight.catch(() => undefined);
+  return res.json(finishedPayload());
+}
+
+async function runSessionFinalization(
+  session: InterviewSessionRecord,
+  terminatedEarlyForAttempts = false,
+  terminatedForMisconduct = false,
+  alreadyAppendedManagerAnswer = false
+): Promise<string> {
+  // Deduplicate any existing evaluations by questionNumber, keeping the real question id
+  const dedupedByNumber = new Map<number, QuestionEvaluation>();
+  for (const ev of session.questionEvaluations) {
+    const q = session.questions.find((qq) => qq.number === ev.questionNumber);
+    dedupedByNumber.set(ev.questionNumber, {
+      ...ev,
+      questionId: q?.id || ev.questionId || `q${ev.questionNumber}`,
+    });
+  }
+
+  // Fill any unreached questions with 0/5 so every asked question appears on the /scoring page
   for (let i = 0; i < session.questions.length; i++) {
     const q = session.questions[i];
-    const existing = session.questionEvaluations.find((ev) => ev.questionNumber === q.number);
-    if (!existing) {
-      session.questionEvaluations.push({
-        questionId: q.id,
-        questionNumber: q.number,
+    const qNum = q.number || i + 1;
+    if (!dedupedByNumber.has(qNum)) {
+      dedupedByNumber.set(qNum, {
+        questionId: q.id || `q${qNum}`,
+        questionNumber: qNum,
         category: q.category,
         questionText: q.question,
         proposedAnswer: q.proposedAnswer,
-        candidateAnswer: terminatedEarlyForAttempts
+        candidateAnswer: terminatedForMisconduct
+          ? '[Session terminated due to professional misconduct — 24-hour suspension applied]'
+          : terminatedEarlyForAttempts
           ? '[Not reached — Session concluded early for additional workshop practice]'
           : '[Not answered]',
         attemptsUsed: 0,
         timedOut: false,
         scoreOutOf5: 0,
-        feedback: terminatedEarlyForAttempts
+        feedback: terminatedForMisconduct
+          ? 'This question was not completed because the interview was immediately terminated for inappropriate language / professional misconduct.'
+          : terminatedEarlyForAttempts
           ? 'This question was not reached because the interview concluded after two unsuccessful attempts on an earlier question.'
           : 'No response was recorded for this question.',
         strengths: [],
@@ -4349,287 +6845,455 @@ async function concludeAndFinalizeSession(
     }
   }
 
-  session.questionEvaluations.sort((a, b) => a.questionNumber - b.questionNumber);
-
-  const totalScore = Number(
-    session.questionEvaluations.reduce((sum, q) => sum + q.scoreOutOf5, 0).toFixed(1)
+  session.questionEvaluations = Array.from(dedupedByNumber.values()).sort(
+    (a, b) => a.questionNumber - b.questionNumber
   );
-  session.totalScoreOutOf25 = totalScore;
-  session.maxScore = 25;
-  session.percentageScore = Math.round((totalScore / 25) * 100);
-  session.successful = !terminatedEarlyForAttempts && totalScore >= 16;
+
+  // Every interview is marked on 20, whether 4 or 5 questions were asked.
+  const { rawOutOf20: rawScore, totalOutOf20: totalScore } = recomputeSessionScore(session, {
+    forceZero: terminatedForMisconduct,
+  });
+  const penaltyPoints = Number(session.misconductPenaltyPoints || 0);
+  const qCount = session.questions.length || DEFAULT_QUESTION_COUNT;
+  const maxScore = INTERVIEW_MAX_SCORE;
+  const passingScore = INTERVIEW_PASSING_SCORE;
+
+  session.successful =
+    !terminatedEarlyForAttempts && !terminatedForMisconduct && totalScore >= passingScore;
   session.currentPhase = 'finished';
   session.completedAt = new Date().toISOString();
 
-  if (terminatedEarlyForAttempts) {
+  const answeredCount = session.questionEvaluations.filter(
+    (ev) => ev.candidateAnswer && !/^\[(not answered|no response|not reached)/i.test(ev.candidateAnswer)
+  ).length;
+  const completedPhrase =
+    answeredCount >= qCount ? `all ${qCount} questions` : `${answeredCount} of the ${qCount} questions`;
+
+  const penaltyNoteSuffix =
+    !terminatedForMisconduct && penaltyPoints > 0
+      ? ` (Note: ${penaltyPoints} points were deducted from your raw score of ${rawScore}/${maxScore} due to a professional conduct warning during the session.)`
+      : '';
+
+  if (terminatedForMisconduct) {
+    session.status = 'terminated_misconduct';
+    if (!session.suspendedUntil) {
+      session.suspendedUntil = await suspendCandidateFor24Hours({
+        email: session.candidateEmail,
+        candidateId: session.candidateId,
+        reason: 'Inappropriate language or professional misconduct during live interview.',
+      });
+    }
+    session.interviewerFinalImpression = `${session.candidateName}, I am ending this Global Hire 360 interview immediately due to inappropriate language and professional misconduct. Mutual respect and workplace professionalism are non-negotiable standards for all Global Hire 360 candidates. Your score for this session is 0 out of ${maxScore} (Unsuccessful), and your candidate profile has been suspended from attempting another interview for the next 24 hours (until ${new Date(
+      session.suspendedUntil
+    ).toLocaleString()}).`;
+  } else if (session.liveEndReason === 'terminated_rules_violation') {
+    session.successful = false;
+    session.status = 'terminated_rules_violation';
+    session.interviewerFinalImpression = `${session.candidateName}, this Global Hire 360 interview was ended by the interviewer because the interview rules were not respected (the interview must be a one-to-one conversation between you and the interviewer, answered by you only). Your score for the questions completed is ${totalScore} out of ${maxScore}, and this attempt is marked as unsuccessful. You are welcome to try again in a quiet space, on your own.`;
+  } else if (terminatedEarlyForAttempts) {
     session.status = 'terminated_attempts';
     session.interviewerFinalImpression = `${session.candidateName}, thank you for stepping into the Global Hire 360 interview room today. Since we tried Question ${
       session.currentQuestionIndex + 1
     } twice and still didn't quite hit the specific ${
       session.detectedRole
-    } examples needed, I am going to wrap up our live call here so you were not successful on this attempt. Please don't be discouraged—you have strong potential! Review your scorecard and marking guide sent to ${
+    } examples needed, I am going to wrap up our live call here so you were not successful on this attempt.${penaltyNoteSuffix} Please don't be discouraged—you have strong potential! Review your scorecard and marking guide sent to ${
       session.candidateEmail
     }, practice structuring your answers with the Global Hire 360 Interview Helper, and come back stronger!`;
   } else if (session.successful) {
     session.status = 'completed_success';
-    session.interviewerFinalImpression = `Congratulations, ${session.candidateName}! You completed all five questions for the ${session.detectedRole} position with an impressive score of ${totalScore} out of 25 (${session.percentageScore}%). Your responses made strong sense and aligned well with our Global Hire 360 marking guide—you were successful in this interview assessment! I have sent your full scorecard and voice transcript to ${session.candidateEmail}.`;
+    session.interviewerFinalImpression = `Congratulations, ${session.candidateName}! You completed ${completedPhrase} for the ${session.detectedRole} position with an impressive final score of ${totalScore} out of ${maxScore} (${session.percentageScore}%).${penaltyNoteSuffix} Your responses made strong sense and aligned well with our Global Hire 360 marking guide—you were successful in this interview assessment! I have sent your full scorecard and voice transcript to ${session.candidateEmail}.`;
   } else {
     session.status = 'completed_unsuccessful';
-    session.interviewerFinalImpression = `Thank you for completing all five questions for the ${session.detectedRole} position, ${session.candidateName}. You achieved ${totalScore} out of 25 (${session.percentageScore}%), which is below our 16/25 placement benchmark, so you were not yet successful on this attempt. Keep your head up—I've emailed your detailed question breakdown, marking guide tips, and full transcript to ${session.candidateEmail} so you can refine your answers and succeed on your next session!`;
+    session.interviewerFinalImpression = `Thank you for completing ${completedPhrase} for the ${session.detectedRole} position, ${session.candidateName}. You achieved ${totalScore} out of ${maxScore} (${session.percentageScore}%),${penaltyNoteSuffix} which is below our ${passingScore}/${maxScore} placement benchmark, so you were not yet successful on this attempt. Keep your head up—I've emailed your detailed question breakdown, marking guide tips, and full transcript to ${session.candidateEmail} so you can refine your answers and succeed on your next session!`;
   }
 
   session.transcript.push({
     id: `tr_${Date.now()}_final`,
     speaker: 'interviewer',
-    speakerName: 'Global Hire 360 AI Interviewer',
+    speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
     text: session.interviewerFinalImpression,
     timestamp: new Date().toISOString(),
-    eventTag: terminatedEarlyForAttempts ? 'termination' : 'closing',
+    eventTag: terminatedForMisconduct
+      ? 'misconduct_termination'
+      : terminatedEarlyForAttempts
+      ? 'termination'
+      : 'closing',
   });
 
-  // Save to Supabase & send Brevo Email
-  const [supabaseRes, brevoRes] = await Promise.all([
-    saveSessionToSupabase(session),
-    sendBrevoAssessmentEmail(session),
-  ]);
+  // If we just appended a manager answer to the candidate's Stage 5 question, combine it with the final closing so Sarah speaks both smoothly
+  let spokenClosingMessage = session.interviewerFinalImpression;
+  if (alreadyAppendedManagerAnswer && session.transcript.length >= 2) {
+    const prevEntry = session.transcript[session.transcript.length - 2];
+    if (prevEntry && prevEntry.speaker === 'interviewer') {
+      spokenClosingMessage = `${prevEntry.text} ${session.interviewerFinalImpression}`;
+    }
+  }
 
+  // Persist the finished session (and its per-answer rows) first, then send the single
+  // results email; sendResendAssessmentEmail is itself idempotent per session.
+  const supabaseRes = await saveSessionToSupabase(session);
   session.supabaseSaved = supabaseRes.saved;
-  session.emailSent = brevoRes.sent;
-  session.emailDeliveryNote = brevoRes.note;
+  const resendRes = await sendResendAssessmentEmail(session);
+  if (!resendRes.inProgress) {
+    session.emailDeliveryNote = resendRes.note;
+  }
+  // Record final email state in the database row too.
+  await saveSessionToSupabase(session);
 
-  return res.json({
-    session,
-    interviewerMessage: session.interviewerFinalImpression,
-    resetQuestionTimer: false,
-    interviewEnded: true,
+  return spokenClosingMessage;
+}
+
+/** The candidate is speaking to the interviewer (question / line check) rather than answering. */
+export function isCandidateTalkingToInterviewer(text: string): boolean {
+  const t = String(text || '').trim().toLowerCase();
+  if (!t) return false;
+  const words = t.split(/\s+/).filter(Boolean).length;
+  if (/\b(are\s+you\s+(still\s+)?there|can\s+you\s+hear\s+me|do\s+you\s+hear\s+me|is\s+(anyone|somebody)\s+there|you('re|\s+are)\s+repeating)\b/.test(t)) {
+    return words <= 30;
+  }
+  return (
+    words <= 30 &&
+    /^(?:(?:hi|hello|okay|ok|sorry|um+|uh+|so|yes|yeah)[\s,.]+)*(?:i\s+have\s+a\s+question|can\s+i\s+ask|may\s+i\s+ask|quick\s+question|before\s+i\s+answer)\b/.test(t)
+  );
+}
+
+const liveGradingLocks = new Map<string, Promise<void>>();
+
+// ---------------------------------------------------------------------------
+// Live voice grading helpers
+// ---------------------------------------------------------------------------
+/**
+ * Splits the interview transcript into the candidate's own words for each question.
+ * Uses the per-question tags written by the live bridge; otherwise detects when the
+ * interviewer asked each prepared question (in order) and assigns what follows to it.
+ */
+export function collectCandidateAnswersPerQuestion(session: InterviewSessionRecord): Map<number, string> {
+  const answers = new Map<number, string>();
+  const hasTags = session.transcript.some(
+    (t) => t.speaker === 'candidate' && Number.isInteger(t.questionIndex)
+  );
+  let currentNumber = 0;
+  for (const entry of session.transcript) {
+    if (entry.speaker === 'interviewer') {
+      if (!hasTags) {
+        const next = session.questions[currentNumber];
+        if (next && interviewerTextAsksQuestion(entry.text, next.question)) currentNumber += 1;
+      }
+      continue;
+    }
+    const qNumber = hasTags
+      ? Number.isInteger(entry.questionIndex)
+        ? (entry.questionIndex as number) + 1
+        : 0
+      : currentNumber;
+    if (qNumber < 1 || qNumber > session.questions.length) continue;
+    const text = String(entry.text || '').replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    answers.set(qNumber, `${answers.get(qNumber) || ''} ${text}`.trim());
+  }
+  return answers;
+}
+
+/**
+ * Grades a live voice interview question by question: the candidate's real words are compared
+ * with the suggested answer (marking guide) and, when Gemini is available, an AI judgement of
+ * whether the answer makes sense against the suggested answer is blended in.
+ */
+async function gradeLiveInterviewAnswers(session: InterviewSessionRecord): Promise<QuestionEvaluation[]> {
+  const answers = collectCandidateAnswersPerQuestion(session);
+  const aiByNumber = new Map<
+    number,
+    { score: number; verbatim: string; feedback: string; strengths: string[]; improvementTip: string }
+  >();
+
+  const ai = getGenAIClientOrNull();
+  const hasCandidateSpeech = session.transcript.some((t) => t.speaker === 'candidate' && t.text.trim());
+  if (ai && hasCandidateSpeech) {
+    try {
+      const transcriptFormatted = session.transcript
+        .map((t) => `[${t.speaker.toUpperCase()}]: ${t.text}`)
+        .join('\n')
+        .slice(-24000);
+      const questionsFormatted = session.questions
+        .map(
+          (q) =>
+            `Q${q.number}: ${q.question}\n  - Suggested answer: ${q.proposedAnswer || q.expectedFocus}\n  - Key focus: ${q.expectedFocus}\n  - Candidate's answer as recorded: ${
+              answers.get(q.number) || '[not detected — find it in the transcript]'
+            }`
+        )
+        .join('\n\n');
+
+      const gradeResp = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: `You are the Senior Assessment Grader for Global Hire 360.
+Candidate: ${session.candidateName}
+Job Position: ${session.detectedRole}
+
+Questions, suggested answers and the candidate's recorded answers:
+${questionsFormatted}
+
+Full interview transcript (speech-to-text, may contain small recognition errors):
+${transcriptFormatted}
+
+For each question, score the candidate's answer from 0 to 5 (0.5 steps) on whether it makes sense and goes in the same direction as the suggested answer: same key ideas, a relevant example and a clear result. A word-for-word match is NOT required — judge the meaning. Ignore small speech-recognition errors. Only the candidate's own words count; never credit what the interviewer said. Requests to repeat the question, small talk or "I don't know" score 0 to 1. Also return the candidate's answer for that question, copied from the transcript (empty string if they did not answer).`,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              evaluations: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    questionNumber: { type: Type.NUMBER },
+                    candidateAnswerVerbatim: { type: Type.STRING },
+                    scoreOutOf5: { type: Type.NUMBER },
+                    feedback: { type: Type.STRING },
+                    strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    improvementTip: { type: Type.STRING },
+                  },
+                  required: [
+                    'questionNumber',
+                    'candidateAnswerVerbatim',
+                    'scoreOutOf5',
+                    'feedback',
+                    'strengths',
+                    'improvementTip',
+                  ],
+                },
+              },
+            },
+            required: ['evaluations'],
+          },
+        },
+      });
+      const parsed = JSON.parse(gradeResp.text || '{}');
+      if (Array.isArray(parsed.evaluations)) {
+        for (const ev of parsed.evaluations) {
+          const n = Number(ev?.questionNumber);
+          const score = Number(ev?.scoreOutOf5);
+          if (!Number.isInteger(n) || !Number.isFinite(score)) continue;
+          aiByNumber.set(n, {
+            score: Math.max(0, Math.min(5, score)),
+            verbatim: clampText(ev.candidateAnswerVerbatim, 6000).trim(),
+            feedback: clampText(ev.feedback, 1500),
+            strengths: Array.isArray(ev.strengths) ? ev.strengths.slice(0, 3).map((x: any) => clampText(x, 300)) : [],
+            improvementTip: clampText(ev.improvementTip, 800),
+          });
+        }
+      }
+    } catch (gradeErr) {
+      console.warn('Live transcript AI grading unavailable, using marking guide only:', gradeErr);
+    }
+  }
+
+  return session.questions.map((q) => {
+    const aiEv = aiByNumber.get(q.number);
+    const text = (answers.get(q.number) || aiEv?.verbatim || '').trim();
+    const base = {
+      questionId: q.id,
+      questionNumber: q.number,
+      category: q.category,
+      questionText: q.question,
+      proposedAnswer: q.proposedAnswer,
+    };
+    if (text.split(/\s+/).filter(Boolean).length < 2) {
+      return {
+        ...base,
+        candidateAnswer: '[No response recorded for this question]',
+        attemptsUsed: 0,
+        timedOut: false,
+        scoreOutOf5: 0,
+        feedback: 'No response was recorded for this question.',
+        strengths: [],
+        improvementTip: `Key marking guide focus: ${q.expectedFocus}`,
+      } as QuestionEvaluation;
+    }
+    const mg = gradeAnswerAgainstSuggestedAnswer({
+      questionId: q.id,
+      questionText: q.question,
+      category: q.category,
+      expectedFocus: q.expectedFocus,
+      proposedAnswer: q.proposedAnswer,
+      candidateText: text,
+      role: session.detectedRole,
+      aiScoreOutOf5: aiEv ? aiEv.score : null,
+    });
+    return {
+      ...base,
+      candidateAnswer: text,
+      attemptsUsed: 1,
+      timedOut: false,
+      scoreOutOf5: mg.scoreOutOf5,
+      feedback: aiEv?.feedback || mg.feedback,
+      strengths: aiEv?.strengths?.length ? aiEv.strengths : mg.strengths,
+      improvementTip: aiEv?.improvementTip || mg.improvementTip,
+      alignmentPercent: mg.alignmentPercent,
+      matchedPoints: mg.matchedPoints,
+      missedPoints: mg.missedPoints,
+      gradingMethod: mg.gradingMethod,
+    } as QuestionEvaluation;
   });
 }
 
 // 5e. Finalize Live WebSocket Call Transcript endpoint (Grades a full LUNA-style Gemini Live WebSocket transcript against the Marking Guide)
 app.post('/api/finalize-live-ws-session', async (req, res) => {
   try {
-    const { sessionId, liveTranscript, terminatedByAttemptRule } = req.body;
-    const session = activeSessions.get(sessionId);
-    if (!session) {
+    const {
+      sessionId,
+      liveTranscript,
+      terminatedByAttemptRule,
+      terminatedByMisconduct,
+    } = req.body || {};
+    const session = activeSessions.get(clampText(sessionId, 100));
+    if (!session || !sessionTokenMatches(session, readSessionToken(req))) {
       return res.status(404).json({ error: 'Interview session not found.' });
     }
 
-    if (Array.isArray(liveTranscript) && liveTranscript.length > 0) {
-      session.transcript = liveTranscript;
+    // Already finalized (e.g. end_call fired twice, or End Call clicked after auto-finish):
+    // return the stored result without re-grading or re-sending the email.
+    if (session.currentPhase === 'finished' || sessionFinalizeLocks.has(session.id)) {
+      return await concludeAndFinalizeSession(session, res);
+    }
+    const pendingGrading = liveGradingLocks.get(session.id);
+    if (pendingGrading) {
+      await pendingGrading.catch(() => undefined);
+      return await concludeAndFinalizeSession(session, res);
+    }
+    let releaseGrading!: () => void;
+    liveGradingLocks.set(session.id, new Promise<void>((r) => (releaseGrading = r)));
+    try {
+
+    // Live voice interviews: the server records the transcript itself from the Gemini stream
+    // (tagged per question), so the browser copy is only used when the server has none.
+    const serverHasLiveTranscript =
+      Boolean(session.liveMode) && session.transcript.some((t) => t.speaker === 'candidate');
+    if (!serverHasLiveTranscript && Array.isArray(liveTranscript) && liveTranscript.length > 0) {
+      // Accept only well-formed, size-bounded transcript entries from the browser.
+      session.transcript = liveTranscript
+        .slice(0, 400)
+        .filter((t: any) => t && (t.speaker === 'interviewer' || t.speaker === 'candidate'))
+        .map((t: any, idx: number) => ({
+          id: clampText(t.id || `tr_live_${idx}`, 80),
+          speaker: t.speaker,
+          speakerName: clampText(t.speakerName, 120),
+          text: clampText(t.text, 6000),
+          timestamp: clampText(t.timestamp || new Date().toISOString(), 40),
+          questionIndex: Number.isInteger(t.questionIndex) ? t.questionIndex : undefined,
+          eventTag: typeof t.eventTag === 'string' ? clampText(t.eventTag, 40) : undefined,
+        })) as TranscriptEntry[];
+    }
+    if (session.liveMode && !session.liveEndReason) {
+      session.liveEndReason = 'ended_by_candidate';
     }
 
-    const ai = getGenAIClientOrNull();
-    if (ai && session.transcript.length > 1) {
-      try {
-        const transcriptFormatted = session.transcript
-          .map((t) => `[${t.speaker.toUpperCase()}]: ${t.text}`)
-          .join('\n');
-
-        const questionsFormatted = session.questions
-          .map(
-            (q) =>
-              `Q${q.number} (${q.category}): ${q.question}\n  - Proposed Marking Guide Answer: ${
-                q.proposedAnswer || q.expectedFocus
-              }\n  - Expected Focus: ${q.expectedFocus}`
-          )
-          .join('\n\n');
-
-        const gradeResp = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
-          contents: `You are the Senior Assessment Grader for Global Hire 360.
-Candidate: ${session.candidateName}
-Job Position: ${session.detectedRole}
-
-Assigned 5 Interview Questions & Official Marking Guide Answers:
-${questionsFormatted}
-
-Full Live Voice Interview Transcript:
-${transcriptFormatted}
-
-Grade each of the 5 questions out of 5 points (0 to 5, increments of 0.5 allowed) based on how well the candidate's spoken answer in the transcript makes sense and aligns with the Proposed Marking Guide Answer (word-for-word match is NOT required, judge whether the candidate's meaning and examples make sense with the proposed answer). If a question was not answered or was skipped/cut short, score it 0 to 1.5 accordingly.`,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                evaluations: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      questionNumber: { type: Type.NUMBER },
-                      candidateAnswerSummary: { type: Type.STRING },
-                      scoreOutOf5: { type: Type.NUMBER },
-                      feedback: { type: Type.STRING },
-                      strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-                      improvementTip: { type: Type.STRING },
-                    },
-                    required: [
-                      'questionNumber',
-                      'candidateAnswerSummary',
-                      'scoreOutOf5',
-                      'feedback',
-                      'strengths',
-                      'improvementTip',
-                    ],
-                  },
-                },
-              },
-              required: ['evaluations'],
-            },
-          },
-        });
-
-        const parsedGrades = JSON.parse(gradeResp.text || '{}');
-        if (Array.isArray(parsedGrades.evaluations)) {
-          session.questionEvaluations = session.questions.map((q) => {
-            const match = parsedGrades.evaluations.find(
-              (ev: any) => Number(ev.questionNumber) === q.number
-            );
-            return {
-              questionId: q.id,
-              questionNumber: q.number,
-              category: q.category,
-              questionText: q.question,
-              proposedAnswer: q.proposedAnswer,
-              candidateAnswer: match?.candidateAnswerSummary || 'Recorded in live voice stream',
-              attemptsUsed: 1,
-              timedOut: false,
-              scoreOutOf5: match
-                ? Math.max(0, Math.min(5, Math.round(Number(match.scoreOutOf5) * 2) / 2))
-                : 0,
-              feedback: match?.feedback || 'Evaluated from live voice transcript.',
-              strengths: Array.isArray(match?.strengths) ? match.strengths.slice(0, 3) : [],
-              improvementTip: match?.improvementTip || q.expectedFocus,
-            };
-          });
+    // Also scan candidate transcript turns for any unflagged misconduct
+    let detectedMisconductTermination =
+      Boolean(terminatedByMisconduct) ||
+      session.status === 'terminated_misconduct' ||
+      session.liveEndReason === 'terminated_misconduct';
+    for (const entry of session.transcript) {
+      if (entry.speaker === 'candidate') {
+        const mc = detectCandidateMisconduct(entry.text);
+        if (mc.isMisconduct) {
+          session.misconductCount = (session.misconductCount || 0) + 1;
+          session.misconductNotes = session.misconductNotes || [];
+          session.misconductNotes.push(`Transcript misconduct detected: ${mc.reason}`);
+          if (mc.severity === 'severe' || (session.misconductCount || 0) >= 2) {
+            detectedMisconductTermination = true;
+          } else {
+            session.misconductPenaltyPoints = Math.max(session.misconductPenaltyPoints || 0, 3);
+          }
         }
-      } catch (gradeErr) {
-        console.warn('Live transcript grading fallback:', gradeErr);
       }
     }
 
-    // Deterministic Marking Guide grading when Gemini is not used or fallback is needed
-    if (session.questionEvaluations.length === 0) {
-      const candidateTurns = session.transcript.filter((t) => t.speaker === 'candidate');
-      session.questionEvaluations = session.questions.map((q, idx) => {
-        const answerTurn = candidateTurns[idx + 1] || candidateTurns[idx];
-        const text = answerTurn?.text || '';
-        if (!text.trim()) {
-          return {
-            questionId: q.id,
-            questionNumber: q.number,
-            category: q.category,
-            questionText: q.question,
-            proposedAnswer: q.proposedAnswer,
-            candidateAnswer: '[No response recorded for this question]',
-            attemptsUsed: 0,
-            timedOut: false,
-            scoreOutOf5: 0,
-            feedback: 'No response was recorded for this question.',
-            strengths: [],
-            improvementTip: q.expectedFocus,
-          };
-        }
-
-        const mgEval = evaluateCandidateResponseWithMarkingGuide({
-          questionId: q.id,
-          questionText: q.question,
-          category: q.category,
-          expectedFocus: q.expectedFocus,
-          proposedAnswer: q.proposedAnswer,
-          candidateText: text,
-          role: session.detectedRole,
-        });
-
-        return {
-          questionId: q.id,
-          questionNumber: q.number,
-          category: q.category,
-          questionText: q.question,
-          proposedAnswer: q.proposedAnswer,
-          candidateAnswer: text,
-          attemptsUsed: 1,
-          timedOut: false,
-          scoreOutOf5: mgEval.isOnTopic ? mgEval.scoreOutOf5 : 1,
-          feedback: mgEval.feedback,
-          strengths: mgEval.strengths,
-          improvementTip: mgEval.improvementTip,
-        };
-      });
+    // Text/fallback-voice interviews are already graded answer by answer in /api/interview-turn.
+    const alreadyGradedTurnByTurn = !session.liveMode && session.questionEvaluations.length > 0;
+    if (!alreadyGradedTurnByTurn) {
+      session.questionEvaluations = await gradeLiveInterviewAnswers(session);
     }
 
-    return await concludeAndFinalizeSession(session, res, Boolean(terminatedByAttemptRule));
+    return await concludeAndFinalizeSession(
+      session,
+      res,
+      Boolean(terminatedByAttemptRule) || session.liveEndReason === 'terminated_after_two_attempts',
+      detectedMisconductTermination
+    );
+    } finally {
+      liveGradingLocks.delete(session.id);
+      releaseGrading();
+    }
   } catch (err: any) {
     console.error('Error in /api/finalize-live-ws-session:', err);
     return res.status(500).json({ error: err?.message || 'Failed to finalize live session.' });
   }
 });
 
-// 5f. Get session by ID (for /scoring page reload safety)
+// 5f. Get session by ID & On-Demand Resend Email Delivery (session token required)
 app.get('/api/session/:id', (req, res) => {
   const session = activeSessions.get(req.params.id);
-  if (!session) {
+  if (!session || !sessionTokenMatches(session, readSessionToken(req))) {
     return res.status(404).json({ error: 'Session not found' });
   }
-  const candidate = activeCandidates.get(session.candidateId) || null;
-  return res.json({ session, candidate });
+  return res.json({ session });
 });
 
-// 5g. Candidates & Relational Interview Sessions Endpoints (1-to-Many: candidates -> interview_sessions)
-app.get('/api/candidates', async (_req, res) => {
-  const config = getSupabaseConfig();
-  let supabaseRelationalData: any[] | null = null;
-
-  if (config) {
-    try {
-      const resp = await fetch(
-        `${config.url}/rest/v1/candidates?select=*,interview_sessions(*)&order=updated_at.desc`,
-        {
-          method: 'GET',
-          headers: {
-            apikey: config.key,
-            Authorization: `Bearer ${config.key}`,
-            Accept: 'application/json',
-          },
-        }
-      );
-      if (resp.ok) {
-        supabaseRelationalData = await resp.json();
-      }
-    } catch {
-      // Fallback to local relational join below
-    }
+app.post('/api/session/:id/send-email', limitEmail, async (req, res) => {
+  const session = activeSessions.get(req.params.id);
+  if (!session || !sessionTokenMatches(session, readSessionToken(req))) {
+    return res.status(404).json({ error: 'Session not found' });
   }
+  if (session.currentPhase !== 'finished') {
+    return res.status(409).json({ error: 'Results can only be emailed after the interview has finished.' });
+  }
+  // Idempotent: if the results were already delivered this returns "already sent" and sends nothing.
+  const resendRes = await sendResendAssessmentEmail(session);
+  if (!resendRes.inProgress) session.emailDeliveryNote = resendRes.note;
+  await saveSessionToSupabase(session);
+  return res.json({
+    sent: resendRes.sent,
+    inProgress: Boolean(resendRes.inProgress),
+    emailId: resendRes.emailId,
+    note: resendRes.note,
+    session,
+  });
+});
+
+function stripSessionSecrets(s: InterviewSessionRecord) {
+  const { accessToken: _t, ...rest } = s;
+  return rest;
+}
+
+// 5g. Candidates & Relational Interview Sessions Endpoints (ADMIN ONLY — contains personal data)
+app.get('/api/candidates', requireAdmin, async (_req, res) => {
+  const supabaseRelationalData = await postgrestSelect(
+    'candidates?select=*,interview_sessions(*),candidate_answers(*)&order=updated_at.desc'
+  );
 
   const allSessions = Array.from(activeSessions.values());
   const candidatesWithSessions = Array.from(activeCandidates.values())
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-    .map((candidate) => {
-      const linkedSessions = allSessions
-        .filter(
-          (s) =>
-            s.candidateId === candidate.id ||
-            s.candidateEmail.toLowerCase() === candidate.email.toLowerCase()
-        )
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-
-      return {
-        ...candidate,
-        interviewSessions: linkedSessions,
-      };
-    });
+    .map((candidate) => ({
+      ...candidate,
+      interviewSessions: allSessions
+        .filter((s) => s.candidateId === candidate.id || s.candidateEmail === candidate.email)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .map(stripSessionSecrets),
+    }));
 
   return res.json({
     totalCandidates: candidatesWithSessions.length,
     totalInterviewSessions: allSessions.length,
-    relation: 'public.candidates (1) ---> (Many) public.interview_sessions via candidate_id',
+    relation:
+      'public.candidates (1) ---> (Many) public.interview_sessions (1) ---> (Many) public.candidate_answers',
     supabaseLiveJoinRows: supabaseRelationalData,
     candidates: candidatesWithSessions,
   });
 });
 
-app.get('/api/candidates/:id', (req, res) => {
+app.get('/api/candidates/:id', requireAdmin, (req, res) => {
   const candidateIdOrEmail = req.params.id.trim().toLowerCase();
   let candidate = activeCandidates.get(req.params.id);
   if (!candidate) {
@@ -4646,12 +7310,9 @@ app.get('/api/candidates/:id', (req, res) => {
   }
 
   const linkedSessions = Array.from(activeSessions.values())
-    .filter(
-      (s) =>
-        s.candidateId === candidate!.id ||
-        s.candidateEmail.toLowerCase() === candidate!.email.toLowerCase()
-    )
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    .filter((s) => s.candidateId === candidate!.id || s.candidateEmail === candidate!.email)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map(stripSessionSecrets);
 
   return res.json({
     candidate,
@@ -4659,18 +7320,18 @@ app.get('/api/candidates/:id', (req, res) => {
   });
 });
 
-// 5h. Supabase Schema SQL & Live Sync Endpoints
-app.get('/api/supabase/schema-sql', (_req, res) => {
+// 5h. Supabase Schema SQL & Live Sync Endpoints (ADMIN ONLY)
+app.get('/api/supabase/schema-sql', requireAdmin, (_req, res) => {
   try {
     const schemaPath = path.join(process.cwd(), 'supabase-schema.sql');
     const sqlContent = fs.existsSync(schemaPath) ? fs.readFileSync(schemaPath, 'utf-8') : '';
     res.type('text/plain').send(sqlContent);
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || 'Failed to read supabase-schema.sql' });
+  } catch {
+    res.status(500).json({ error: 'Failed to read supabase-schema.sql' });
   }
 });
 
-app.post('/api/supabase/sync', async (_req, res) => {
+app.post('/api/supabase/sync', requireAdmin, async (_req, res) => {
   const config = getSupabaseConfig();
   if (!config) {
     return res.status(400).json({
@@ -4705,43 +7366,483 @@ app.post('/api/supabase/sync', async (_req, res) => {
   });
 });
 
+// 5i. Single NotebookLM Female Interviewer Voice (Aoede — Sarah) & Studio Neural TTS Endpoint
+export const SINGLE_INTERVIEWER_VOICE = {
+  id: 'Aoede',
+  edgeNeuralVoice: 'en-US-AvaMultilingualNeural',
+  name: 'Sarah — Global Hire 360 Operations & Talent Manager (NotebookLM Aoede Voice)',
+  tone: 'Warm, natural, composed NotebookLM female host & hiring manager cadence',
+  pitch: 1.0,
+  rate: 0.99,
+} as const;
+
+const ttsAudioMemoryCache = new Map<string, { mimeType: string; audioBase64: string }>();
+
+async function synthesizeNotebookLmFemaleVoiceMp3(text: string): Promise<Buffer | null> {
+  try {
+    const clean = text.replace(/\s+/g, ' ').trim();
+    if (!clean) return null;
+
+    const tts = new MsEdgeTTS();
+    await tts.setMetadata(
+      SINGLE_INTERVIEWER_VOICE.edgeNeuralVoice,
+      OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
+    );
+    const { audioStream } = tts.toStream(clean);
+    const chunks: Buffer[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        try {
+          tts.close();
+        } catch {
+          // ignore
+        }
+        resolve();
+      }, 9500);
+
+      audioStream.on('data', (d: Buffer | Uint8Array) => {
+        chunks.push(Buffer.from(d));
+      });
+      audioStream.on('end', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      audioStream.on('close', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      audioStream.on('error', (err: any) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+    });
+
+    try {
+      tts.close();
+    } catch {
+      // ignore
+    }
+
+    if (chunks.length === 0) return null;
+    return Buffer.concat(chunks);
+  } catch (err) {
+    console.warn('MsEdgeTTS NotebookLM voice synthesis warning:', err);
+    return null;
+  }
+}
+
+function splitTextIntoTtsChunks(text: string, maxLen = 175): string[] {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return [];
+  if (normalized.length <= maxLen) return [normalized];
+
+  const sentences = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [normalized];
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const rawSentence of sentences) {
+    const sentence = rawSentence.trim();
+    if (!sentence) continue;
+
+    if ((current + ' ' + sentence).trim().length <= maxLen) {
+      current = (current + ' ' + sentence).trim();
+    } else {
+      if (current) chunks.push(current);
+      if (sentence.length <= maxLen) {
+        current = sentence;
+      } else {
+        const words = sentence.split(' ');
+        let piece = '';
+        for (const w of words) {
+          if ((piece + ' ' + w).trim().length <= maxLen) {
+            piece = (piece + ' ' + w).trim();
+          } else {
+            if (piece) chunks.push(piece);
+            piece = w;
+          }
+        }
+        current = piece;
+      }
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function fetchGoogleNeuralFemaleTtsMp3(text: string): Promise<Buffer | null> {
+  // Primary: Studio-grade Microsoft Edge Neural Multilingual Female Voice (AvaMultilingualNeural — NotebookLM cadence)
+  const studioNeuralMp3 = await synthesizeNotebookLmFemaleVoiceMp3(text);
+  if (studioNeuralMp3 && studioNeuralMp3.length > 512) {
+    return studioNeuralMp3;
+  }
+
+  // Secondary fallback: Google en-US TTS stream
+  try {
+    const chunks = splitTextIntoTtsChunks(text, 175);
+    if (chunks.length === 0) return null;
+
+    const buffers: Buffer[] = [];
+    for (const chunk of chunks) {
+      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en-US&q=${encodeURIComponent(
+        chunk
+      )}`;
+      const resp = await fetch(ttsUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        },
+      });
+      if (!resp.ok) {
+        return null;
+      }
+      const arrBuf = await resp.arrayBuffer();
+      const buf = Buffer.from(arrBuf);
+      if (buf.length > 0) {
+        buffers.push(buf);
+      }
+    }
+
+    if (buffers.length === 0) return null;
+    return Buffer.concat(buffers);
+  } catch (err) {
+    console.warn('Google neural TTS stream warning:', err);
+    return null;
+  }
+}
+
+function pcm24kToWavBuffer(pcmBuffer: Buffer, sampleRate = 24000, numChannels = 1, bitsPerSample = 16): Buffer {
+  // If buffer already starts with RIFF header (e.g. Gemini 3.8 TTS unary output), return as-is
+  if (pcmBuffer.length >= 44 && pcmBuffer.subarray(0, 4).toString('ascii') === 'RIFF') {
+    return pcmBuffer;
+  }
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  const dataSize = pcmBuffer.length;
+  const header = Buffer.alloc(44);
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16); // PCM chunk size
+  header.writeUInt16LE(1, 20); // AudioFormat = 1 (PCM)
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+app.get('/api/google-avatar.svg', (req, res) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  const rawName = String(req.query.name || email || 'Candidate').trim();
+  const bgColor = getGoogleAccountColorForEmail(email || rawName);
+
+  const parts = rawName
+    .replace(/[^a-zA-Z0-9 ]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const initials =
+    parts.length >= 2
+      ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
+      : (rawName.slice(0, 2) || 'C').toUpperCase();
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+    <defs>
+      <radialGradient id="gGlow" cx="30%" cy="25%" r="75%">
+        <stop offset="0%" stop-color="#ffffff" stop-opacity="0.18"/>
+        <stop offset="100%" stop-color="#000000" stop-opacity="0.12"/>
+      </radialGradient>
+    </defs>
+    <circle cx="128" cy="128" r="128" fill="${bgColor}"/>
+    <circle cx="128" cy="128" r="128" fill="url(#gGlow)"/>
+    <text x="128" y="136" text-anchor="middle" dominant-baseline="middle" fill="#FFFFFF" font-family="'Plus Jakarta Sans', 'Google Sans', Inter, Arial, sans-serif" font-size="96" font-weight="700" letter-spacing="1">${initials}</text>
+  </svg>`;
+
+  res.setHeader('Content-Type', 'image/svg+xml');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(svg);
+});
+
+app.get('/api/candidate-profile-picture', async (req, res) => {
+  const email = String(req.query.email || '');
+  const fullName = String(req.query.name || req.query.fullName || 'Candidate');
+  const resolved = await resolveGoogleAccountProfilePicture(email, fullName);
+  res.json(resolved);
+});
+
+app.post('/api/candidate-profile-picture', (req, res) => {
+  const { fullName, avatarDataUrl, sessionId } = req.body || {};
+  const cleanAvatar = String(avatarDataUrl || '').trim();
+  // Only the owner of a live session may set the avatar, and only to a small inline image.
+  const sess = activeSessions.get(clampText(sessionId, 100));
+  if (!sess || !sessionTokenMatches(sess, readSessionToken(req))) {
+    return res.status(404).json({ error: 'Session not found.' });
+  }
+  if (
+    cleanAvatar.length > 400_000 ||
+    !/^data:image\/(?:png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/.test(cleanAvatar)
+  ) {
+    return res.status(400).json({ error: 'avatarDataUrl must be a PNG, JPEG or WebP data URL under 300KB.' });
+  }
+  const cleanEmail = sess.candidateEmail;
+
+  verifiedGoogleAvatarCache.set(cleanEmail, cleanAvatar);
+
+  const existingCandidate = activeCandidates.get(sess.candidateId);
+  if (existingCandidate) {
+    existingCandidate.googleAvatarUrl = cleanAvatar;
+    activeCandidates.set(existingCandidate.id, existingCandidate);
+  }
+
+  sess.candidateGoogleAvatarUrl = cleanAvatar;
+  activeSessions.set(sess.id, sess);
+
+  flushCandidatesAndSessionsToDisk();
+  return res.json({
+    saved: true,
+    primaryUrl: cleanAvatar,
+    candidateName: fullName || existingCandidate?.fullName || 'Candidate',
+  });
+});
+
+app.get('/api/live-agent-config', (_req, res) => {
+  res.json({
+    apiVersion: 'v1alpha',
+    models: LIVE_MODELS,
+    voiceName: SINGLE_INTERVIEWER_VOICE.id,
+    neuralFallbackVoice: SINGLE_INTERVIEWER_VOICE.edgeNeuralVoice,
+    interviewerName: 'Sarah',
+    interviewerTitle: 'Operations and Talent Manager',
+    companyName: 'Global Hire 360',
+    turnEndSilenceMs: TURN_END_SILENCE_MS,
+  });
+});
+
+app.get('/api/interviewer-voices', (_req, res) => {
+  res.json({
+    defaultVoice: SINGLE_INTERVIEWER_VOICE.id,
+    singleVoiceLocked: true,
+    voices: [SINGLE_INTERVIEWER_VOICE],
+  });
+});
+
+app.post('/api/interviewer-tts', async (req, res) => {
+  const { text } = req.body || {};
+  const cleanText = clampText(text, 2500).trim();
+  if (!cleanText) {
+    return res.status(400).json({ error: 'Text is required for TTS.' });
+  }
+
+  // Always lock to the single NotebookLM voice: Aoede
+  const selectedVoice = SINGLE_INTERVIEWER_VOICE.id;
+  const cacheKey = `${selectedVoice}::${cleanText}`;
+  const cachedAudio = ttsAudioMemoryCache.get(cacheKey);
+  if (cachedAudio) {
+    return res.json({
+      fallback: false,
+      voiceName: selectedVoice,
+      mimeType: cachedAudio.mimeType,
+      audioBase64: cachedAudio.audioBase64,
+    });
+  }
+
+  const ai = getGenAIClientOrNull();
+  if (ai) {
+    for (const ttsModel of [
+      'gemini-3.8-flash-lite-tts',
+      'gemini-3.8-flash-tts',
+      'gemini-2.5-flash-preview-tts',
+    ]) {
+      try {
+        const response = await ai.models.generateContent({
+          model: ttsModel,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: cleanText,
+                  ...(ttsModel.startsWith('gemini-3.8')
+                    ? {
+                        speechMetadata: {
+                          style:
+                            'Warm, natural, composed hiring manager and NotebookLM podcast host',
+                        },
+                      }
+                    : {}),
+                } as any,
+              ],
+            },
+          ],
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: selectedVoice },
+              },
+            },
+          } as any,
+        });
+
+        const inlineData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+        const base64Audio = inlineData?.data;
+        const rawMime = inlineData?.mimeType || 'audio/wav';
+        if (base64Audio) {
+          const rawBuf = Buffer.from(base64Audio, 'base64');
+          const wavBuffer = pcm24kToWavBuffer(rawBuf, 24000, 1, 16);
+          const wavB64 = wavBuffer.toString('base64');
+          ttsAudioMemoryCache.set(cacheKey, { mimeType: 'audio/wav', audioBase64: wavB64 });
+          return res.json({
+            fallback: false,
+            voiceName: selectedVoice,
+            mimeType: 'audio/wav',
+            audioBase64: wavB64,
+          });
+        }
+      } catch (err: any) {
+        console.warn(`Gemini TTS (${ttsModel}) fallback check:`, err?.message || err);
+      }
+    }
+  }
+
+  // Server-side Studio Neural Female TTS (en-US-AvaMultilingualNeural — NotebookLM cadence)
+  const neuralMp3Buffer = await fetchGoogleNeuralFemaleTtsMp3(cleanText);
+  if (neuralMp3Buffer && neuralMp3Buffer.length > 0) {
+    const mp3B64 = neuralMp3Buffer.toString('base64');
+    ttsAudioMemoryCache.set(cacheKey, { mimeType: 'audio/mpeg', audioBase64: mp3B64 });
+    return res.json({
+      fallback: false,
+      voiceName: selectedVoice,
+      mimeType: 'audio/mpeg',
+      audioBase64: mp3B64,
+    });
+  }
+
+  return res.json({ fallback: true, voiceName: selectedVoice });
+});
+
 // ============================================================================
-// 6. LUNA v2 REAL-TIME VOICE WEBSOCKET BRIDGE (/api/live-ws)
+// 6. LUNA v2 REAL-TIME VOICE WEBSOCKET BRIDGE (/api/live-ws) — GEMINI-3.8-LIVE
 // ============================================================================
 const endCallFunctionDeclaration: FunctionDeclaration = {
   name: 'end_call',
   description:
-    'Ends the live interview call after you have spoken your final impression and told the candidate whether or not they were successful (or after 2 failed attempts on a question).',
+    'Ends the live interview call. Call it only AFTER you have spoken your closing words. After calling it you must stay completely silent.',
   parameters: {
     type: Type.OBJECT,
     properties: {
       reason: {
         type: Type.STRING,
-        description: 'completed_all_questions or terminated_after_two_attempts',
+        description:
+          'completed_all_questions (normal end after the closing), time_up (the 10 minutes are over), terminated_rules_violation (the interview rules were broken again after a warning), or terminated_misconduct (abusive / repeated inappropriate language).',
       },
     },
+    required: ['reason'],
   },
 };
 
 const advanceQuestionFunctionDeclaration: FunctionDeclaration = {
   name: 'advance_question',
   description:
-    'Call this whenever you move to the next interview question (Question 1, 2, 3, 4, or 5) so the candidate UI resets the 90-second timer.',
+    'Call this in the same turn, right before you ask a new main interview question, with that question number. Do NOT call it when you only repeat or rephrase the current question.',
   parameters: {
     type: Type.OBJECT,
     properties: {
       questionNumber: {
         type: Type.NUMBER,
-        description: 'The question number (1 to 5) you are now asking.',
+        description: 'The number of the main question you are about to ask.',
       },
     },
     required: ['questionNumber'],
   },
 };
 
+const reportMisconductFunctionDeclaration: FunctionDeclaration = {
+  name: 'report_candidate_misconduct',
+  description:
+    'Call this IMMEDIATELY if the candidate uses profanity, inappropriate language, insults, or disrespectful conduct during the interview.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      action: {
+        type: Type.STRING,
+        description:
+          'deduct_points_warning (for 1st mild offense: deducts 3 points and warns candidate) or terminate_and_suspend_24h (for severe profanity/insults or a 2nd offense: ends call and suspends candidate for 24 hours).',
+      },
+      pointsDeducted: {
+        type: Type.NUMBER,
+        description: 'Points deducted for misconduct (default 3 for warning, 25 for termination).',
+      },
+      reason: {
+        type: Type.STRING,
+        description: 'Brief explanation of the inappropriate language or misconduct.',
+      },
+    },
+    required: ['action', 'reason'],
+  },
+};
+
+/** One live voice bridge per interview session: a new connection always replaces the old one. */
+const liveVoiceConnections = new Map<string, { clientWs: WebSocket; shutdown: () => void }>();
+
+/** Startup check: tells the operator clearly whether Supabase is ready (tables + key). */
+async function checkSupabaseTables(): Promise<boolean> {
+  const config = getSupabaseConfig();
+  if (!config) {
+    console.warn('[Supabase] Not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY) — saving to local data/ only.');
+    return false;
+  }
+  const tables = [
+    'candidates',
+    'interview_sessions',
+    'candidate_answers',
+    'interview_questions',
+    'customer_service_questions',
+    'virtual_assistant_questions',
+    'technical_support_questions',
+  ];
+  const missing: string[] = [];
+  let authProblem = '';
+  for (const table of tables) {
+    try {
+      const resp = await fetch(`${config.url}/rest/v1/${table}?select=id&limit=1`, {
+        headers: { apikey: config.key, Authorization: `Bearer ${config.key}` },
+      });
+      if (resp.status === 401 || resp.status === 403) {
+        authProblem = `HTTP ${resp.status} — check that SUPABASE_SERVICE_ROLE_KEY is the secret (service role) key`;
+        break;
+      }
+      if (!resp.ok) missing.push(table);
+    } catch (err: any) {
+      authProblem = `cannot reach ${config.url}: ${err?.message || err}`;
+      break;
+    }
+  }
+  if (authProblem) {
+    console.warn(`[Supabase] ${authProblem}`);
+    return false;
+  }
+  if (missing.length) {
+    console.warn(
+      `[Supabase] Missing tables: ${missing.join(', ')}. Run supabase-schema.sql once in Supabase Dashboard -> SQL Editor, then restart the server.`
+    );
+    return false;
+  }
+  console.log('[Supabase] Connected — all interview tables are ready.');
+  return true;
+}
+
 async function startServer() {
   const httpServer = http.createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
+  // Audio frames are ~6 KB; anything much larger is not a legitimate client frame.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
 
   httpServer.on('upgrade', (request, socket, head) => {
     const pathname = new URL(request.url || '', `http://${request.headers.host}`).pathname;
@@ -4749,226 +7850,581 @@ async function startServer() {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
-    } else {
-      socket.destroy();
     }
   });
 
   wss.on('connection', async (clientWs: WebSocket, request) => {
     const url = new URL(request.url || '', `http://${request.headers.host}`);
     const sessionId = url.searchParams.get('sessionId') || '';
-    const session = activeSessions.get(sessionId);
+    const wsToken = url.searchParams.get('token') || '';
+    const isReconnect = url.searchParams.get('reconnect') === '1';
+    const liveVoiceName = SINGLE_INTERVIEWER_VOICE.id; // Single NotebookLM female voice ("Aoede")
+    const candidateSession = activeSessions.get(sessionId);
+    // The live voice socket is only opened for the owner of an unfinished session.
+    const session =
+      candidateSession &&
+      sessionTokenMatches(candidateSession, wsToken) &&
+      candidateSession.currentPhase !== 'finished'
+        ? candidateSession
+        : undefined;
 
-    const ai = getGenAIClientOrNull();
-    if (!ai || !session) {
+    const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || !session) {
       clientWs.send(
         JSON.stringify({
           type: 'fallback_required',
-          reason: !ai ? 'GEMINI_API_KEY not configured' : 'Session not found',
+          reason: !apiKey ? 'GEMINI_API_KEY not configured' : 'Session not found',
         })
       );
       clientWs.close();
       return;
     }
 
-    let geminiSession: any = null;
+    // Only ONE interviewer voice per interview: close any previous bridge for this session
+    // (second tab, page reload, reconnect) so two Sarahs can never talk at the same time.
+    liveVoiceConnections.get(session.id)?.shutdown();
 
-    try {
-      const questionsListText = session.questions
-        .map((q) => `Question ${q.number} (${q.category}): "${q.question}" [Expected Focus: ${q.expectedFocus}]`)
-        .join('\n');
-
-      const systemPrompt = `You are the Official Live Voice Interviewer for Global Hire 360 (https://www.globalhire360.com/).
-VOICE & PERSONA:
-- Speak with a warm, articulate, confident, encouraging African American female coach voice and cadence.
-- Keep your spoken turns natural, conversational, and concise (2 to 4 sentences per turn).
-
-CANDIDATE DETAILS:
-- Candidate Name: ${session.candidateName}
-- Extracted Job Position from Resume: ${session.detectedRole}
-- Candidate Experience Summary: ${session.candidateExperienceSummary}
-- Key Skills: ${session.keySkills.join(', ')}
-
-THE 5 INTERVIEW QUESTIONS FOR THIS ROLE:
-${questionsListText}
-
-STRICT INTERVIEW FLOW & RULES (MUST FOLLOW EXACTLY):
-1. GREETING FIRST: Start immediately by warmly greeting ${session.candidateName}, welcoming them to the Global Hire 360 interview room for the ${session.detectedRole} role, and asking how they are doing today. Wait for their reply.
-2. ASK QUESTIONS 1 TO 5 IN ORDER: After they reply to your greeting, call the tool "advance_question" with questionNumber: 1 and ask Question 1. Each time you move to a new question (1 through 5), call "advance_question" with that questionNumber so their 90-second timer resets.
-3. REPHRASING & THE 2-ATTEMPT COACHING RULE:
-   - If ${session.candidateName} asks you to repeat or rephrase a question, gladly rephrase it in simpler terms.
-   - If ${session.candidateName}'s answer is off-topic or does not answer the question on their FIRST attempt, gently stop them, give them warm motivation ("You've got this, let me rephrase what I'm looking for..."), and rephrase the question for Attempt 2.
-   - If after 2 attempts on the same question they STILL do not answer it properly, give them warm, encouraging words to practice further with the Global Hire 360 Workshop, tell them they were not successful today, and call "end_call" with reason "terminated_after_two_attempts".
-4. 90-SECOND TIMER: If you receive a system message saying "[90-SECOND TIMER EXPIRED]", politely interrupt the candidate, let them know the 90 seconds for that question are up, call "advance_question" for the next question, and ask the next question immediately.
-5. ENDING THE INTERVIEW: After Question 5 is answered, give your honest final impression, explicitly tell ${session.candidateName} whether or not they were successful, and call the "end_call" tool.`;
-
-      geminiSession = await ai.live.connect({
-        model: 'gemini-3.8-live',
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: 'Kore',
-              },
-            },
-          },
-          systemInstruction: {
-            parts: [{ text: systemPrompt }],
-          },
-          tools: [
-            {
-              functionDeclarations: [endCallFunctionDeclaration, advanceQuestionFunctionDeclaration],
-            },
-          ],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        },
-        callbacks: {
-          onopen: () => {
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify({ type: 'connected' }));
-            }
-          },
-          onmessage: async (message: any) => {
-            if (clientWs.readyState !== WebSocket.OPEN) return;
-
-            // Forward serverContent (audio chunks, interruption, transcriptions)
-            clientWs.send(JSON.stringify(message));
-
-            // Handle tool calls (advance_question / end_call)
-            const toolCalls = message?.toolCall?.functionCalls;
-            if (Array.isArray(toolCalls)) {
-              for (const call of toolCalls) {
-                if (call.name === 'advance_question') {
-                  const qNum = Number(call.args?.questionNumber) || 1;
-                  clientWs.send(
-                    JSON.stringify({
-                      type: 'question_advanced',
-                      questionNumber: Math.max(1, Math.min(5, qNum)),
-                    })
-                  );
-                  try {
-                    await geminiSession.sendToolResponse({
-                      functionResponses: [
-                        {
-                          id: call.id,
-                          name: call.name,
-                          response: { result: `Timer reset for Question ${qNum}` },
-                        },
-                      ],
-                    });
-                  } catch {
-                    // ignore
-                  }
-                } else if (call.name === 'end_call') {
-                  clientWs.send(
-                    JSON.stringify({
-                      type: 'end_call_triggered',
-                      reason: call.args?.reason || 'completed_all_questions',
-                    })
-                  );
-                }
-              }
-            }
-          },
-          onerror: (err: any) => {
-            console.warn('Gemini Live WebSocket error:', err);
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(
-                JSON.stringify({
-                  type: 'fallback_required',
-                  reason: err?.message || 'Gemini Live error',
-                })
-              );
-            }
-          },
-          onclose: () => {
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.close();
-            }
-          },
-        },
-      });
-
-      // Kick off the interviewer's initial greeting automatically
-      await geminiSession.sendClientContent({
-        turns: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: `The candidate ${session.candidateName} has just joined the interview room with their camera and microphone on. Greet them warmly by name and ask how they are doing today.`,
-              },
-            ],
-          },
-        ],
-        turnComplete: true,
-      });
-    } catch (err: any) {
-      console.warn('Failed to initialize Gemini Live session, switching to fallback:', err?.message);
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(
-          JSON.stringify({
-            type: 'fallback_required',
-            reason: err?.message || 'Live connection unavailable',
-          })
-        );
-        clientWs.close();
-      }
-      return;
-    }
-
-    clientWs.on('message', async (raw) => {
-      if (!geminiSession) return;
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.realtimeInput) {
-          await geminiSession.sendRealtimeInput(msg.realtimeInput);
-        } else if (msg.clientContent) {
-          await geminiSession.sendClientContent(msg.clientContent);
-        } else if (msg.type === 'timer_expired') {
-          const nextQNum = (msg.currentQuestionIndex || 0) + 2;
-          await geminiSession.sendClientContent({
-            turns: [
-              {
-                role: 'user',
-                parts: [
-                  {
-                    text: `[SYSTEM NOTIFICATION: 90-SECOND TIMER EXPIRED on Question ${
-                      (msg.currentQuestionIndex || 0) + 1
-                    }. Politely interrupt ${session.candidateName} right now, let them know their 90 seconds are up for this question, and ${
-                      nextQNum <= 5
-                        ? `call advance_question(${nextQNum}) and ask Question ${nextQNum} immediately.`
-                        : `give your final impression and call end_call.`
-                    }]`,
-                  },
-                ],
-              },
-            ],
-            turnComplete: true,
-          });
-        }
-      } catch (e) {
-        console.warn('Error forwarding client WS frame:', e);
-      }
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        apiVersion: 'v1alpha', // needed for affective dialog & proactive audio
+        headers: { 'User-Agent': 'aistudio-build' },
+      },
     });
 
-    clientWs.on('close', () => {
+    const totalQuestions = session.questions.length || DEFAULT_QUESTION_COUNT;
+    let geminiSession: any = null;
+    let geminiGeneration = 0;
+    let resumptionHandle: string | null = null;
+    let geminiReconnects = 0;
+    let stopped = false; // bridge closed (client left / replaced)
+    let callEnded = false; // interview over: nothing is forwarded any more
+    let endingReason: InterviewSessionRecord['liveEndReason'] | null = null;
+    let rejectedEarlyEnd = false;
+    let lastExpiredQuestion = 0;
+    let lastAutoMisconductAt = 0;
+    let interviewerTurnText = '';
+    let currentQuestionNumber =
+      session.currentPhase === 'questioning'
+        ? Math.min(totalQuestions, (session.currentQuestionIndex || 0) + 1)
+        : 0;
+    const timers: NodeJS.Timeout[] = [];
+
+    session.liveMode = true;
+    if (!isReconnect && session.transcript.every((t) => t.speaker === 'interviewer')) {
+      // Fresh live call: drop the text-mode greeting that was never spoken.
+      session.transcript = [];
+    }
+
+    const sendToClient = (payload: unknown) => {
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify(payload));
+    };
+
+    const shutdown = () => {
+      if (stopped) return;
+      stopped = true;
+      timers.forEach((t) => clearTimeout(t));
       try {
         geminiSession?.close();
       } catch {
         // ignore
       }
+      geminiSession = null;
+      try {
+        if (clientWs.readyState === WebSocket.OPEN) clientWs.close();
+      } catch {
+        // ignore
+      }
+      if (liveVoiceConnections.get(session.id)?.clientWs === clientWs) {
+        liveVoiceConnections.delete(session.id);
+      }
+      flushCandidatesAndSessionsToDisk();
+    };
+    liveVoiceConnections.set(session.id, { clientWs, shutdown });
+
+    const secondsLeft = () => {
+      const maxSeconds = session.maxDurationSeconds || 600;
+      const deadline = new Date(session.createdAt).getTime() + maxSeconds * 1000;
+      return Math.round((deadline - Date.now()) / 1000);
+    };
+
+    /** Server-side transcript, tagged with the question being answered. */
+    const appendTranscript = (speaker: 'interviewer' | 'candidate', chunk: string) => {
+      if (!chunk) return;
+      const questionIndex = currentQuestionNumber > 0 ? currentQuestionNumber - 1 : undefined;
+      const last = session.transcript[session.transcript.length - 1];
+      if (last && last.speaker === speaker && last.questionIndex === questionIndex) {
+        last.text = clampText(`${last.text}${chunk}`.replace(/\s+/g, ' '), 6000);
+      } else {
+        const text = chunk.replace(/\s+/g, ' ').trim();
+        if (!text) return;
+        session.transcript.push({
+          id: `tr_${Date.now()}_${speaker === 'interviewer' ? 'i' : 'c'}_${session.transcript.length}`,
+          speaker,
+          speakerName:
+            speaker === 'interviewer' ? 'Sarah (Global Hire 360 Hiring Manager)' : session.candidateName,
+          text,
+          timestamp: new Date().toISOString(),
+          questionIndex,
+        });
+        if (session.transcript.length > 600) session.transcript.splice(0, session.transcript.length - 600);
+      }
+    };
+
+    // Candidate words spoken since the current question started (decides whether a re-ask
+    // of the same question restarts its 90-second timer).
+    let candidateWordsThisQuestion = 0;
+    // Only one question detection per interviewer turn.
+    let questionDetectedThisTurn = false;
+
+    const setCurrentQuestion = (n: number) => {
+      const qn = Math.max(1, Math.min(totalQuestions, Math.round(n)));
+      if (qn < currentQuestionNumber) return;
+      if (qn === currentQuestionNumber) {
+        // Same question asked again before the candidate really started answering — e.g. it
+        // was first "heard" in the introduction ("let me walk you through..."), or Sarah
+        // repeated it on request. Give the candidate a full 90 seconds from now.
+        if (candidateWordsThisQuestion >= ANSWER_STARTED_WORDS || lastExpiredQuestion === qn) return;
+        sendToClient({ type: 'question_advanced', questionNumber: qn, totalQuestions });
+        return;
+      }
+      currentQuestionNumber = qn;
+      candidateWordsThisQuestion = 0;
+      session.currentPhase = 'questioning';
+      session.currentQuestionIndex = qn - 1;
+      session.currentQuestionAttempts = 0;
+      sendToClient({ type: 'question_advanced', questionNumber: qn, totalQuestions });
+      flushCandidatesAndSessionsToDisk();
+    };
+
+    const sendSystemNote = async (text: string, respondNow: boolean) => {
+      if (!geminiSession || stopped || callEnded) return;
+      try {
+        await geminiSession.sendClientContent({
+          turns: [{ role: 'user', parts: [{ text: `[SYSTEM NOTE] ${text}` }] }],
+          turnComplete: respondNow,
+        });
+      } catch (e: any) {
+        console.warn('Live system note failed:', e?.message || e);
+      }
+    };
+
+    let drainUntil = 0;
+    const closeGeminiAfterEnd = () => {
+      drainUntil = 0;
+      try {
+        geminiSession?.close();
+      } catch {
+        // ignore
+      }
+      geminiSession = null;
+      sendToClient({ type: 'interviewer_audio_done' });
+    };
+
+    /** The interview is over: stop forwarding everything, tell the browser, close Gemini. */
+    const finishCall = (reason: NonNullable<InterviewSessionRecord['liveEndReason']>) => {
+      if (callEnded || stopped) return;
+      callEnded = true;
+      session.liveEndReason = reason;
+      if (reason === 'terminated_misconduct') session.status = 'terminated_misconduct';
+      timers.forEach((t) => clearTimeout(t));
+      sendToClient({ type: 'end_call_triggered', reason, suspendedUntil: session.suspendedUntil });
+      flushCandidatesAndSessionsToDisk();
+      // Let the closing sentence that is already being spoken finish (current turn only),
+      // then close Gemini so it cannot produce another word.
+      drainUntil = Date.now() + 8000;
+      timers.push(setTimeout(closeGeminiAfterEnd, 8000));
+    };
+
+    /** Ask Sarah to say a short closing line, and end the call ourselves if she doesn't. */
+    const requestGracefulEnd = (
+      reason: NonNullable<InterviewSessionRecord['liveEndReason']>,
+      instruction: string,
+      graceMs: number
+    ) => {
+      if (callEnded || endingReason) return;
+      endingReason = reason;
+      void sendSystemNote(instruction, true);
+      timers.push(setTimeout(() => finishCall(reason), graceMs));
+    };
+
+    const terminateForMisconduct = async (reason: string) => {
+      session.status = 'terminated_misconduct';
+      session.misconductPenaltyPoints = (session.misconductPenaltyPoints || 0) + 5;
+      session.misconductNotes = session.misconductNotes || [];
+      session.misconductNotes.push(`Live voice misconduct termination: ${reason}`);
+      if (!session.suspendedUntil) {
+        session.suspendedUntil = await suspendCandidateFor24Hours({
+          email: session.candidateEmail,
+          candidateId: session.candidateId,
+          reason,
+        });
+      }
+      requestGracefulEnd(
+        'terminated_misconduct',
+        `The candidate used unacceptable language again. In one calm sentence, tell ${session.candidateName} that the interview is ending now because of unprofessional language and that a 24-hour suspension applies. Then call end_call with reason "terminated_misconduct". Say nothing else.`,
+        9000
+      );
+    };
+
+    const handleToolCalls = async (calls: any[]) => {
+      for (const call of calls) {
+        const respond = async (result: string) => {
+          try {
+            await geminiSession?.sendToolResponse({
+              functionResponses: [{ id: call.id, name: call.name, response: { result } }],
+            });
+          } catch {
+            // ignore
+          }
+        };
+
+        if (call.name === 'advance_question') {
+          const qNum = Number(call.args?.questionNumber) || currentQuestionNumber + 1;
+          setCurrentQuestion(qNum);
+          await respond(
+            `Question ${Math.min(totalQuestions, qNum)} of ${totalQuestions} started. Ask it exactly as written, then wait for the answer.`
+          );
+        } else if (call.name === 'report_candidate_misconduct') {
+          const action = String(call.args?.action || 'deduct_points_warning');
+          const reason = clampText(call.args?.reason || 'Unprofessional language during live interview', 300);
+          // The server's own detector may already have counted this same sentence.
+          const alreadyCounted = Date.now() - lastAutoMisconductAt < 10000;
+          if (!alreadyCounted) session.misconductCount = (session.misconductCount || 0) + 1;
+          session.misconductNotes = session.misconductNotes || [];
+
+          if (action === 'terminate_and_suspend_24h' || (session.misconductCount || 0) >= 2) {
+            await respond('Recorded. Say one sentence that the interview is ending now, then call end_call with reason "terminated_misconduct".');
+            await terminateForMisconduct(reason);
+          } else {
+            if (!alreadyCounted) {
+              const pts = Math.max(1, Math.min(5, Number(call.args?.pointsDeducted) || 3));
+              session.misconductPenaltyPoints = (session.misconductPenaltyPoints || 0) + pts;
+              session.misconductNotes.push(`Warning (-${pts} pts): ${reason}`);
+              sendToClient({
+                type: 'misconduct_warning',
+                pointsDeducted: pts,
+                totalPenaltyPoints: session.misconductPenaltyPoints,
+                reason,
+              });
+            }
+            await respond(`Warning recorded. Total penalty points: ${session.misconductPenaltyPoints}. Calmly warn the candidate once, then continue the interview.`);
+          }
+        } else if (call.name === 'end_call') {
+          const allowed = [
+            'completed_all_questions',
+            'time_up',
+            'terminated_rules_violation',
+            'terminated_misconduct',
+          ] as const;
+          const asked = String(call.args?.reason || 'completed_all_questions') as (typeof allowed)[number];
+          let reason: NonNullable<InterviewSessionRecord['liveEndReason']> =
+            endingReason || (allowed.includes(asked) ? asked : 'completed_all_questions');
+
+          // Keep the interview going until all questions were asked (or time is up):
+          // the model is not allowed to cut the call short by mistake.
+          if (
+            !endingReason &&
+            reason === 'completed_all_questions' &&
+            currentQuestionNumber < totalQuestions &&
+            secondsLeft() > 60 &&
+            !rejectedEarlyEnd
+          ) {
+            rejectedEarlyEnd = true;
+            await respond(
+              `The call cannot end yet: only ${currentQuestionNumber} of ${totalQuestions} questions have been asked. Continue the interview now with Question ${currentQuestionNumber + 1} exactly as written.`
+            );
+            continue;
+          }
+          if (reason === 'time_up' && secondsLeft() > 30) reason = 'completed_all_questions';
+          if (reason === 'terminated_misconduct' && !session.suspendedUntil) {
+            session.suspendedUntil = await suspendCandidateFor24Hours({
+              email: session.candidateEmail,
+              candidateId: session.candidateId,
+              reason: 'Terminated by interviewer for professional misconduct.',
+            });
+          }
+          finishCall(reason);
+          return; // nothing after end_call is processed
+        }
+      }
+    };
+
+    const onGeminiMessage = async (message: any) => {
+      if (stopped) return;
+      if (callEnded) {
+        // After end_call only the rest of the closing turn (audio + caption) is passed on.
+        const sc = message?.serverContent;
+        if (!sc || Date.now() > drainUntil) return;
+        if (sc.modelTurn || sc.outputTranscription) {
+          sendToClient({ serverContent: { modelTurn: sc.modelTurn, outputTranscription: sc.outputTranscription } });
+        }
+        if (sc.outputTranscription?.text) appendTranscript('interviewer', sc.outputTranscription.text);
+        if (sc.turnComplete || sc.interrupted) closeGeminiAfterEnd();
+        return;
+      }
+
+      if (message?.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate.newHandle) {
+        resumptionHandle = message.sessionResumptionUpdate.newHandle;
+        return;
+      }
+      if (message?.goAway || message?.setupComplete) return;
+
+      // Forward audio, interruption and transcriptions to the browser
+      if (message?.serverContent || message?.toolCall) sendToClient(message);
+
+      const serverContent = message?.serverContent;
+      const interviewerChunk = serverContent?.outputTranscription?.text;
+      if (interviewerChunk) {
+        appendTranscript('interviewer', interviewerChunk);
+        interviewerTurnText += interviewerChunk;
+        // The server follows the interview by itself: as soon as Sarah says the next prepared
+        // question, the 90-second timer starts and the answer that follows is filed under it.
+        // Look at the next question first, then one further (in case one was missed), and at
+        // the current one (a re-ask before it was answered restarts its timer).
+        if (!questionDetectedThisTurn) {
+          for (const ahead of [0, 1, -1]) {
+            const qn = currentQuestionNumber + 1 + ahead;
+            const candidateQ = qn >= 1 ? session.questions[qn - 1] : undefined;
+            if (candidateQ && recentSpeechAsksQuestion(interviewerTurnText, candidateQ.question)) {
+              questionDetectedThisTurn = true;
+              setCurrentQuestion(qn);
+              break;
+            }
+          }
+        }
+      }
+      if (serverContent?.turnComplete || serverContent?.interrupted) {
+        interviewerTurnText = '';
+        questionDetectedThisTurn = false;
+      }
+
+      const candidateChunk = serverContent?.inputTranscription?.text;
+      if (candidateChunk && !endingReason) {
+        appendTranscript('candidate', candidateChunk);
+        candidateWordsThisQuestion += candidateChunk.split(/\s+/).filter(Boolean).length;
+        const liveCheck = detectCandidateMisconduct(candidateChunk);
+        if (liveCheck.isMisconduct) {
+          lastAutoMisconductAt = Date.now();
+          session.misconductCount = (session.misconductCount || 0) + 1;
+          session.misconductNotes = session.misconductNotes || [];
+          if (liveCheck.severity === 'severe' || session.misconductCount >= 2) {
+            await terminateForMisconduct(liveCheck.reason);
+          } else {
+            session.misconductPenaltyPoints = (session.misconductPenaltyPoints || 0) + 3;
+            session.misconductNotes.push(`Live voice misconduct warning (-3 pts): ${liveCheck.reason}`);
+            sendToClient({
+              type: 'misconduct_warning',
+              pointsDeducted: 3,
+              totalPenaltyPoints: session.misconductPenaltyPoints,
+              reason: liveCheck.reason,
+            });
+            void sendSystemNote(
+              'The platform detected unprofessional language and deducted 3 points. When the candidate finishes, calmly remind them in one sentence to keep the language professional, otherwise the interview will end with a 24-hour suspension. Then continue.',
+              false
+            );
+          }
+        }
+      }
+
+      const toolCalls = message?.toolCall?.functionCalls;
+      if (Array.isArray(toolCalls)) await handleToolCalls(toolCalls);
+    };
+
+    // Prompt and Live settings live in interviewer-agent.ts.
+    const buildLiveConfig = (): any =>
+      buildLiveVoiceConfig({
+        systemInstruction: buildInterviewerPrompt(session, DEFAULT_QUESTION_COUNT),
+        voiceName: liveVoiceName, // NotebookLM female voice ("Aoede")
+        resumptionHandle,
+        functionDeclarations: [endCallFunctionDeclaration, reportMisconductFunctionDeclaration],
+      });
+
+    // Index in LIVE_MODELS of the model in use (a resumed conversation must stay on it).
+    let activeModelIndex = 0;
+    // First platform note of this connection, re-sent if we have to switch model at startup.
+    let openingNote = '';
+
+    const connectGemini = async (startAt = 0): Promise<void> => {
+      const generation = ++geminiGeneration;
+      let gotMessage = false;
+      let modelIndex = startAt;
+      const callbacks = {
+        onopen: () => {
+          if (generation === geminiGeneration) sendToClient({ type: 'connected' });
+        },
+        onmessage: (message: any) => {
+          if (generation !== geminiGeneration) return;
+          gotMessage = true;
+          onGeminiMessage(message).catch((e) => console.warn('Live message handling error:', e));
+        },
+        onerror: (err: any) => {
+          if (generation !== geminiGeneration) return;
+          console.warn('Gemini Live WebSocket error:', err?.message || err);
+        },
+        onclose: (event: any) => {
+          if (generation !== geminiGeneration || stopped || callEnded) return;
+          geminiSession = null;
+          // Closed before saying anything (quota, unsupported setting...): try the next model.
+          if (!gotMessage && !resumptionHandle && modelIndex + 1 < LIVE_MODELS.length) {
+            console.warn(`Gemini Live model ${LIVE_MODELS[modelIndex]} closed at startup (${event?.reason || 'no reason'}); trying ${LIVE_MODELS[modelIndex + 1]}.`);
+            connectGemini(modelIndex + 1)
+              .then(() => (openingNote ? sendSystemNote(openingNote, true) : undefined))
+              .catch(() => {
+                sendToClient({ type: 'live_dropped' });
+                shutdown();
+              });
+            return;
+          }
+          // Transparent resume of the same conversation when Google recycles the connection.
+          if (resumptionHandle && geminiReconnects < 3) {
+            geminiReconnects += 1;
+            connectGemini(activeModelIndex).catch(() => {
+              sendToClient({ type: 'live_dropped' });
+              shutdown();
+            });
+            return;
+          }
+          sendToClient({ type: 'live_dropped' });
+          shutdown();
+        },
+      };
+      const config = buildLiveConfig();
+      let connected: any;
+      // Fastest model first, then the backups (see LIVE_MODELS in interviewer-agent.ts).
+      let lastErr: any;
+      for (; modelIndex < LIVE_MODELS.length; modelIndex++) {
+        if (stopped) return;
+        try {
+          connected = await ai.live.connect({ model: LIVE_MODELS[modelIndex], config, callbacks });
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      if (!connected) throw lastErr || new Error('Gemini Live unavailable');
+      if (stopped) {
+        try {
+          connected.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      activeModelIndex = modelIndex;
+      geminiSession = connected;
+    };
+
+    try {
+      await connectGemini();
+      if (stopped) return;
+
+      // Kick off the conversation
+      const firstName = session.candidateName.split(/\s+/)[0] || session.candidateName;
+      const recentContext = session.transcript
+        .slice(-6)
+        .map((t) => `${t.speaker === 'interviewer' ? 'You' : 'Candidate'}: ${t.text}`)
+        .join('\n');
+      openingNote = isReconnect
+        ? `The candidate's connection dropped for a moment and they are back. ${
+            currentQuestionNumber > 0
+              ? `You were on question ${currentQuestionNumber}. In one short sentence say you're back, then briefly repeat question ${currentQuestionNumber} and let them continue their answer.`
+              : 'In one short sentence say you are back, then continue the introduction from where you were.'
+          }${recentContext ? `\nLast exchanges before the drop:\n${recentContext}` : ''}`
+        : (session.resumedCount || 0) > 0 && session.currentPhase === 'questioning'
+        ? `${firstName} has reconnected to the interview. In one sentence welcome them back, then ask question ${session.currentQuestionIndex + 1} with its exact wording, and listen.`
+        : LIVE_NOTES.kickoff(firstName, session.isFirstTimeCandidate === false);
+      await sendSystemNote(openingNote, true);
+    } catch (err: any) {
+      console.warn('Failed to initialize Gemini Live session, switching to fallback:', err?.message);
+      sendToClient({ type: 'fallback_required', reason: err?.message || 'Live connection unavailable' });
+      shutdown();
+      return;
+    }
+
+    // 10-minute limit, enforced by the server (one-minute warning, then a short closing).
+    const left = Math.max(30, secondsLeft());
+    if (left > 75) {
+      timers.push(
+        setTimeout(() => {
+          void sendSystemNote(
+            'About one minute of interview time is left. Let the candidate finish the current answer, do not start another question, then go straight to the closing and call end_call.',
+            false
+          );
+        }, (left - 60) * 1000)
+      );
+    }
+    timers.push(
+      setTimeout(() => {
+        requestGracefulEnd(
+          'time_up',
+          `The 10 minutes of the interview are over. Politely tell ${session.candidateName} that the interview time is up, thank them, say their results will be sent to their email, and say goodbye, in at most two short sentences. Then call end_call with reason "time_up". Do not ask anything else.`,
+          20000
+        );
+      }, left * 1000)
+    );
+
+    clientWs.on('message', async (raw) => {
+      if (stopped || callEnded) return;
+      let msg: any;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+      try {
+        if (msg?.realtimeInput) {
+          // Once the call is closing, the candidate's microphone is no longer passed on.
+          if (!geminiSession || endingReason) return;
+          const audio = msg.realtimeInput.audio || msg.realtimeInput.mediaChunks?.[0];
+          if (!audio?.data || typeof audio.data !== 'string') return;
+          await geminiSession.sendRealtimeInput({
+            audio: { data: audio.data, mimeType: 'audio/pcm;rate=16000' },
+          });
+        } else if (msg?.type === 'timer_expired') {
+          if (endingReason) return;
+          const expired = Number(msg.currentQuestionIndex) + 1;
+          // Ignore stale or repeated timer messages.
+          if (expired !== currentQuestionNumber || expired === lastExpiredQuestion) return;
+          lastExpiredQuestion = expired;
+          if (expired < totalQuestions) {
+            await sendSystemNote(LIVE_NOTES.questionTimeUp(expired + 1), true);
+          } else {
+            await sendSystemNote(LIVE_NOTES.lastQuestionTimeUp(secondsLeft() > 75), true);
+          }
+        } else if (msg?.type === 'request_rephrase') {
+          if (endingReason || currentQuestionNumber < 1) return;
+          await sendSystemNote(
+            `The candidate pressed the "rephrase" button. Say Question ${currentQuestionNumber} again in simpler words with exactly the same meaning. Do not move to another question.`,
+            true
+          );
+        }
+        // Any other frame (including arbitrary text prompts) is ignored on purpose.
+      } catch (e) {
+        console.warn('Error forwarding client WS frame:', e);
+      }
     });
+
+    clientWs.on('close', () => shutdown());
   });
 
   // Bind port 3000 immediately so container health checks succeed without delay
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Global Hire 360 Server running on http://localhost:${PORT}`);
     // Automatically provision & seed Supabase tables on startup when credentials are configured
+    const resendKey = (process.env.RESEND_API_KEY || '').trim();
+    if (!resendKey || resendKey === 're_your_resend_api_key') {
+      console.warn('[Resend] RESEND_API_KEY is not set — result emails will NOT be sent.');
+    } else {
+      console.log(
+        `[Resend] Email delivery enabled (from: ${
+          process.env.RESEND_FROM_EMAIL || process.env.RESEND_SENDER_EMAIL || 'onboarding@resend.dev'
+        }).`
+      );
+    }
     provisionSupabaseTablesViaManagementApi()
-      .then(() => seedCustomerServiceQuestionsToSupabase())
+      .then(() => checkSupabaseTables())
+      .then((ready) => (ready ? seedCustomerServiceQuestionsToSupabase() : undefined))
       .catch(() => {});
   });
 
@@ -4982,11 +8438,11 @@ STRICT INTERVIEW FLOW & RULES (MUST FOLLOW EXACTLY):
         const vite = await createViteServer({
           server: {
             middlewareMode: true,
-            hmr: false,
-            watch: null,
+            ws: { server: httpServer },
           },
           appType: 'spa',
         });
+
         app.use(vite.middlewares);
         viteLoaded = true;
         break;

@@ -1,10 +1,17 @@
-import React, { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  createContext,
+  useContext,
+} from "react";
 
 type NavigateOptions = { replace?: boolean };
 type NavigateFn = (to: string, options?: NavigateOptions) => void;
 
 const RouterContext = createContext<{ path: string; navigate: NavigateFn }>({
-  path: '/',
+  path: "/",
   navigate: () => {},
 });
 
@@ -12,26 +19,34 @@ function useNavigate(): NavigateFn {
   return useContext(RouterContext).navigate;
 }
 
-const BrowserRouter: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [path, setPath] = useState<string>(() => window.location.pathname || '/');
+const BrowserRouter: React.FC<{ children: React.ReactNode }> = ({
+  children,
+}) => {
+  const [path, setPath] = useState<string>(
+    () => window.location.pathname || "/",
+  );
 
   useEffect(() => {
-    const onPopState = () => setPath(window.location.pathname || '/');
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
+    const onPopState = () => setPath(window.location.pathname || "/");
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
   const navigate = useCallback((to: string, options?: NavigateOptions) => {
     if (options?.replace) {
-      window.history.replaceState({}, '', to);
+      window.history.replaceState({}, "", to);
     } else {
-      window.history.pushState({}, '', to);
+      window.history.pushState({}, "", to);
     }
     setPath(to);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }, []);
 
-  return <RouterContext.Provider value={{ path, navigate }}>{children}</RouterContext.Provider>;
+  return (
+    <RouterContext.Provider value={{ path, navigate }}>
+      {children}
+    </RouterContext.Provider>
+  );
 };
 
 const Routes: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -42,13 +57,16 @@ const Routes: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   }>[];
   const exactMatch = childArray.find((c) => c.props.path === path);
   if (exactMatch) return <>{exactMatch.props.element}</>;
-  const wildcard = childArray.find((c) => c.props.path === '*');
+  const wildcard = childArray.find((c) => c.props.path === "*");
   return <>{wildcard ? wildcard.props.element : null}</>;
 };
 
 const Route: React.FC<{ path: string; element: React.ReactNode }> = () => null;
 
-const Navigate: React.FC<{ to: string; replace?: boolean }> = ({ to, replace }) => {
+const Navigate: React.FC<{ to: string; replace?: boolean }> = ({
+  to,
+  replace,
+}) => {
   const navigate = useNavigate();
   useEffect(() => {
     navigate(to, { replace });
@@ -79,20 +97,167 @@ import {
   Download,
   ArrowRight,
   RotateCcw,
-} from 'lucide-react';
-import { LunaVoiceOrb } from './components/LunaVoiceOrb';
+} from "lucide-react";
 
-const LOGO_URL = '/assets/aistudio/cropped-cropped-Global-Hire-360-Logo-2_18222f57.png';
-const VOICE_SAMPLE_URL = '/assets/aistudio/audio-sample_63bf5371.wav';
+const LOGO_URL =
+  "/assets/aistudio/cropped-cropped-Global-Hire-360-Logo-2_18222f57.png";
+
+export const SINGLE_INTERVIEWER_VOICE = {
+  id: "Aoede" as const,
+  label: "Sarah — Operations & Talent Manager (Global Hire 360)",
+  shortLabel: "Sarah (Hiring Manager)",
+  pitch: 1.0,
+  rate: 0.99,
+  voiceMatchRegex:
+    /google us english|ava|aria|jenny|samantha|allison|sara|sonia|natural/i,
+};
+
+/**
+ * Dedicated helper to resolve the candidate's Google account profile picture when their camera is off.
+ * Uses verified Google/Gravatar/webcam avatar URLs or the Google Account monogram SVG endpoint.
+ */
+export function findCandidateProfilePicture(
+  email: string,
+  fullName: string,
+  sessionAvatarUrl?: string,
+): string {
+  const cleanEmail = (email || "").trim().toLowerCase();
+  const displayName = (fullName || "").trim() || cleanEmail || "Candidate";
+
+  if (cleanEmail) {
+    try {
+      const localCached = window.localStorage.getItem(
+        `gh360_google_pic_${cleanEmail}`,
+      );
+      if (localCached && !localCached.includes("unavatar.io")) {
+        return localCached;
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  if (
+    sessionAvatarUrl &&
+    sessionAvatarUrl.trim().length > 0 &&
+    !sessionAvatarUrl.includes("unavatar.io")
+  ) {
+    return sessionAvatarUrl.trim();
+  }
+
+  return `/api/google-avatar.svg?email=${encodeURIComponent(
+    cleanEmail,
+  )}&name=${encodeURIComponent(displayName)}`;
+}
+
+// ============================================================================
+// SESSION ACCESS TOKEN (required by the backend for every session-scoped call)
+// Kept in memory, and mirrored in localStorage so an unfinished interview can be
+// continued directly after a reload or when the candidate comes back.
+// ============================================================================
+const ACTIVE_SESSION_STORAGE_KEY = "gh360_active_session";
+let currentSessionToken = "";
+
+function setActiveSessionAuth(sessionId: string, token: string) {
+  currentSessionToken = token;
+  try {
+    window.localStorage.setItem(
+      ACTIVE_SESSION_STORAGE_KEY,
+      JSON.stringify({ sessionId, token }),
+    );
+  } catch {
+    // storage unavailable (private mode) — in-memory token still works
+  }
+}
+
+function loadActiveSessionAuth(): { sessionId: string; token: string } | null {
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed?.sessionId && parsed?.token) return parsed;
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function clearActiveSessionAuth() {
+  try {
+    window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function sessionHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "x-session-token": currentSessionToken,
+  };
+}
+
+/**
+ * Deduplicates overlapping words between final/interim browser SpeechRecognition segments
+ * so candidate speech is transcribed cleanly and accurately.
+ */
+function mergeSpeechChunksAccurately(
+  existingText: string,
+  newChunk: string,
+): string {
+  const prev = existingText.replace(/\s+/g, " ").trim();
+  const next = newChunk.replace(/\s+/g, " ").trim();
+  if (!prev) return next;
+  if (!next) return prev;
+
+  const prevLower = prev.toLowerCase();
+  const nextLower = next.toLowerCase();
+
+  // If the new chunk already contains the entire previous text (Chrome mobile/desktop quirk)
+  if (nextLower.startsWith(prevLower)) {
+    return next;
+  }
+  // If the previous text already ends with the new chunk
+  if (prevLower.endsWith(nextLower)) {
+    return prev;
+  }
+
+  // Check word-level suffix/prefix overlap (up to 6 words)
+  const prevWords = prev.split(" ");
+  const nextWords = next.split(" ");
+  const maxOverlap = Math.min(6, prevWords.length, nextWords.length);
+
+  for (let k = maxOverlap; k >= 1; k--) {
+    const prevSuffix = prevWords
+      .slice(prevWords.length - k)
+      .join(" ")
+      .toLowerCase();
+    const nextPrefix = nextWords.slice(0, k).join(" ").toLowerCase();
+    if (prevSuffix === nextPrefix) {
+      return [...prevWords, ...nextWords.slice(k)].join(" ");
+    }
+  }
+
+  return `${prev} ${next}`;
+}
 
 export interface TranscriptEntry {
   id: string;
-  speaker: 'interviewer' | 'candidate';
+  speaker: "interviewer" | "candidate";
   speakerName: string;
   text: string;
   timestamp: string;
   questionIndex?: number;
-  eventTag?: 'greeting' | 'question' | 'rephrase' | 'timeout' | 'termination' | 'closing' | 'answer';
+  eventTag?:
+    | "greeting"
+    | "question"
+    | "rephrase"
+    | "timeout"
+    | "termination"
+    | "closing"
+    | "answer"
+    | "misconduct_warning"
+    | "misconduct_termination";
 }
 
 export interface QuestionEvaluation {
@@ -108,6 +273,9 @@ export interface QuestionEvaluation {
   feedback: string;
   strengths: string[];
   improvementTip: string;
+  alignmentPercent?: number;
+  matchedPoints?: string[];
+  missedPoints?: string[];
 }
 
 export interface InterviewSessionRecord {
@@ -118,6 +286,7 @@ export interface InterviewSessionRecord {
   maxDurationSeconds?: number;
   candidateName: string;
   candidateEmail: string;
+  candidateGoogleAvatarUrl?: string;
   resumeFileName: string;
   detectedRole: string;
   candidateExperienceSummary: string;
@@ -130,17 +299,35 @@ export interface InterviewSessionRecord {
     expectedFocus: string;
     proposedAnswer?: string;
   }[];
-  status: 'in_progress' | 'completed_success' | 'completed_unsuccessful' | 'terminated_attempts';
-  currentPhase: 'greeting_how_are_you' | 'questioning' | 'finished';
+  status:
+    | "in_progress"
+    | "completed_success"
+    | "completed_unsuccessful"
+    | "terminated_attempts"
+    | "terminated_misconduct"
+    | "terminated_rules_violation"
+    | "abandoned";
+  isFirstTimeCandidate?: boolean;
+  currentPhase:
+    | "greeting_how_are_you"
+    | "process_walkthrough"
+    | "questioning"
+    | "candidate_questions"
+    | "finished";
   currentQuestionIndex: number;
   currentQuestionAttempts: number;
   questionEvaluations: QuestionEvaluation[];
   transcript: TranscriptEntry[];
+  totalScoreOutOf20?: number;
   totalScoreOutOf25: number;
   maxScore: number;
   percentageScore: number;
   successful: boolean;
   interviewerFinalImpression: string;
+  misconductCount?: number;
+  misconductPenaltyPoints?: number;
+  misconductNotes?: string[];
+  suspendedUntil?: string | null;
   emailSent: boolean;
   emailDeliveryNote?: string;
   supabaseSaved?: boolean;
@@ -164,22 +351,27 @@ interface ResumeExaminationResult {
 // PAGE 1: HOMEPAGE (/) — Short Welcome Message, Instructions & Candidate Form
 // ============================================================================
 interface HomePageProps {
-  onSessionStarted: (session: InterviewSessionRecord, initialMessage: string, liveWsAvailable: boolean) => void;
+  onSessionStarted: (
+    session: InterviewSessionRecord,
+    initialMessage: string,
+    liveWsAvailable: boolean,
+  ) => void;
 }
 
 const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
   const navigate = useNavigate();
 
-  const [candidateName, setCandidateName] = useState('');
-  const [candidateEmail, setCandidateEmail] = useState('');
+  const [candidateName, setCandidateName] = useState("");
+  const [candidateEmail, setCandidateEmail] = useState("");
   const [resumeFile, setResumeFile] = useState<File | null>(null);
-  const [resumeBase64, setResumeBase64] = useState('');
+  const [resumeBase64, setResumeBase64] = useState("");
   const [agreedToInstructions, setAgreedToInstructions] = useState(false);
 
   // Resume Examination State
   const [isExaminingResume, setIsExaminingResume] = useState(false);
-  const [examinedResume, setExaminedResume] = useState<ResumeExaminationResult | null>(null);
-  const [confirmedJobPosition, setConfirmedJobPosition] = useState('');
+  const [examinedResume, setExaminedResume] =
+    useState<ResumeExaminationResult | null>(null);
+  const [confirmedJobPosition, setConfirmedJobPosition] = useState("");
   const [rejectedDocumentInfo, setRejectedDocumentInfo] = useState<{
     fileName: string;
     message: string;
@@ -187,24 +379,151 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
 
   const [isStarting, setIsStarting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const [isPlayingSample, setIsPlayingSample] = useState(false);
-  const sampleAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [recognizedCandidate, setRecognizedCandidate] = useState<{
+    firstName: string;
+    sessionsCount: number;
+    completedSessionsCount: number;
+    savedJobPosition: string;
+    hasSavedProfile: boolean;
+  } | null>(null);
+  const [nameMatchesExisting, setNameMatchesExisting] = useState(false);
+  const [unfinishedSession, setUnfinishedSession] = useState<{
+    sessionId: string;
+    token: string;
+    role: string;
+    candidateName: string;
+  } | null>(null);
+  const [isResuming, setIsResuming] = useState(false);
+
+  // Continue directly: if this browser holds an unfinished interview, offer to resume it.
+  useEffect(() => {
+    const saved = loadActiveSessionAuth();
+    if (!saved) return;
+    (async () => {
+      try {
+        const res = await fetch(
+          `/api/session/${encodeURIComponent(saved.sessionId)}`,
+          { headers: { "x-session-token": saved.token } },
+        );
+        if (!res.ok) {
+          clearActiveSessionAuth();
+          return;
+        }
+        const data = await res.json();
+        const s = data.session as InterviewSessionRecord | undefined;
+        const maxMs = (s?.maxDurationSeconds || 600) * 1000;
+        const stillOpen =
+          s &&
+          s.status === "in_progress" &&
+          s.currentPhase !== "finished" &&
+          new Date(s.createdAt).getTime() + maxMs > Date.now();
+        if (stillOpen) {
+          setUnfinishedSession({
+            sessionId: saved.sessionId,
+            token: saved.token,
+            role: s!.detectedRole,
+            candidateName: s!.candidateName,
+          });
+        } else {
+          clearActiveSessionAuth();
+        }
+      } catch {
+        // non-blocking
+      }
+    })();
+  }, []);
+
+  const handleResumeUnfinished = async () => {
+    if (!unfinishedSession) return;
+    setIsResuming(true);
+    setFormError(null);
+    try {
+      const res = await fetch("/api/resume-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-session-token": unfinishedSession.token,
+        },
+        body: JSON.stringify({ sessionId: unfinishedSession.sessionId }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.resumed || !data.session) {
+        clearActiveSessionAuth();
+        setUnfinishedSession(null);
+        setFormError(
+          "That interview can no longer be continued (it finished or its 10 minutes ran out). Please start a new one.",
+        );
+        return;
+      }
+      setActiveSessionAuth(data.session.id, data.accessToken || unfinishedSession.token);
+      onSessionStarted(
+        data.session,
+        data.interviewerMessage,
+        Boolean(data.liveWsAvailable),
+      );
+      navigate("/interview");
+    } catch {
+      setFormError("Could not reconnect to your interview. Please try again.");
+    } finally {
+      setIsResuming(false);
+    }
+  };
+
+  // Recognize returning candidates by email (and flag name-only matches) to prevent duplicates
+  useEffect(() => {
+    const trimmed = candidateEmail.trim().toLowerCase();
+    const validEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed);
+    const nameQuery = candidateName.trim();
+    if (!validEmail && nameQuery.length < 3) {
+      setRecognizedCandidate(null);
+      setNameMatchesExisting(false);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const params = new URLSearchParams();
+        if (validEmail) params.set("email", trimmed);
+        if (nameQuery) params.set("name", nameQuery);
+        const res = await fetch(`/api/candidate-history?${params.toString()}`);
+        const data = await res.json();
+        if (data.exists) {
+          setRecognizedCandidate({
+            firstName: data.firstName,
+            sessionsCount: data.sessionsCount || 1,
+            completedSessionsCount: data.completedSessionsCount || 0,
+            savedJobPosition: data.savedJobPosition || "",
+            hasSavedProfile: Boolean(data.hasSavedProfile),
+          });
+          setNameMatchesExisting(false);
+          if (data.savedJobPosition && !confirmedJobPosition.trim()) {
+            setConfirmedJobPosition(data.savedJobPosition);
+          }
+        } else {
+          setRecognizedCandidate(null);
+          setNameMatchesExisting(Boolean(data.nameMatchesExistingCandidate));
+        }
+      } catch {
+        // non-blocking
+      }
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [candidateEmail, candidateName]);
 
   const handleResumeUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     const ext = file.name.toLowerCase();
-    if (!ext.endsWith('.pdf') && !ext.endsWith('.docx')) {
+    if (!ext.endsWith(".pdf") && !ext.endsWith(".docx")) {
       const msg =
-        'Document Rejected: Invalid file format. Please upload a valid Resume or CV in .PDF or .DOCX format.';
+        "Document Rejected: Invalid file format. Please upload a valid Resume or CV in .PDF or .DOCX format.";
       setFormError(msg);
       setRejectedDocumentInfo({ fileName: file.name, message: msg });
       setResumeFile(null);
-      setResumeBase64('');
+      setResumeBase64("");
       setExaminedResume(null);
-      setConfirmedJobPosition('');
-      e.target.value = '';
+      setConfirmedJobPosition("");
+      e.target.value = "";
       return;
     }
 
@@ -212,7 +531,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
     setRejectedDocumentInfo(null);
     setResumeFile(file);
     setExaminedResume(null);
-    setConfirmedJobPosition('');
+    setConfirmedJobPosition("");
     setIsExaminingResume(true);
 
     const reader = new FileReader();
@@ -221,9 +540,9 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
       setResumeBase64(base64Data);
 
       try {
-        const res = await fetch('/api/examine-resume', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+        const res = await fetch("/api/examine-resume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             resumeFileName: file.name,
             resumeMimeType: file.type,
@@ -238,41 +557,28 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
         } else {
           const rejectionMessage =
             data.error ||
-            'Document Rejected: This document does not relate to a Resume, CV, or professional job search profile. Please upload a valid Resume or CV.';
+            "Document Rejected: This document does not relate to a Resume, CV, or professional job search profile. Please upload a valid Resume or CV.";
           setRejectedDocumentInfo({
             fileName: file.name,
             message: rejectionMessage,
           });
           setFormError(rejectionMessage);
           setResumeFile(null);
-          setResumeBase64('');
+          setResumeBase64("");
           setExaminedResume(null);
-          setConfirmedJobPosition('');
+          setConfirmedJobPosition("");
         }
       } catch (err) {
-        console.warn('Resume examination preview warning:', err);
-        setFormError('Failed to examine the uploaded document. Please try again.');
+        console.warn("Resume examination preview warning:", err);
+        setFormError(
+          "Failed to examine the uploaded document. Please try again.",
+        );
       } finally {
         setIsExaminingResume(false);
       }
     };
     reader.readAsDataURL(file);
-    e.target.value = '';
-  };
-
-  const toggleSampleAudio = () => {
-    if (!sampleAudioRef.current) {
-      sampleAudioRef.current = new Audio(VOICE_SAMPLE_URL);
-      sampleAudioRef.current.onended = () => setIsPlayingSample(false);
-    }
-    if (isPlayingSample) {
-      sampleAudioRef.current.pause();
-      sampleAudioRef.current.currentTime = 0;
-      setIsPlayingSample(false);
-    } else {
-      sampleAudioRef.current.play().catch(() => setIsPlayingSample(false));
-      setIsPlayingSample(true);
-    }
+    e.target.value = "";
   };
 
   const handleStartInterview = async (e: React.FormEvent) => {
@@ -280,52 +586,77 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
     setFormError(null);
 
     if (!candidateName.trim()) {
-      setFormError('Please enter your full name.');
+      setFormError("Please enter your full name.");
       return;
     }
-    if (!candidateEmail.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(candidateEmail.trim())) {
-      setFormError('Please enter a valid email address to receive your assessment results.');
+    if (
+      !candidateEmail.trim() ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(candidateEmail.trim())
+    ) {
+      setFormError(
+        "Please enter a valid email address to receive your assessment results.",
+      );
       return;
     }
     if (rejectedDocumentInfo) {
       setFormError(rejectedDocumentInfo.message);
       return;
     }
-    if (!resumeFile || !resumeBase64 || !examinedResume) {
-      setFormError('Please upload a valid Resume or CV (.pdf or .docx) before joining the interview room.');
+    const canUseSavedProfile = Boolean(recognizedCandidate?.hasSavedProfile);
+    const hasNewResume = Boolean(resumeFile && resumeBase64 && examinedResume);
+    if (!hasNewResume && !canUseSavedProfile) {
+      setFormError(
+        "Please upload a valid Resume or CV (.pdf or .docx) before joining the interview room.",
+      );
       return;
     }
     if (!agreedToInstructions) {
-      setFormError('Please check the box confirming you have read and agreed to follow the interview instructions.');
+      setFormError(
+        "Please check the box confirming you have read and agreed to follow the interview instructions.",
+      );
       return;
     }
 
     setIsStarting(true);
     try {
-      const res = await fetch('/api/start-interview-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const res = await fetch("/api/start-interview-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           candidateName: candidateName.trim(),
           candidateEmail: candidateEmail.trim(),
-          resumeFileName: resumeFile.name,
-          resumeMimeType: resumeFile.type,
-          resumeBase64,
-          confirmedJobPosition: confirmedJobPosition.trim() || examinedResume?.detectedRole,
+          resumeFileName: hasNewResume ? resumeFile!.name : undefined,
+          resumeMimeType: hasNewResume ? resumeFile!.type : undefined,
+          resumeBase64: hasNewResume ? resumeBase64 : undefined,
+          confirmedJobPosition:
+            confirmedJobPosition.trim() ||
+            examinedResume?.detectedRole ||
+            recognizedCandidate?.savedJobPosition,
           agreedToInstructions: Boolean(agreedToInstructions),
-          preExaminedData: examinedResume,
+          preExaminedData: hasNewResume ? examinedResume : undefined,
+          // Lets the server continue this browser's unfinished session instead of creating a new one
+          existingSessionToken: loadActiveSessionAuth()?.token,
         }),
       });
 
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.error || 'Could not start interview session.');
+        throw new Error(data.error || "Could not start interview session.");
+      }
+      if (data.session?.id && data.accessToken) {
+        setActiveSessionAuth(data.session.id, data.accessToken);
       }
 
-      onSessionStarted(data.session, data.interviewerMessage, Boolean(data.liveWsAvailable));
-      navigate('/interview');
+      onSessionStarted(
+        data.session,
+        data.interviewerMessage,
+        Boolean(data.liveWsAvailable),
+      );
+      navigate("/interview");
     } catch (err: any) {
-      setFormError(err?.message || 'Unable to start interview session. Please try again.');
+      setFormError(
+        err?.message || "Unable to start interview session. Please try again.",
+      );
     } finally {
       setIsStarting(false);
     }
@@ -335,7 +666,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
     <div className="min-h-screen bg-[#F8FAFC] text-slate-900 flex flex-col">
       {/* Clean Brand Header */}
       <header className="bg-white border-b border-slate-200">
-        <div className="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between">
+        <div className="max-w-3xl mx-auto px-6 py-4 flex items-center justify-center">
           <div className="flex items-center gap-3">
             <img
               src={LOGO_URL}
@@ -352,15 +683,6 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
               </span>
             </div>
           </div>
-
-          <button
-            type="button"
-            onClick={toggleSampleAudio}
-            className="inline-flex items-center gap-2 text-xs font-semibold px-3.5 py-2 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-[#041E41] transition-colors cursor-pointer"
-          >
-            <Volume2 className="w-4 h-4 text-[#339A05]" />
-            {isPlayingSample ? 'Stop Voice Sample' : 'Hear Interviewer Voice'}
-          </button>
         </div>
       </header>
 
@@ -372,9 +694,10 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
             Welcome, Candidate!
           </h1>
           <p className="text-sm text-slate-200 leading-relaxed">
-            Welcome to the official <strong>Global Hire 360</strong> Live Voice Interview Platform.
-            You are about to enter a live interactive voice interview where our AI Interviewer will
-            examine your resume, greet you, and assess your readiness for your target role.
+            Welcome to the official <strong>Global Hire 360</strong> Live Voice
+            Interview Platform. You are about to enter a live interactive voice
+            interview where our AI Interviewer will examine your resume, greet
+            you, and assess your readiness for your target role.
           </p>
         </section>
 
@@ -390,8 +713,12 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 1
               </span>
               <span>
-                <strong>Camera &amp; Microphone On:</strong> Ensure you are in a quiet space with your
-                camera and microphone enabled for a live voice conversation with the interviewer.
+                <strong>Camera &amp; Microphone On, One-to-One:</strong> Join
+                alone from a quiet space with your camera and microphone
+                enabled. Headphones give the clearest conversation. Speak when
+                Sarah has finished her sentence — your microphone is paused
+                while she talks. Only you may answer: if someone else answers
+                or coaches you, the interviewer can end the call.
               </span>
             </li>
             <li className="flex items-start gap-2.5">
@@ -399,10 +726,13 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 2
               </span>
               <span>
-                <strong>10-Minute Max Session &amp; 90-Second Question Timer:</strong> Each interview
-                consists of <strong>5 shuffled questions</strong> within a{' '}
-                <strong>10-minute maximum session</strong>. You have <strong>90 seconds</strong> per
-                question before the interviewer politely advances to the next question.
+                <strong>
+                  10-Minute Max Session &amp; 90-Second Question Timer:
+                </strong>{" "}
+                Each interview consists of <strong>4 questions</strong> (5 for returning candidates) within a{" "}
+                <strong>10-minute maximum session</strong>. You have{" "}
+                <strong>90 seconds</strong> per question before the interviewer
+                politely advances to the next question.
               </span>
             </li>
             <li className="flex items-start gap-2.5">
@@ -410,10 +740,11 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 3
               </span>
               <span>
-                <strong>Rephrasing &amp; 2-Attempt Rule:</strong> You may ask the interviewer to
-                rephrase a question if needed. If your answer is off-topic, the interviewer will
-                motivate you and rephrase the question once. After <strong>2 unsuccessful attempts</strong>,
-                the interviewer will encourage you to practice further and end the call.
+                <strong>Stress-Free Conversational Coaching:</strong> Speak
+                comfortably with Sarah, your AI Hiring Manager. You can ask her
+                anything during the call, or ask her to repeat or rephrase a
+                question. If you feel stuck, she will rephrase it in simpler
+                words before moving on to the next question.
               </span>
             </li>
             <li className="flex items-start gap-2.5">
@@ -421,10 +752,30 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 4
               </span>
               <span>
-                <strong>Marking Guide Scoring (0 to 5 Scale) &amp; Email Report:</strong> Each of the 5
-                questions is graded from <strong>0 to 5 points</strong> (Total: 25) based on how well
-                your response aligns in meaning with our marking guide. Results and transcript are sent
-                to your email.
+                <strong>
+                  Professional Conduct &amp; 24-Hour Suspension Policy:
+                </strong>{" "}
+                Enjoy a natural, warm conversation with your interviewer, but
+                keep all dialogue strictly professional. Inappropriate or
+                profane language results in a{" "}
+                <strong>3-point score deduction</strong>, or immediate call
+                termination and a <strong>24-hour suspension</strong> from
+                attempting another interview.
+              </span>
+            </li>
+            <li className="flex items-start gap-2.5">
+              <span className="w-5 h-5 rounded-full bg-[#339A05]/15 text-[#339A05] font-bold text-xs flex items-center justify-center shrink-0 mt-0.5">
+                5
+              </span>
+              <span>
+                <strong>
+                  Marking Guide Scoring (0 to 5 Scale) &amp; Email Report:
+                </strong>{" "}
+                Each question is graded from <strong>0 to 5 points</strong>{" "}
+                on how closely your answer follows the direction of the
+                suggested answer, and your total is always marked{" "}
+                <strong>out of 20</strong> (passing benchmark: 13/20 = 65%). Results and transcript are
+                sent to your email.
               </span>
             </li>
           </ul>
@@ -435,9 +786,56 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
           onSubmit={handleStartInterview}
           className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs space-y-5"
         >
-          <h2 className="text-base font-bold text-[#041E41] border-b border-slate-100 pb-3">
-            Candidate Details &amp; Resume Check-In
+          <h2 className="text-base font-bold text-[#041E41] border-b border-slate-100 pb-3 flex items-center justify-between">
+            <span>Candidate Details &amp; Resume Check-In</span>
+            {recognizedCandidate && (
+              <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-emerald-100 text-[#15803D] inline-flex items-center gap-1">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                Returning Candidate Recognized
+              </span>
+            )}
           </h2>
+
+          {unfinishedSession && (
+            <div className="p-3.5 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <span>
+                You have an unfinished <strong>{unfinishedSession.role}</strong>{" "}
+                interview. Continue where you left off?
+              </span>
+              <button
+                type="button"
+                onClick={handleResumeUnfinished}
+                disabled={isResuming}
+                className="shrink-0 px-4 py-2 rounded-lg bg-[#041E41] hover:bg-[#0a2d5e] disabled:opacity-60 text-white font-bold cursor-pointer"
+              >
+                {isResuming ? "Reconnecting..." : "Continue my interview"}
+              </button>
+            </div>
+          )}
+
+          {recognizedCandidate && (
+            <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-[#339A05] shrink-0" />
+                <span>
+                  Welcome back, <strong>{recognizedCandidate.firstName}</strong>!
+                  This session will be added to your existing candidate profile
+                  ({recognizedCandidate.sessionsCount} session
+                  {recognizedCandidate.sessionsCount === 1 ? "" : "s"} on record).
+                  {recognizedCandidate.hasSavedProfile &&
+                    ` Your saved role is ${recognizedCandidate.savedJobPosition}, so uploading your resume again is optional.`}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {!recognizedCandidate && nameMatchesExisting && (
+            <div className="p-3 rounded-lg bg-sky-50 border border-sky-200 text-sky-900 text-xs">
+              We already have a candidate profile with this name. If it is
+              yours, use the same email address you used before so your
+              sessions continue in one profile.
+            </div>
+          )}
 
           {formError && (
             <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-red-700 text-xs font-medium flex items-center gap-2.5">
@@ -476,7 +874,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 required
                 value={candidateEmail}
                 onChange={(e) => setCandidateEmail(e.target.value)}
-                placeholder="you@example.com (Your scorecard & transcript will be sent here)"
+                placeholder="you@example.com"
                 className="w-full pl-10 pr-4 py-2.5 rounded-lg border border-slate-300 text-sm focus:outline-none focus:border-[#041E41] focus:ring-2 focus:ring-[#041E41]/10"
               />
             </div>
@@ -485,33 +883,41 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
           {/* Upload Resume (.pdf or .docx) */}
           <div>
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1.5">
-              Upload Resume (.PDF or .DOCX) <span className="text-red-500">*</span>
+              Upload Resume (.PDF or .DOCX){" "}
+              {recognizedCandidate?.hasSavedProfile ? (
+                <span className="text-slate-500 normal-case font-medium">
+                  (optional — saved profile on file)
+                </span>
+              ) : (
+                <span className="text-red-500">*</span>
+              )}
             </label>
             <label
               className={`flex flex-col items-center justify-center border-2 border-dashed rounded-xl p-5 cursor-pointer transition-colors ${
                 rejectedDocumentInfo
-                  ? 'border-red-300 bg-red-50/40 hover:border-red-400'
-                  : 'border-slate-300 hover:border-[#339A05] bg-slate-50/70 hover:bg-[#339A05]/5'
+                  ? "border-red-300 bg-red-50/40 hover:border-red-400"
+                  : "border-slate-300 hover:border-[#339A05] bg-slate-50/70 hover:bg-[#339A05]/5"
               }`}
             >
               <Upload
                 className={`w-6 h-6 mb-1.5 ${
-                  rejectedDocumentInfo ? 'text-red-600' : 'text-[#041E41]'
+                  rejectedDocumentInfo ? "text-red-600" : "text-[#041E41]"
                 }`}
               />
               <span
                 className={`text-sm font-semibold ${
-                  rejectedDocumentInfo ? 'text-red-700' : 'text-[#041E41]'
+                  rejectedDocumentInfo ? "text-red-700" : "text-[#041E41]"
                 }`}
               >
                 {resumeFile
                   ? resumeFile.name
                   : rejectedDocumentInfo
-                  ? `${rejectedDocumentInfo.fileName} (Rejected — Click to upload a valid Resume/CV)`
-                  : 'Click to upload your resume (.pdf or .docx)'}
+                    ? `${rejectedDocumentInfo.fileName} (Rejected — Click to upload a valid Resume/CV)`
+                    : "Click to upload your resume (.pdf or .docx)"}
               </span>
               <span className="text-xs text-slate-500 mt-0.5">
-                Your resume is automatically examined to extract the job position you are applying for
+                Your resume is automatically examined to extract the job
+                position you are applying for
               </span>
               <input
                 type="file"
@@ -529,18 +935,22 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
               </div>
             )}
 
-            {/* Document Rejection Card (shown when uploaded document is not a Resume/CV) */}
-            {!isExaminingResume && rejectedDocumentInfo && (
-              <div className="mt-3 p-4 rounded-lg bg-red-50 border border-red-200 text-red-800 space-y-1.5">
-                <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-red-700">
-                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-600" />
-                  <span>Invalid Document Rejected</span>
+            {!isExaminingResume &&
+              !examinedResume &&
+              recognizedCandidate?.hasSavedProfile && (
+                <div className="mt-3 p-3.5 rounded-lg bg-[#339A05]/10 border border-[#339A05]/30">
+                  <label className="block text-xs font-bold uppercase tracking-wider text-[#041E41] mb-1">
+                    Job Position (from your saved profile)
+                  </label>
+                  <input
+                    type="text"
+                    value={confirmedJobPosition}
+                    maxLength={120}
+                    onChange={(e) => setConfirmedJobPosition(e.target.value)}
+                    className="w-full px-3 py-2 rounded-md border border-[#339A05]/40 bg-white text-sm font-bold text-[#041E41] focus:outline-none focus:border-[#041E41]"
+                  />
                 </div>
-                <p className="text-xs text-red-700 leading-relaxed font-medium">
-                  {rejectedDocumentInfo.message}
-                </p>
-              </div>
-            )}
+              )}
 
             {!isExaminingResume && examinedResume && !rejectedDocumentInfo && (
               <div className="mt-3 p-3.5 rounded-lg bg-[#339A05]/10 border border-[#339A05]/30 space-y-3">
@@ -562,7 +972,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                       Skills
                     </label>
                     <div className="w-full px-3 py-2 rounded-md border border-[#339A05]/40 bg-white text-xs text-slate-700 leading-relaxed">
-                      {examinedResume.keySkills.join(', ')}
+                      {examinedResume.keySkills.join(", ")}
                     </div>
                   </div>
                 )}
@@ -579,9 +989,9 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
               className="mt-0.5 w-4 h-4 accent-[#339A05] rounded cursor-pointer"
             />
             <span className="text-xs text-slate-700 leading-relaxed font-medium">
-              I confirm that I have read and followed all the instructions above, my camera and
-              microphone are ready, and I agree to join the live interview room.{' '}
-              <span className="text-red-500">*</span>
+              I confirm that I have read and followed all the instructions
+              above, my camera and microphone are ready, and I agree to join the
+              live interview room. <span className="text-red-500">*</span>
             </span>
           </label>
 
@@ -627,22 +1037,32 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
 }) => {
   const navigate = useNavigate();
 
-  const [session, setSession] = useState<InterviewSessionRecord | null>(initialSession);
-  const [speakerState, setSpeakerState] = useState<'interviewer' | 'candidate' | 'idle'>('idle');
-  const [micRms, setMicRms] = useState<number>(0);
-  const [liveCaption, setLiveCaption] = useState<string>(initialMessage || '');
-  const [candidateSpokenBuffer, setCandidateSpokenBuffer] = useState<string>('');
-  const [questionTimeLeft, setQuestionTimeLeft] = useState<number>(90);
-  const [sessionTimeLeft, setSessionTimeLeft] = useState<number>(
-    initialSession?.maxDurationSeconds || 600
+  const [session, setSession] = useState<InterviewSessionRecord | null>(
+    initialSession,
   );
-  const [callSeconds, setCallSeconds] = useState<number>(0);
+  const [speakerState, setSpeakerState] = useState<
+    "interviewer" | "candidate" | "idle"
+  >("idle");
+  // Audio level is no longer displayed (no sound-wave visuals); kept as a no-op so the
+  // audio pipeline does not re-render the page dozens of times per second.
+  const setMicRms = useCallback((_level: number) => {}, []);
+  const [questionSecondsLeft, setQuestionSecondsLeft] = useState<number>(90);
+  const [liveCaption, setLiveCaption] = useState<string>(initialMessage || "");
+  const [candidateSpokenBuffer, setCandidateSpokenBuffer] =
+    useState<string>("");
   const [isMicMuted, setIsMicMuted] = useState<boolean>(false);
-  const [isCameraOn, setIsCameraOn] = useState<boolean>(true);
   const [isProcessingTurn, setIsProcessingTurn] = useState<boolean>(false);
+  const [isInitializingCall, setIsInitializingCall] = useState<boolean>(true);
+  const [isReconnectingVoice, setIsReconnectingVoice] =
+    useState<boolean>(false);
+  const [isScrutinizingCall, setIsScrutinizingCall] = useState<boolean>(false);
   const [usingGeminiLiveWs, setUsingGeminiLiveWs] = useState<boolean>(false);
+  const [misconductBanner, setMisconductBanner] = useState<{
+    pointsDeducted: number;
+    totalPenaltyPoints: number;
+    message: string;
+  } | null>(null);
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const playbackCtxRef = useRef<AudioContext | null>(null);
@@ -651,82 +1071,281 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
   const wsRef = useRef<WebSocket | null>(null);
   const recognitionRef = useRef<any>(null);
   const silenceTimerRef = useRef<number | null>(null);
-  const spokenAccumulatorRef = useRef<string>('');
+  const spokenAccumulatorRef = useRef<string>("");
+  const interimSpeechRef = useRef<string>("");
   const isInterviewerSpeakingRef = useRef<boolean>(false);
   const isSubmittingTurnRef = useRef<boolean>(false);
-  const liveTranscriptRef = useRef<TranscriptEntry[]>(initialSession?.transcript || []);
+  const liveTranscriptRef = useRef<TranscriptEntry[]>(
+    initialSession?.transcript || [],
+  );
+  const sessionRef = useRef<InterviewSessionRecord | null>(initialSession);
+  const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const waveIntervalRef = useRef<number | null>(null);
+  const safetySpeechTimerRef = useRef<number | null>(null);
+  const initializedSessionIdRef = useRef<string | null>(null);
+  // Single-voice guarantees: only one interviewer audio source may ever play.
+  const liveModeRef = useRef<boolean>(false); // Gemini Live voice is active: never play TTS
+  const speechGenerationRef = useRef<number>(0); // invalidates stale TTS requests
+  const micReopenAtRef = useRef<number>(0); // ignore the mic briefly after Sarah stops (echo tail)
+  const callEndingRef = useRef<boolean>(false); // call is over: mic closed, no new audio
+  const lastLiveAudioAtRef = useRef<number>(0);
+  const isMicMutedRef = useRef<boolean>(false);
+  const liveAudioDoneRef = useRef<boolean>(false); // server: closing audio fully sent
+  const liveCleanupRef = useRef<(() => void) | null>(null);
+
+  // Silent background timers (90s per question + 10m total session) — hidden from UI per specification
+  const questionSecondsRef = useRef<number>(90);
+  const finalizeRequestedRef = useRef<boolean>(false);
+  const sessionSecondsRef = useRef<number>(
+    (() => {
+      const max = initialSession?.maxDurationSeconds || 600;
+      const startedAt = initialSession?.createdAt
+        ? new Date(initialSession.createdAt).getTime()
+        : Date.now();
+      const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      // Resumed sessions continue with the time that is left (at least 30s to wrap up).
+      return Math.max(30, max - elapsed);
+    })(),
+  );
+  const sessionTimeoutTriggeredRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  // Preload browser voices early as backup
+  useEffect(() => {
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.getVoices();
+      const handleVoicesChanged = () => {
+        window.speechSynthesis.getVoices();
+      };
+      window.speechSynthesis.addEventListener?.(
+        "voiceschanged",
+        handleVoicesChanged,
+      );
+      return () => {
+        window.speechSynthesis.removeEventListener?.(
+          "voiceschanged",
+          handleVoicesChanged,
+        );
+      };
+    }
+  }, []);
 
   // Redirect to / if no session exists
   useEffect(() => {
     if (!initialSession) {
-      navigate('/', { replace: true });
+      navigate("/", { replace: true });
     }
   }, [initialSession, navigate]);
 
-  // Call duration counter
-  useEffect(() => {
-    const interval = window.setInterval(() => {
-      setCallSeconds((prev) => prev + 1);
-    }, 1000);
-    return () => clearInterval(interval);
+  const clearCurrentSpeechPlayback = useCallback(() => {
+    // Any TTS request still loading must not start playing later (that caused two voices).
+    speechGenerationRef.current += 1;
+    if (waveIntervalRef.current) {
+      clearInterval(waveIntervalRef.current);
+      waveIntervalRef.current = null;
+    }
+    if (safetySpeechTimerRef.current) {
+      clearTimeout(safetySpeechTimerRef.current);
+      safetySpeechTimerRef.current = null;
+    }
+    if (ttsAudioRef.current) {
+      try {
+        ttsAudioRef.current.pause();
+        ttsAudioRef.current.src = "";
+      } catch {
+        // ignore
+      }
+      ttsAudioRef.current = null;
+    }
+    if ("speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
+    }
+    activeUtteranceRef.current = null;
+    isInterviewerSpeakingRef.current = false;
+    setMicRms(0);
+    setSpeakerState("idle");
   }, []);
 
-  // Speak helper using Web Speech Synthesis tuned to warm African American female coach cadence
+  // Speak helper locked to Sarah's single NotebookLM female voice (/api/interviewer-tts)
   const speakInterviewerText = useCallback(
     (text: string, onDone?: () => void) => {
-      if (!('speechSynthesis' in window)) {
-        setSpeakerState('idle');
+      const cleanText = String(text || "").trim();
+      // In a Gemini Live call Sarah speaks only through the live stream, never through TTS,
+      // and nothing is spoken any more once the call is over.
+      if (!cleanText || liveModeRef.current || callEndingRef.current) {
         isInterviewerSpeakingRef.current = false;
+        setSpeakerState("idle");
         onDone?.();
         return;
       }
 
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      const voices = window.speechSynthesis.getVoices();
-      const preferredVoice =
-        voices.find((v) =>
-          /samantha|ava|allison|karen|zira|google us english|natural|aria|jenny|sonia/i.test(v.name)
-        ) ||
-        voices.find((v) => v.lang.startsWith('en') && /female/i.test(v.name)) ||
-        voices.find((v) => v.lang.startsWith('en-US')) ||
-        voices[0];
+      clearCurrentSpeechPlayback();
+      const myGeneration = speechGenerationRef.current;
+      const isStale = () => myGeneration !== speechGenerationRef.current;
 
-      if (preferredVoice) utterance.voice = preferredVoice;
-      utterance.rate = 0.98;
-      utterance.pitch = 1.02;
+      // Clear any residual mic noise picked up before the interviewer started speaking
+      spokenAccumulatorRef.current = "";
+      interimSpeechRef.current = "";
 
       isInterviewerSpeakingRef.current = true;
-      setSpeakerState('interviewer');
-      setLiveCaption(text);
+      setSpeakerState("interviewer");
+      setLiveCaption(cleanText);
 
-      // Simulate smooth RMS wave while interviewer speaks
-      const waveInterval = window.setInterval(() => {
-        setMicRms(0.18 + Math.random() * 0.28);
-      }, 90);
-
-      utterance.onend = () => {
-        clearInterval(waveInterval);
+      let finished = false;
+      const finishSpeaking = () => {
+        if (finished) return;
+        finished = true;
+        if (isStale()) return; // a newer line (or a stop) already took over
+        // Keep the mic closed a little longer so the tail of Sarah's voice from the
+        // speakers is not recognised as the candidate speaking, and drop anything the
+        // recogniser buffered while she was talking.
+        micReopenAtRef.current = Date.now() + 900;
+        spokenAccumulatorRef.current = "";
+        interimSpeechRef.current = "";
+        try {
+          recognitionRef.current?.abort?.();
+        } catch {
+          // ignore (onend restarts recognition)
+        }
+        if (waveIntervalRef.current) {
+          clearInterval(waveIntervalRef.current);
+          waveIntervalRef.current = null;
+        }
+        if (safetySpeechTimerRef.current) {
+          clearTimeout(safetySpeechTimerRef.current);
+          safetySpeechTimerRef.current = null;
+        }
+        activeUtteranceRef.current = null;
         setMicRms(0);
         isInterviewerSpeakingRef.current = false;
-        setSpeakerState('idle');
+        setSpeakerState("idle");
         onDone?.();
       };
 
-      utterance.onerror = () => {
-        clearInterval(waveInterval);
-        setMicRms(0);
-        isInterviewerSpeakingRef.current = false;
-        setSpeakerState('idle');
-        onDone?.();
+      const speakWithBrowserSynthesis = () => {
+        if (isStale() || finished) return;
+        if (!("speechSynthesis" in window)) {
+          finishSpeaking();
+          return;
+        }
+
+        try {
+          window.speechSynthesis.cancel();
+        } catch {
+          // ignore
+        }
+
+        const utterance = new SpeechSynthesisUtterance(cleanText);
+        activeUtteranceRef.current = utterance;
+
+        const voices = window.speechSynthesis.getVoices();
+        const englishVoices = voices.filter((v) => /^en(-|_|$)/i.test(v.lang));
+        const femaleEnglishVoices = englishVoices.filter(
+          (v) =>
+            !/david|mark|alex|daniel|fred|george|james|richard|guy|christopher|eric|roger|steffan|ryan|male/i.test(
+              v.name,
+            ),
+        );
+
+        const matchedVoice =
+          femaleEnglishVoices.find((v) =>
+            SINGLE_INTERVIEWER_VOICE.voiceMatchRegex.test(v.name),
+          ) ||
+          femaleEnglishVoices[0] ||
+          englishVoices[0] ||
+          voices[0];
+
+        if (matchedVoice) {
+          utterance.voice = matchedVoice;
+        }
+        utterance.pitch = SINGLE_INTERVIEWER_VOICE.pitch;
+        utterance.rate = SINGLE_INTERVIEWER_VOICE.rate;
+
+        let tickCount = 0;
+        waveIntervalRef.current = window.setInterval(() => {
+          tickCount += 1;
+          setMicRms(0.22 + Math.random() * 0.28);
+          if (
+            tickCount > 12 &&
+            !window.speechSynthesis.speaking &&
+            !window.speechSynthesis.pending
+          ) {
+            finishSpeaking();
+          }
+        }, 85);
+
+        const wordCount = cleanText.split(/\s+/).length;
+        const maxDurationMs = Math.max(
+          4000,
+          Math.min(30000, wordCount * 520 + 2500),
+        );
+        safetySpeechTimerRef.current = window.setTimeout(() => {
+          finishSpeaking();
+        }, maxDurationMs);
+
+        utterance.onend = () => {
+          finishSpeaking();
+        };
+
+        utterance.onerror = () => {
+          finishSpeaking();
+        };
+
+        window.speechSynthesis.speak(utterance);
       };
 
-      window.speechSynthesis.speak(utterance);
+      // Always fetch Sarah's single neural female voice from /api/interviewer-tts
+      fetch("/api/interviewer-tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: cleanText,
+          voiceName: SINGLE_INTERVIEWER_VOICE.id,
+        }),
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          if (finished || isStale()) return;
+          if (data && !data.fallback && data.audioBase64) {
+            const audioSrc = `data:${data.mimeType || "audio/mpeg"};base64,${data.audioBase64}`;
+            const audio = new Audio(audioSrc);
+            ttsAudioRef.current = audio;
+
+            waveIntervalRef.current = window.setInterval(() => {
+              setMicRms(0.24 + Math.random() * 0.3);
+            }, 85);
+
+            audio.onended = () => {
+              finishSpeaking();
+            };
+            audio.onerror = () => {
+              speakWithBrowserSynthesis();
+            };
+            audio.play().catch(() => {
+              speakWithBrowserSynthesis();
+            });
+          } else {
+            speakWithBrowserSynthesis();
+          }
+        })
+        .catch(() => {
+          if (!finished && !isStale()) {
+            speakWithBrowserSynthesis();
+          }
+        });
     },
-    []
+    [clearCurrentSpeechPlayback],
   );
 
-  // Submit a conversational turn in Fallback Continuous Voice Mode
+  // Submit a conversational turn in Continuous Voice Mode
   const submitVoiceTurn = useCallback(
     async (opts: {
       text?: string;
@@ -734,9 +1353,30 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
       sessionTimedOut?: boolean;
       requestedRephrase?: boolean;
     }) => {
-      if (!session || isSubmittingTurnRef.current) return;
-      const textToSend = (opts.text ?? spokenAccumulatorRef.current).trim();
-      if (!textToSend && !opts.timedOut && !opts.sessionTimedOut && !opts.requestedRephrase) return;
+      const currentSession = sessionRef.current;
+      if (!currentSession || isSubmittingTurnRef.current) return;
+
+      const combinedSpoken = (
+        spokenAccumulatorRef.current +
+        " " +
+        interimSpeechRef.current
+      )
+        .replace(/\s+/g, " ")
+        .trim();
+
+      const textToSend = (
+        opts.text !== undefined ? opts.text : combinedSpoken
+      ).trim();
+      if (
+        !textToSend &&
+        !opts.timedOut &&
+        !opts.sessionTimedOut &&
+        !opts.requestedRephrase
+      )
+        return;
+
+      // Stop any ongoing interviewer speech before processing candidate's turn
+      clearCurrentSpeechPlayback();
 
       isSubmittingTurnRef.current = true;
       setIsProcessingTurn(true);
@@ -744,15 +1384,16 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
         clearTimeout(silenceTimerRef.current);
         silenceTimerRef.current = null;
       }
-      spokenAccumulatorRef.current = '';
-      setCandidateSpokenBuffer('');
+      spokenAccumulatorRef.current = "";
+      interimSpeechRef.current = "";
+      setCandidateSpokenBuffer("");
 
       try {
-        const res = await fetch('/api/interview-turn', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+        const res = await fetch("/api/interview-turn", {
+          method: "POST",
+          headers: sessionHeaders(),
           body: JSON.stringify({
-            sessionId: session.id,
+            sessionId: currentSession.id,
             candidateText: textToSend,
             timedOut: Boolean(opts.timedOut),
             sessionTimedOut: Boolean(opts.sessionTimedOut),
@@ -762,134 +1403,362 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
 
         const data = await res.json();
         if (res.ok && data.session) {
+          sessionRef.current = data.session;
           setSession(data.session);
           liveTranscriptRef.current = data.session.transcript;
 
+          if (data.misconductWarning) {
+            setMisconductBanner({
+              pointsDeducted: data.misconductWarning.pointsDeducted || 3,
+              totalPenaltyPoints:
+                data.misconductWarning.totalPenaltyPoints || 3,
+              message:
+                "Professional Conduct Warning: -3 points deducted for inappropriate language. Repeating this will end the call and suspend your account for 24 hours.",
+            });
+          }
+
           if (data.resetQuestionTimer) {
-            setQuestionTimeLeft(90);
+            questionSecondsRef.current = 90;
           }
 
           if (data.interviewEnded) {
             speakInterviewerText(data.interviewerMessage, () => {
-              onSessionCompleted(data.session);
-              navigate('/scoring');
+              setIsScrutinizingCall(true);
+              window.setTimeout(() => {
+                onSessionCompleted(data.session);
+                navigate("/scoring");
+              }, 1400);
             });
             return;
           }
 
           if (data.interviewerMessage) {
-            speakInterviewerText(data.interviewerMessage);
+            speakInterviewerText(data.interviewerMessage, () => {
+              // Ensure the candidate starts with a full 90 seconds AFTER Sarah finishes asking a question
+              if (
+                data.resetQuestionTimer ||
+                data.session?.currentPhase === "questioning"
+              ) {
+                questionSecondsRef.current = 90;
+              }
+            });
           }
         }
       } catch (err) {
-        console.warn('Turn error:', err);
+        console.warn("Turn error:", err);
       } finally {
         isSubmittingTurnRef.current = false;
         setIsProcessingTurn(false);
       }
     },
-    [session, speakInterviewerText, onSessionCompleted, navigate]
+    [
+      clearCurrentSpeechPlayback,
+      speakInterviewerText,
+      onSessionCompleted,
+      navigate,
+    ],
   );
 
-  // 90-Second Per-Question Countdown Timer
+  // Keep a stable ref to submitVoiceTurn for timers and speech recognition callbacks
+  const submitVoiceTurnRef = useRef(submitVoiceTurn);
   useEffect(() => {
-    if (!session || session.currentPhase !== 'questioning') return;
+    submitVoiceTurnRef.current = submitVoiceTurn;
+  }, [submitVoiceTurn]);
 
-    const timer = window.setInterval(() => {
-      setQuestionTimeLeft((prev) => {
-        if (prev <= 1) {
-          // 90 seconds expired! Interrupt candidate and advance to next question
-          if (usingGeminiLiveWs && wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(
+  // Coordinated Background Timers (90s Per-Question Response Timer + 10m Overall Session Timer)
+  // Hidden from the UI to prevent visual distraction and coordinated so they never conflict.
+  useEffect(() => {
+    if (!session || session.currentPhase === "finished") return;
+
+    const unifiedTimer = window.setInterval(() => {
+      setQuestionSecondsLeft(Math.max(0, questionSecondsRef.current));
+      const activeSess = sessionRef.current;
+      if (
+        !activeSess ||
+        activeSess.currentPhase === "finished" ||
+        sessionTimeoutTriggeredRef.current
+      ) {
+        return;
+      }
+
+      // 1. 10-Minute (600s) Overall Interview Session Timer
+      sessionSecondsRef.current -= 1;
+      if (liveModeRef.current) {
+        // Live call: the server tells Sarah to close at 10:00 and ends the call itself.
+        // This is only a safety net in case the connection to the server is lost.
+        if (sessionSecondsRef.current <= -40 && !callEndingRef.current) {
+          sessionTimeoutTriggeredRef.current = true;
+          finalizeGeminiLiveCallRef.current?.(false, false);
+        }
+        if (sessionSecondsRef.current <= 0) return;
+      } else if (sessionSecondsRef.current <= 0) {
+        sessionTimeoutTriggeredRef.current = true;
+        const currentSpoken = mergeSpeechChunksAccurately(
+          spokenAccumulatorRef.current,
+          interimSpeechRef.current,
+        );
+        submitVoiceTurnRef.current({
+          text: currentSpoken,
+          sessionTimedOut: true,
+        });
+        return;
+      }
+
+      // 2. 90-Second Per-Question Response Timer
+      // Only counts down when in 'questioning' phase AND Sarah has finished speaking AND no turn is currently submitting
+      if (
+        activeSess.currentPhase === "questioning" &&
+        !isInterviewerSpeakingRef.current &&
+        !isSubmittingTurnRef.current &&
+        !callEndingRef.current &&
+        questionSecondsRef.current > 0
+      ) {
+        questionSecondsRef.current -= 1;
+        if (questionSecondsRef.current <= 0) {
+          const isLastQuestion =
+            (activeSess.currentQuestionIndex || 0) >=
+            (activeSess.questions?.length || 1) - 1;
+          // Last question: the timer stays at 0:00 while Sarah closes the interview.
+          // Otherwise it restarts for the next question (Sarah also resets it when she asks it).
+          questionSecondsRef.current = liveModeRef.current && isLastQuestion ? 0 : 90;
+          setQuestionSecondsLeft(questionSecondsRef.current);
+          if (liveModeRef.current) {
+            if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(
               JSON.stringify({
-                type: 'timer_expired',
-                currentQuestionIndex: session.currentQuestionIndex,
-              })
+                type: "timer_expired",
+                currentQuestionIndex: activeSess.currentQuestionIndex || 0,
+              }),
             );
-            return 90;
           } else {
-            submitVoiceTurn({
-              text: spokenAccumulatorRef.current,
+            const currentSpoken = mergeSpeechChunksAccurately(
+              spokenAccumulatorRef.current,
+              interimSpeechRef.current,
+            );
+            submitVoiceTurnRef.current({
+              text: currentSpoken,
               timedOut: true,
             });
-            return 90;
           }
         }
-        return prev - 1;
-      });
+      }
     }, 1000);
 
-    return () => clearInterval(timer);
-  }, [session, usingGeminiLiveWs, submitVoiceTurn]);
+    return () => clearInterval(unifiedTimer);
+  }, [session?.currentPhase, usingGeminiLiveWs]);
 
-  // 10-Minute (600 Seconds) Maximum Interview Session Duration Timer
-  useEffect(() => {
-    if (!session || session.currentPhase === 'finished') return;
+  // Immediately silence the live interviewer stream (queued audio chunks included).
+  const stopLiveAudio = useCallback(() => {
+    activeSourcesRef.current.forEach((s) => {
+      try {
+        s.onended = null;
+        s.stop();
+      } catch {
+        // ignore
+      }
+    });
+    activeSourcesRef.current = [];
+    if (playbackCtxRef.current) {
+      nextPlayTimeRef.current = playbackCtxRef.current.currentTime;
+    }
+    isInterviewerSpeakingRef.current = false;
+    setSpeakerState("idle");
+    setMicRms(0);
+  }, []);
 
-    const sessionTimer = window.setInterval(() => {
-      setSessionTimeLeft((prev) => {
-        if (prev <= 1) {
-          // 10-minute session limit reached! Automatically conclude the interview
-          if (usingGeminiLiveWs && wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.close();
-          }
-          submitVoiceTurn({
-            text: spokenAccumulatorRef.current,
-            sessionTimedOut: true,
-          });
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-
-    return () => clearInterval(sessionTimer);
-  }, [session, usingGeminiLiveWs, submitVoiceTurn]);
-
-  // Finalize a Gemini Live WebSocket session and navigate to /scoring
+  // Finalize a Gemini Live WebSocket session and navigate to /scoring with AI Coach Scrutinizing screen
   const finalizeGeminiLiveCall = useCallback(
-    async (terminatedByAttemptRule = false) => {
-      if (!session) return;
+    async (terminatedByAttemptRule = false, terminatedByMisconduct = false) => {
+      const currentSession = sessionRef.current;
+      if (!currentSession) return;
+      // Finalize only once per session: Gemini may emit end_call more than once and the
+      // candidate may also click "End Call & Score" — each extra call used to trigger
+      // another results email.
+      if (finalizeRequestedRef.current) return;
+      finalizeRequestedRef.current = true;
+      // The call is over: close the mic path and silence the interviewer for good.
+      callEndingRef.current = true;
+      stopLiveAudio();
+      clearCurrentSpeechPlayback();
       setIsProcessingTurn(true);
+      setIsScrutinizingCall(true);
       try {
         wsRef.current?.close();
       } catch {
         // ignore
       }
       try {
-        const res = await fetch('/api/finalize-live-ws-session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+        const res = await fetch("/api/finalize-live-ws-session", {
+          method: "POST",
+          headers: sessionHeaders(),
           body: JSON.stringify({
-            sessionId: session.id,
+            sessionId: currentSession.id,
             liveTranscript: liveTranscriptRef.current,
             terminatedByAttemptRule,
+            terminatedByMisconduct,
           }),
         });
         const data = await res.json();
         if (res.ok && data.session) {
-          onSessionCompleted(data.session);
-          navigate('/scoring');
+          window.setTimeout(() => {
+            onSessionCompleted(data.session);
+            navigate("/scoring");
+          }, 1200);
           return;
         }
       } catch (e) {
-        console.warn('Finalize live session error:', e);
+        console.warn("Finalize live session error:", e);
+        setIsScrutinizingCall(false);
+        finalizeRequestedRef.current = false; // allow a manual retry after a network failure
       } finally {
         setIsProcessingTurn(false);
       }
     },
-    [session, onSessionCompleted, navigate]
+    [clearCurrentSpeechPlayback, stopLiveAudio, onSessionCompleted, navigate],
   );
+  const finalizeGeminiLiveCallRef = useRef(finalizeGeminiLiveCall);
+  useEffect(() => {
+    finalizeGeminiLiveCallRef.current = finalizeGeminiLiveCall;
+  }, [finalizeGeminiLiveCall]);
 
-  // Initialize Camera, 16kHz AudioWorklet Mic Engine, and LUNA Live Voice Connection
+  // Initialize Camera, 16kHz AudioWorklet Mic Engine, and Live Voice Connection ONCE per session
   useEffect(() => {
     if (!initialSession) return;
+    if (initializedSessionIdRef.current === initialSession.id) return;
+    initializedSessionIdRef.current = initialSession.id;
+
     let isUnmounted = false;
+
+    const startContinuousSpeechLoop = () => {
+      const SpeechRecognition =
+        (window as any).SpeechRecognition ||
+        (window as any).webkitSpeechRecognition;
+      if (!SpeechRecognition) return;
+
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {
+          // ignore
+        }
+      }
+
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 3;
+      recognition.lang = "en-US";
+
+      recognition.onresult = (event: any) => {
+        if (
+          isInterviewerSpeakingRef.current ||
+          isSubmittingTurnRef.current ||
+          callEndingRef.current ||
+          Date.now() < micReopenAtRef.current
+        )
+          return;
+
+        let interim = "";
+        let finalChunk = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const bestAlternative = event.results[i][0];
+          const transcriptPiece = bestAlternative
+            ? String(bestAlternative.transcript || "")
+            : "";
+          if (event.results[i].isFinal) {
+            finalChunk = mergeSpeechChunksAccurately(
+              finalChunk,
+              transcriptPiece,
+            );
+          } else {
+            interim = mergeSpeechChunksAccurately(interim, transcriptPiece);
+          }
+        }
+
+        if (finalChunk.trim()) {
+          spokenAccumulatorRef.current = mergeSpeechChunksAccurately(
+            spokenAccumulatorRef.current,
+            finalChunk,
+          );
+        }
+        interimSpeechRef.current = interim.trim();
+
+        const combinedLive = mergeSpeechChunksAccurately(
+          spokenAccumulatorRef.current,
+          interimSpeechRef.current,
+        );
+
+        if (combinedLive) {
+          setCandidateSpokenBuffer(combinedLive);
+          setSpeakerState("candidate");
+
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+          }
+
+          const currentPhase =
+            sessionRef.current?.currentPhase || "greeting_how_are_you";
+          const wordCount = combinedLive
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean).length;
+          const isExplicitQuestionOrDontKnow =
+            /\b(i\s+don'?t\s+know|not\s+sure|no\s+idea|rephrase|repeat|can\s+you\s+repeat)\b/i.test(
+              combinedLive,
+            );
+
+          // In 'questioning' phase, let the candidate speak comfortably up to the full 90 seconds!
+          // Do NOT cut them off on 1-3 second thinking pauses. Only auto-submit after a 4.5s pause
+          // if they have already spoken a substantial answer (>= 16 words) or explicitly asked to rephrase/don't know.
+          const pauseMs =
+            currentPhase === "questioning"
+              ? isExplicitQuestionOrDontKnow
+                ? 2400
+                : wordCount >= 16
+                  ? 4500
+                  : 0 // 0 means wait for more speech or the 90s timer / manual Done Speaking button
+              : 2400;
+
+          if (pauseMs > 0) {
+            silenceTimerRef.current = window.setTimeout(() => {
+              const fullAnswerToSend = mergeSpeechChunksAccurately(
+                spokenAccumulatorRef.current,
+                interimSpeechRef.current,
+              );
+
+              if (
+                fullAnswerToSend.length >= 2 &&
+                !isInterviewerSpeakingRef.current &&
+                !isSubmittingTurnRef.current
+              ) {
+                submitVoiceTurnRef.current({ text: fullAnswerToSend });
+              }
+            }, pauseMs);
+          }
+        }
+      };
+
+      recognition.onend = () => {
+        if (!isUnmounted) {
+          try {
+            recognition.start();
+          } catch {
+            // ignore
+          }
+        }
+      };
+
+      try {
+        recognition.start();
+        recognitionRef.current = recognition;
+      } catch {
+        // ignore
+      }
+    };
 
     const setupMediaAndVoice = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
+          video: false, // voice-only interview: no camera
           audio: {
             sampleRate: 16000,
             channelCount: 1,
@@ -905,12 +1774,11 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
         }
 
         mediaStreamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
 
-        // Set up 16kHz AudioWorkletProcessor (exact LUNA v2 MicProcessor)
-        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
+        // Set up 16kHz AudioWorkletProcessor (LUNA v2 MicProcessor)
+        const audioCtx = new (
+          window.AudioContext || (window as any).webkitAudioContext
+        )({
           sampleRate: 16000,
         });
         audioCtxRef.current = audioCtx;
@@ -949,32 +1817,63 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
           registerProcessor('luna-mic-processor', LunaMicProcessor);
         `;
 
-        const blob = new Blob([workletCode], { type: 'application/javascript' });
+        const blob = new Blob([workletCode], {
+          type: "application/javascript",
+        });
         const workletUrl = URL.createObjectURL(blob);
         await audioCtx.audioWorklet.addModule(workletUrl);
         URL.revokeObjectURL(workletUrl);
 
         const source = audioCtx.createMediaStreamSource(stream);
-        const workletNode = new AudioWorkletNode(audioCtx, 'luna-mic-processor');
+        const workletNode = new AudioWorkletNode(
+          audioCtx,
+          "luna-mic-processor",
+        );
         source.connect(workletNode);
 
         workletNode.port.onmessage = (event) => {
           if (isUnmounted) return;
           const { pcm, rms } = event.data;
 
-          if (!isInterviewerSpeakingRef.current) {
+          // ECHO GATE: while Sarah's voice is coming out of the speakers (plus a short tail),
+          // the microphone is NOT passed to the interviewer. Otherwise the agent hears its own
+          // voice, takes it for the candidate and starts answering itself (the "second voice").
+          // The tail is kept short (browser echo cancellation is on): a longer one swallowed
+          // quick replies like "yes" or "sorry?" and Sarah never answered them.
+          const playCtx = playbackCtxRef.current;
+          const interviewerAudible =
+            isInterviewerSpeakingRef.current ||
+            activeSourcesRef.current.length > 0 ||
+            (playCtx ? playCtx.currentTime < nextPlayTimeRef.current + 0.25 : false);
+
+          if (!isInterviewerSpeakingRef.current && !interviewerAudible) {
             setMicRms(rms);
-            if (rms > 0.025) {
-              setSpeakerState('candidate');
+            if (rms > 0.022) {
+              setSpeakerState("candidate");
             } else {
-              setSpeakerState((prev) => (prev === 'candidate' ? 'idle' : prev));
+              setSpeakerState((prev) =>
+                prev === "candidate" &&
+                !spokenAccumulatorRef.current &&
+                !interimSpeechRef.current
+                  ? "idle"
+                  : prev,
+              );
             }
           }
 
           // Stream 16-bit PCM audio frames to /api/live-ws if connected
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            const bytes = new Uint8Array(pcm);
-            let binary = '';
+          if (
+            wsRef.current &&
+            wsRef.current.readyState === WebSocket.OPEN &&
+            liveModeRef.current &&
+            !callEndingRef.current &&
+            !isMicMutedRef.current
+          ) {
+            // Silence (zeros) keeps the stream timing steady while the gate is closed.
+            const bytes = interviewerAudible
+              ? new Uint8Array((pcm as ArrayBuffer).byteLength)
+              : new Uint8Array(pcm);
+            let binary = "";
             for (let i = 0; i < bytes.byteLength; i++) {
               binary += String.fromCharCode(bytes[i]);
             }
@@ -982,74 +1881,214 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
             wsRef.current.send(
               JSON.stringify({
                 realtimeInput: {
-                  mediaChunks: [
-                    {
-                      mimeType: 'audio/pcm;rate=16000',
-                      data: base64Audio,
-                    },
-                  ],
+                  audio: {
+                    mimeType: "audio/pcm;rate=16000",
+                    data: base64Audio,
+                  },
                 },
-              })
+              }),
             );
           }
         };
       } catch (mediaErr) {
-        console.warn('Media permission warning:', mediaErr);
+        console.warn("Media permission warning:", mediaErr);
       }
 
       // Connect to LUNA v2 Gemini Live WebSocket (/api/live-ws) if available, otherwise start continuous voice loop
-      if (liveWsAvailable) {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      let liveConnectedOnce = false;
+      let fallbackStarted = false;
+      let reconnectAttempts = 0;
+      let reconnectTimer: number | null = null;
+
+      const startTextVoiceFallback = () => {
+        // Only used when the live voice never connected: one voice (TTS) for the whole call.
+        if (fallbackStarted || isUnmounted || liveConnectedOnce) return;
+        fallbackStarted = true;
+        liveModeRef.current = false;
+        setUsingGeminiLiveWs(false);
+        setIsInitializingCall(false);
+        setIsReconnectingVoice(false);
+        startContinuousSpeechLoop();
+        speakInterviewerText(initialMessage);
+      };
+
+      /** End of call: let the closing sentence already received finish, then finalize. */
+      const finishAfterClosingAudio = (
+        terminatedByAttempts: boolean,
+        terminatedByMisconduct: boolean,
+      ) => {
+        if (callEndingRef.current && finalizeRequestedRef.current) return;
+        callEndingRef.current = true; // mic is no longer sent from now on
+        const startedAt = Date.now();
+        const poll = window.setInterval(() => {
+          const ctx = playbackCtxRef.current;
+          const queueDone =
+            activeSourcesRef.current.length === 0 &&
+            (!ctx || ctx.currentTime >= nextPlayTimeRef.current);
+          const quietFor = Date.now() - lastLiveAudioAtRef.current;
+          if (
+            isUnmounted ||
+            (queueDone && (liveAudioDoneRef.current || quietFor > 1500)) ||
+            Date.now() - startedAt > 15000
+          ) {
+            window.clearInterval(poll);
+            if (!isUnmounted) {
+              finalizeGeminiLiveCallRef.current(terminatedByAttempts, terminatedByMisconduct);
+            }
+          }
+        }, 200);
+      };
+
+      const scheduleReconnect = () => {
+        if (isUnmounted || callEndingRef.current || finalizeRequestedRef.current) return;
+        if (reconnectTimer) return;
+        stopLiveAudio();
+        if (reconnectAttempts >= 3) {
+          // Could not get the interviewer back: score what was answered so far.
+          setIsReconnectingVoice(false);
+          finalizeGeminiLiveCallRef.current(false, false);
+          return;
+        }
+        reconnectAttempts += 1;
+        setIsReconnectingVoice(true);
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          connectLiveVoice(true);
+        }, 800 * reconnectAttempts);
+      };
+
+      const connectLiveVoice = (isReconnect: boolean) => {
+        if (isUnmounted || callEndingRef.current) return;
+        // Never keep two sockets (= two interviewer voices) open at once.
+        const previous = wsRef.current;
+        if (previous) {
+          previous.onmessage = null;
+          previous.onerror = null;
+          previous.onclose = null;
+          try {
+            previous.close();
+          } catch {
+            // ignore
+          }
+        }
+
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const wsUrl = `${protocol}//${window.location.host}/api/live-ws?sessionId=${encodeURIComponent(
-          initialSession.id
-        )}`;
+          initialSession.id,
+        )}&token=${encodeURIComponent(currentSessionToken)}${isReconnect ? "&reconnect=1" : ""}`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
+        let socketHandled = false;
 
-        const playCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
-          sampleRate: 24000,
-        });
-        playbackCtxRef.current = playCtx;
-        nextPlayTimeRef.current = playCtx.currentTime;
+        if (!playbackCtxRef.current) {
+          const playCtx = new (
+            window.AudioContext || (window as any).webkitAudioContext
+          )({
+            sampleRate: 24000,
+          });
+          playbackCtxRef.current = playCtx;
+          nextPlayTimeRef.current = playCtx.currentTime;
+        }
+
+        const onSocketLost = () => {
+          if (socketHandled || ws !== wsRef.current) return;
+          socketHandled = true;
+          if (isUnmounted || callEndingRef.current || finalizeRequestedRef.current) return;
+          if (liveConnectedOnce) scheduleReconnect();
+          else startTextVoiceFallback();
+        };
 
         ws.onmessage = (evt) => {
-          if (isUnmounted) return;
+          if (isUnmounted || ws !== wsRef.current) return;
           try {
             const msg = JSON.parse(evt.data);
 
-            if (msg.type === 'connected') {
+            if (msg.type === "connected") {
+              liveConnectedOnce = true;
+              reconnectAttempts = 0;
+              liveModeRef.current = true;
+              // Make sure no TTS voice from the fallback path is playing.
+              clearCurrentSpeechPlayback();
+              try {
+                recognitionRef.current?.stop();
+              } catch {
+                // ignore
+              }
               setUsingGeminiLiveWs(true);
+              setIsInitializingCall(false);
+              setIsReconnectingVoice(false);
               return;
             }
 
-            if (msg.type === 'fallback_required') {
-              setUsingGeminiLiveWs(false);
-              ws.close();
-              startContinuousSpeechLoop();
-              speakInterviewerText(initialMessage);
+            if (msg.type === "fallback_required" || msg.type === "live_dropped") {
+              onSocketLost();
               return;
             }
 
-            if (msg.type === 'question_advanced') {
-              const qIdx = Math.max(0, Math.min(4, Number(msg.questionNumber) - 1));
-              setQuestionTimeLeft(90);
-              setSession((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      currentPhase: 'questioning',
-                      currentQuestionIndex: qIdx,
-                    }
-                  : prev
+            if (msg.type === "interviewer_audio_done") {
+              liveAudioDoneRef.current = true;
+              return;
+            }
+
+            if (msg.type === "question_advanced") {
+              const total = Math.max(
+                1,
+                Number(msg.totalQuestions) ||
+                  sessionRef.current?.questions?.length ||
+                  4,
               );
+              const qIdx = Math.max(
+                0,
+                Math.min(total - 1, Number(msg.questionNumber) - 1),
+              );
+              questionSecondsRef.current = 90;
+              setSession((prev) => {
+                if (!prev) return prev;
+                const updated: InterviewSessionRecord = {
+                  ...prev,
+                  currentPhase: "questioning",
+                  currentQuestionIndex: qIdx,
+                };
+                sessionRef.current = updated;
+                return updated;
+              });
               return;
             }
 
-            if (msg.type === 'end_call_triggered') {
-              const terminatedByAttempts = msg.reason === 'terminated_after_two_attempts';
-              window.setTimeout(() => {
-                finalizeGeminiLiveCall(terminatedByAttempts);
-              }, 3500);
+            if (msg.type === "misconduct_warning") {
+              const penaltyPts = Number(msg.totalPenaltyPoints || 3);
+              setMisconductBanner({
+                pointsDeducted: Number(msg.pointsDeducted || 3),
+                totalPenaltyPoints: penaltyPts,
+                message:
+                  "Professional Conduct Warning: -3 points deducted for inappropriate language. Repeating this will end the call and suspend your account for 24 hours.",
+              });
+              setSession((prev) => {
+                if (!prev) return prev;
+                const updated: InterviewSessionRecord = {
+                  ...prev,
+                  misconductPenaltyPoints: penaltyPts,
+                };
+                sessionRef.current = updated;
+                return updated;
+              });
+              return;
+            }
+
+            if (msg.type === "end_call_triggered") {
+              const terminatedByAttempts =
+                msg.reason === "terminated_after_two_attempts";
+              const terminatedByMisconduct =
+                msg.reason === "terminated_misconduct";
+              if (terminatedByMisconduct) {
+                setMisconductBanner({
+                  pointsDeducted: 20,
+                  totalPenaltyPoints: 20,
+                  message:
+                    "Interview terminated due to professional misconduct. Your account is suspended from interview attempts for the next 24 hours.",
+                });
+              }
+              finishAfterClosingAudio(terminatedByAttempts, terminatedByMisconduct);
               return;
             }
 
@@ -1070,11 +2109,15 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
                 nextPlayTimeRef.current = playbackCtxRef.current.currentTime;
               }
               isInterviewerSpeakingRef.current = false;
-              setSpeakerState('idle');
+              setSpeakerState("idle");
             }
 
             const parts = serverContent.modelTurn?.parts;
-            if (Array.isArray(parts) && playbackCtxRef.current) {
+            if (
+              Array.isArray(parts) &&
+              playbackCtxRef.current &&
+              !finalizeRequestedRef.current
+            ) {
               for (const part of parts) {
                 const b64 = part.inlineData?.data;
                 if (b64) {
@@ -1092,29 +2135,41 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
                     float32[i] = sample;
                     chunkSum += sample * sample;
                   }
-                  const chunkRms = Math.sqrt(chunkSum / Math.max(1, int16.length));
+                  const chunkRms = Math.sqrt(
+                    chunkSum / Math.max(1, int16.length),
+                  );
                   setMicRms(chunkRms * 1.6);
                   isInterviewerSpeakingRef.current = true;
-                  setSpeakerState('interviewer');
+                  setSpeakerState("interviewer");
 
                   const ctx = playbackCtxRef.current;
-                  const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+                  const audioBuffer = ctx.createBuffer(
+                    1,
+                    float32.length,
+                    24000,
+                  );
                   audioBuffer.getChannelData(0).set(float32);
 
                   const bufSource = ctx.createBufferSource();
                   bufSource.buffer = audioBuffer;
                   bufSource.connect(ctx.destination);
 
-                  const startAt = Math.max(nextPlayTimeRef.current, ctx.currentTime);
+                  const startAt = Math.max(
+                    nextPlayTimeRef.current,
+                    ctx.currentTime,
+                  );
                   bufSource.start(startAt);
+                  lastLiveAudioAtRef.current = Date.now();
                   nextPlayTimeRef.current = startAt + audioBuffer.duration;
                   activeSourcesRef.current.push(bufSource);
 
                   bufSource.onended = () => {
-                    activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== bufSource);
+                    activeSourcesRef.current = activeSourcesRef.current.filter(
+                      (s) => s !== bufSource,
+                    );
                     if (activeSourcesRef.current.length === 0) {
                       isInterviewerSpeakingRef.current = false;
-                      setSpeakerState('idle');
+                      setSpeakerState("idle");
                       setMicRms(0);
                     }
                   };
@@ -1126,18 +2181,22 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
             if (serverContent.outputTranscription?.text) {
               const chunk = serverContent.outputTranscription.text;
               setLiveCaption((prev) => {
-                const updated = (prev + ' ' + chunk).replace(/\s+/g, ' ').trim();
+                const updated = (prev + " " + chunk)
+                  .replace(/\s+/g, " ")
+                  .trim();
                 return updated.slice(-280);
               });
               const list = liveTranscriptRef.current;
               const last = list[list.length - 1];
-              if (last && last.speaker === 'interviewer') {
-                last.text = (last.text + ' ' + chunk).replace(/\s+/g, ' ').trim();
+              if (last && last.speaker === "interviewer") {
+                last.text = (last.text + " " + chunk)
+                  .replace(/\s+/g, " ")
+                  .trim();
               } else {
                 list.push({
                   id: `tr_${Date.now()}_i`,
-                  speaker: 'interviewer',
-                  speakerName: 'Global Hire 360 AI Interviewer',
+                  speaker: "interviewer",
+                  speakerName: "Sarah (Global Hire 360 Hiring Manager)",
                   text: chunk.trim(),
                   timestamp: new Date().toISOString(),
                 });
@@ -1147,15 +2206,17 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
             // Live input transcription (Candidate voice captions)
             if (serverContent.inputTranscription?.text) {
               const chunk = serverContent.inputTranscription.text;
-              setCandidateSpokenBuffer((prev) => (prev + ' ' + chunk).replace(/\s+/g, ' ').trim());
+              setCandidateSpokenBuffer((prev) =>
+                mergeSpeechChunksAccurately(prev, chunk),
+              );
               const list = liveTranscriptRef.current;
               const last = list[list.length - 1];
-              if (last && last.speaker === 'candidate') {
-                last.text = (last.text + ' ' + chunk).replace(/\s+/g, ' ').trim();
+              if (last && last.speaker === "candidate") {
+                last.text = mergeSpeechChunksAccurately(last.text, chunk);
               } else {
                 list.push({
                   id: `tr_${Date.now()}_c`,
-                  speaker: 'candidate',
+                  speaker: "candidate",
                   speakerName: initialSession.candidateName,
                   text: chunk.trim(),
                   timestamp: new Date().toISOString(),
@@ -1163,108 +2224,48 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
               }
             }
           } catch (err) {
-            console.warn('WS message parse warning:', err);
+            console.warn("WS message parse warning:", err);
           }
         };
 
-        ws.onerror = () => {
-          if (!isUnmounted) {
-            setUsingGeminiLiveWs(false);
-            startContinuousSpeechLoop();
-            speakInterviewerText(initialMessage);
-          }
-        };
+        ws.onerror = onSocketLost;
+        ws.onclose = onSocketLost;
+      };
+
+      if (liveWsAvailable) {
+        connectLiveVoice(false);
       } else {
+        setIsInitializingCall(false);
         startContinuousSpeechLoop();
         speakInterviewerText(initialMessage);
       }
-    };
 
-    const startContinuousSpeechLoop = () => {
-      const SpeechRecognition =
-        (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (!SpeechRecognition) return;
-
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      recognition.onresult = (event: any) => {
-        if (isInterviewerSpeakingRef.current || isSubmittingTurnRef.current) return;
-
-        let interim = '';
-        let finalChunk = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcriptPiece = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalChunk += transcriptPiece + ' ';
-          } else {
-            interim += transcriptPiece;
-          }
-        }
-
-        if (finalChunk.trim()) {
-          spokenAccumulatorRef.current = (
-            spokenAccumulatorRef.current +
-            ' ' +
-            finalChunk
-          )
-            .replace(/\s+/g, ' ')
-            .trim();
-        }
-
-        const combinedLive = (spokenAccumulatorRef.current + ' ' + interim).trim();
-        if (combinedLive) {
-          setCandidateSpokenBuffer(combinedLive);
-          setSpeakerState('candidate');
-
-          // Reset 2.2-second natural pause detector to automatically send the candidate's spoken turn
-          if (silenceTimerRef.current) {
-            clearTimeout(silenceTimerRef.current);
-          }
-          silenceTimerRef.current = window.setTimeout(() => {
-            if (
-              spokenAccumulatorRef.current.trim().length >= 2 &&
-              !isInterviewerSpeakingRef.current &&
-              !isSubmittingTurnRef.current
-            ) {
-              submitVoiceTurn({ text: spokenAccumulatorRef.current.trim() });
-            }
-          }, 2200);
-        }
+      liveCleanupRef.current = () => {
+        if (reconnectTimer) window.clearTimeout(reconnectTimer);
       };
-
-      recognition.onend = () => {
-        if (!isUnmounted) {
-          try {
-            recognition.start();
-          } catch {
-            // ignore
-          }
-        }
-      };
-
-      try {
-        recognition.start();
-        recognitionRef.current = recognition;
-      } catch {
-        // ignore
-      }
     };
 
     setupMediaAndVoice();
 
     return () => {
       isUnmounted = true;
+      initializedSessionIdRef.current = null;
+      liveCleanupRef.current?.();
+      liveModeRef.current = false;
+      stopLiveAudio();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      clearCurrentSpeechPlayback();
       try {
         recognitionRef.current?.stop();
       } catch {
         // ignore
       }
       try {
-        wsRef.current?.close();
+        if (wsRef.current) {
+          wsRef.current.onclose = null;
+          wsRef.current.onerror = null;
+          wsRef.current.close();
+        }
       } catch {
         // ignore
       }
@@ -1278,12 +2279,12 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
       } catch {
         // ignore
       }
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-      }
+      playbackCtxRef.current = null;
       mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
-  }, [initialSession, initialMessage, liveWsAvailable, speakInterviewerText, submitVoiceTurn, finalizeGeminiLiveCall]);
+    // Only run once when entering the interview room for this session ID
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSession?.id]);
 
   const toggleMic = () => {
     if (!mediaStreamRef.current) return;
@@ -1291,339 +2292,570 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
     audioTracks.forEach((track) => {
       track.enabled = isMicMuted;
     });
+    isMicMutedRef.current = !isMicMuted;
     setIsMicMuted(!isMicMuted);
-  };
-
-  const toggleCamera = () => {
-    if (!mediaStreamRef.current) return;
-    const videoTracks = mediaStreamRef.current.getVideoTracks();
-    videoTracks.forEach((track) => {
-      track.enabled = !isCameraOn;
-    });
-    setIsCameraOn(!isCameraOn);
-  };
-
-  const handleRequestRephrase = () => {
-    if (usingGeminiLiveWs && wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          clientContent: {
-            turns: [
-              {
-                role: 'user',
-                parts: [{ text: 'Could you please rephrase the current question for me?' }],
-              },
-            ],
-            turnComplete: true,
-          },
-        })
-      );
-    } else {
-      submitVoiceTurn({ requestedRephrase: true });
-    }
   };
 
   if (!session) return null;
 
-  const currentQuestion =
-    session.currentPhase === 'questioning'
-      ? session.questions[session.currentQuestionIndex]
-      : null;
+  // Short transition screen while the answers are being marked
+  if (isScrutinizingCall) {
+    return (
+      <div className="min-h-screen bg-[#041E41] text-white flex flex-col items-center justify-center px-6 text-center select-none">
+        <div className="w-14 h-14 rounded-full border-4 border-[#339A05]/30 border-t-[#339A05] animate-spin mb-6" />
+        <h2 className="text-xl font-bold">Interview complete</h2>
+        <p className="text-sm text-slate-300 mt-2">Marking your answers…</p>
+      </div>
+    );
+  }
 
-  const formatTimer = (sec: number) => {
-    const m = Math.floor(sec / 60);
-    const s = sec % 60;
-    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  };
+  const totalQuestions = session.questions?.length || 4;
+  const isQuestioning = session.currentPhase === "questioning";
+  const sarahSpeaking = speakerState === "interviewer";
+  const timerNotStarted = isQuestioning && sarahSpeaking && questionSecondsLeft >= 90;
+  const timerLow = questionSecondsLeft <= 15;
+  const timerText = `${Math.floor(questionSecondsLeft / 60)}:${String(
+    questionSecondsLeft % 60,
+  ).padStart(2, "0")}`;
+
+  const statusText = isInitializingCall
+    ? "Connecting to Sarah…"
+    : isReconnectingVoice
+      ? "Reconnecting…"
+      : isMicMuted
+        ? "Your microphone is muted"
+        : sarahSpeaking
+          ? "Sarah is speaking…"
+          : isQuestioning
+            ? "Your turn — answer when you're ready"
+            : "Listening…";
 
   return (
-    <div className="min-h-screen bg-[#041E41] text-white flex flex-col justify-between">
-      {/* Top Bar: Role Badge, Question Progress, 90-Second Timer, End Call */}
-      <header className="border-b border-white/10 bg-[#031630] px-6 py-3.5">
-        <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="bg-white rounded-lg px-2.5 py-1">
-              <img
-                src={LOGO_URL}
-                alt="Global Hire 360"
-                referrerPolicy="no-referrer"
-                className="h-7 w-auto object-contain"
-              />
-            </div>
-            <div>
-              <div className="text-xs font-bold uppercase tracking-wider text-[#339A05]">
-                Position: {session.detectedRole}
-              </div>
-              <div className="text-xs text-slate-300">
-                Candidate: <strong>{session.candidateName}</strong> &bull; Call Time:{' '}
-                <span className="font-mono">{formatTimer(callSeconds)}</span>
-              </div>
-            </div>
-          </div>
-
-          {/* 90-Second Question Countdown Timer */}
-          <div className="flex items-center gap-3">
-            <div className="px-3.5 py-1.5 rounded-lg bg-white/10 border border-white/15 text-xs font-bold">
-              {session.currentPhase === 'greeting_how_are_you'
-                ? 'Warm-Up Greeting'
-                : `Question ${session.currentQuestionIndex + 1} of 5`}
-            </div>
-
-            <div
-              title="10-Minute Maximum Session Countdown"
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border font-mono text-xs font-bold ${
-                sessionTimeLeft <= 60
-                  ? 'bg-red-600/30 border-red-400 text-red-200 animate-pulse'
-                  : 'bg-white/10 border-white/20 text-slate-200'
-              }`}
-            >
-              <Clock className="w-3.5 h-3.5 text-[#339A05]" />
-              <span>Session: {formatTimer(sessionTimeLeft)} / 10:00</span>
-            </div>
-
-            <div
-              title="90-Second Per-Question Countdown"
-              className={`flex items-center gap-2 px-4 py-1.5 rounded-lg border font-mono text-sm font-extrabold ${
-                questionTimeLeft <= 15
-                  ? 'bg-red-600/30 border-red-400 text-red-200 animate-pulse'
-                  : questionTimeLeft <= 30
-                  ? 'bg-amber-500/25 border-amber-400 text-amber-200'
-                  : 'bg-[#339A05]/25 border-[#339A05] text-white'
-              }`}
-            >
-              <Clock className="w-4 h-4" />
-              <span>{formatTimer(questionTimeLeft)} / 01:30</span>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => finalizeGeminiLiveCall(false)}
-              disabled={isProcessingTurn}
-              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-bold transition-colors cursor-pointer"
-            >
-              <PhoneOff className="w-3.5 h-3.5" />
-              End Interview
-            </button>
-          </div>
+    <div className="min-h-screen bg-[#041E41] text-white flex flex-col">
+      {/* Minimal header */}
+      <header className="px-6 py-4 flex items-center justify-between">
+        <div className="bg-white rounded-lg px-2.5 py-1">
+          <img
+            src={LOGO_URL}
+            alt="Global Hire 360"
+            referrerPolicy="no-referrer"
+            className="h-6 w-auto object-contain"
+          />
         </div>
+        <span className="text-xs font-semibold text-slate-300">
+          {session.detectedRole} interview
+        </span>
       </header>
 
-      {/* Center Stage: LUNA AI Voice Orb (Global Hire 360 Interviewer) + Candidate Live Camera */}
-      <main className="flex-1 max-w-6xl w-full mx-auto px-6 py-6 grid grid-cols-1 lg:grid-cols-2 gap-6 items-center">
-        {/* Left Card: AI Interviewer with Global Hire 360 Logo & 60fps LUNA Voice Orb */}
-        <div className="bg-[#072957] border border-white/15 rounded-2xl p-6 flex flex-col items-center justify-between min-h-[420px] shadow-lg">
-          <div className="w-full flex items-center justify-between text-xs text-slate-300">
-            <span className="font-bold text-white flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#339A05] animate-ping" />
-              Global Hire 360 AI Interviewer
-            </span>
-            <span className="text-[11px] text-slate-300 font-medium">
-              {session.currentPhase === 'questioning'
-                ? `Attempt ${session.currentQuestionAttempts + 1} of 2`
-                : 'Live Voice Active'}
-            </span>
+      {/* Agent profile */}
+      <main className="flex-1 flex flex-col items-center justify-center px-6 text-center">
+        {misconductBanner && (
+          <div className="mb-8 max-w-md w-full px-4 py-3 rounded-xl bg-red-950/80 border border-red-500/60 text-red-100 text-xs font-semibold flex items-center gap-2.5 text-left">
+            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+            <span>{misconductBanner.message}</span>
           </div>
+        )}
 
-          <LunaVoiceOrb
-            rms={micRms}
-            isSpeaking={speakerState !== 'idle'}
-            speaker={speakerState}
-            logoUrl={LOGO_URL}
-          />
-
-          {/* Current Question Prompt Display */}
-          <div className="w-full bg-[#041E41]/90 border border-white/10 rounded-xl p-4 text-center">
-            <div className="text-[11px] font-bold uppercase tracking-wider text-[#339A05] mb-1">
-              {currentQuestion
-                ? `Question ${currentQuestion.number} (${currentQuestion.category})`
-                : 'Live Greeting'}
-            </div>
-            <p className="text-sm text-slate-100 leading-relaxed">
-              {currentQuestion ? currentQuestion.question : liveCaption}
-            </p>
-          </div>
+        <div
+          className={`w-40 h-40 rounded-full bg-gradient-to-br from-[#339A05] to-[#1f5f03] flex items-center justify-center text-6xl font-extrabold shadow-2xl border-4 transition-colors duration-300 ${
+            sarahSpeaking ? "border-white" : "border-white/15"
+          }`}
+          aria-hidden="true"
+        >
+          S
         </div>
+        <h1 className="mt-6 text-2xl font-bold">Sarah</h1>
+        <p className="text-sm text-slate-300">
+          Operations &amp; Talent Manager · Global Hire 360
+        </p>
 
-        {/* Right Card: Candidate Live Camera Feed */}
-        <div className="bg-[#072957] border border-white/15 rounded-2xl p-6 flex flex-col justify-between min-h-[420px] shadow-lg">
-          <div className="w-full flex items-center justify-between text-xs text-slate-300 mb-3">
-            <span className="font-bold text-white flex items-center gap-2">
-              <Video className="w-4 h-4 text-[#339A05]" />
-              {session.candidateName} (Candidate Camera)
-            </span>
-            <span className="text-[11px] text-emerald-300 font-semibold">
-              {isMicMuted ? 'Microphone Muted' : 'Mic Live — Speak Naturally'}
-            </span>
-          </div>
+        <p
+          className={`mt-6 text-sm font-medium ${
+            isMicMuted ? "text-amber-300" : "text-slate-200"
+          }`}
+          aria-live="polite"
+        >
+          {statusText}
+        </p>
 
-          <div className="relative flex-1 w-full bg-slate-950 rounded-xl overflow-hidden border border-white/10 flex items-center justify-center min-h-[280px]">
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              muted
-              className={`w-full h-full object-cover transform scale-x-[-1] ${
-                isCameraOn ? 'block' : 'hidden'
+        {/* 90-second question timer — appears once the questions start */}
+        {isQuestioning && (
+          <div className="mt-8 w-full max-w-xs">
+            <div className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+              Question {Math.min(totalQuestions, session.currentQuestionIndex + 1)} of{" "}
+              {totalQuestions}
+            </div>
+            <div
+              className={`mt-2 text-5xl font-extrabold tabular-nums ${
+                timerLow ? "text-red-400" : "text-white"
               }`}
-            />
-            {!isCameraOn && (
-              <div className="flex flex-col items-center justify-center text-slate-400">
-                <VideoOff className="w-10 h-10 mb-2" />
-                <span className="text-xs font-medium">Camera Turned Off</span>
-              </div>
-            )}
-
-            {/* Live Candidate Speech Indicator Overlay */}
-            {candidateSpokenBuffer && (
-              <div className="absolute bottom-3 left-3 right-3 bg-slate-950/85 backdrop-blur-md border border-[#339A05]/50 rounded-lg px-3.5 py-2 text-xs text-white">
-                <span className="text-[#339A05] font-bold mr-1.5">You:</span>
-                {candidateSpokenBuffer}
+            >
+              {timerText}
+            </div>
+            <div className="mt-3 h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-1000 ease-linear ${
+                  timerLow ? "bg-red-500" : "bg-[#339A05]"
+                }`}
+                style={{ width: `${(questionSecondsLeft / 90) * 100}%` }}
+              />
+            </div>
+            {timerNotStarted && (
+              <div className="mt-2 text-xs text-slate-400">
+                Starts when Sarah finishes the question
               </div>
             )}
           </div>
+        )}
 
-          {/* Live Voice Controls Bar */}
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={toggleMic}
-                className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
-                  isMicMuted
-                    ? 'bg-red-600 text-white'
-                    : 'bg-white/10 hover:bg-white/20 text-white border border-white/15'
-                }`}
-              >
-                {isMicMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4 text-[#339A05]" />}
-                {isMicMuted ? 'Unmute Mic' : 'Mic On'}
-              </button>
-
-              <button
-                type="button"
-                onClick={toggleCamera}
-                className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
-                  !isCameraOn
-                    ? 'bg-red-600 text-white'
-                    : 'bg-white/10 hover:bg-white/20 text-white border border-white/15'
-                }`}
-              >
-                {isCameraOn ? (
-                  <Video className="w-4 h-4 text-[#339A05]" />
-                ) : (
-                  <VideoOff className="w-4 h-4" />
-                )}
-                {isCameraOn ? 'Camera On' : 'Camera Off'}
-              </button>
-            </div>
-
-            <div className="flex items-center gap-2">
-              {session.currentPhase === 'questioning' && (
-                <button
-                  type="button"
-                  onClick={handleRequestRephrase}
-                  disabled={isProcessingTurn}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-white/10 hover:bg-white/20 border border-white/15 text-xs font-bold text-white transition-colors cursor-pointer"
-                >
-                  <RotateCcw className="w-3.5 h-3.5 text-sky-300" />
-                  Ask to Rephrase
-                </button>
-              )}
-
-              {!usingGeminiLiveWs && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    submitVoiceTurn({
-                      text:
-                        spokenAccumulatorRef.current.trim() ||
-                        candidateSpokenBuffer.trim() ||
-                        "I'm doing great today, thank you! I'm ready for the questions.",
-                    })
-                  }
-                  disabled={isProcessingTurn}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-[#339A05] hover:bg-[#2b8204] text-xs font-bold text-white transition-colors cursor-pointer"
-                >
-                  <Check className="w-3.5 h-3.5" />
-                  {isProcessingTurn ? 'Processing...' : 'Done Speaking'}
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
+        {/* Fallback (no live voice) only: send the answer manually */}
+        {!usingGeminiLiveWs && !isInitializingCall && (
+          <button
+            type="button"
+            onClick={() => {
+              const spoken = mergeSpeechChunksAccurately(
+                spokenAccumulatorRef.current,
+                interimSpeechRef.current,
+              );
+              if (spoken) submitVoiceTurn({ text: spoken });
+            }}
+            disabled={isProcessingTurn || sarahSpeaking}
+            className="mt-8 inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-40 border border-white/15 text-xs font-bold cursor-pointer"
+          >
+            <Check className="w-4 h-4 text-[#339A05]" />
+            {isProcessingTurn ? "Processing…" : "I'm done answering"}
+          </button>
+        )}
       </main>
 
-      {/* Bottom Live Caption Bar */}
-      <footer className="bg-[#031630] border-t border-white/10 px-6 py-3.5">
-        <div className="max-w-4xl mx-auto text-center">
-          <p className="text-xs text-slate-300 truncate">
-            <strong className="text-[#339A05] uppercase tracking-wider mr-2">
-              Live Caption:
-            </strong>
-            {liveCaption || 'Listening to your voice...'}
-          </p>
-        </div>
+      {/* Call controls */}
+      <footer className="px-6 py-8 flex items-center justify-center gap-5">
+        <button
+          type="button"
+          onClick={toggleMic}
+          aria-label={isMicMuted ? "Unmute microphone" : "Mute microphone"}
+          title={isMicMuted ? "Unmute" : "Mute"}
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
+            isMicMuted
+              ? "bg-amber-500 text-white"
+              : "bg-white/10 hover:bg-white/20 text-white border border-white/15"
+          }`}
+        >
+          {isMicMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+        </button>
+        <button
+          type="button"
+          onClick={() => finalizeGeminiLiveCall(false)}
+          disabled={isProcessingTurn && !usingGeminiLiveWs}
+          aria-label="End call"
+          title="End call"
+          className="w-16 h-16 rounded-full bg-red-600 hover:bg-red-500 text-white flex items-center justify-center shadow-lg shadow-red-600/30 transition-colors cursor-pointer"
+        >
+          <PhoneOff className="w-7 h-7" />
+        </button>
       </footer>
     </div>
   );
 };
 
+
 // ============================================================================
-// PAGE 3: SCORING PAGE (/scoring) — Final Verdict, Per-Question Scores (/ 5) & Transcript
+// CHAT-BUBBLE PDF GENERATOR (Generates a valid binary .PDF with chat bubbles)
+// ============================================================================
+function wrapCanvasLines(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+): string[] {
+  const words = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ");
+  const lines: string[] = [];
+  let currentLine = "";
+
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+    if (ctx.measureText(testLine).width <= maxWidth) {
+      currentLine = testLine;
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+  return lines.length > 0 ? lines : [""];
+}
+
+function drawRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function buildMultiPagePdfFromJpegDataUrls(
+  jpegDataUrls: string[],
+  pageWidthPt = 595.28,
+  pageHeightPt = 841.89,
+  pixelWidth = 1190,
+  pixelHeight = 1684,
+): Uint8Array {
+  const jpegBytesList = jpegDataUrls.map((dataUrl) => {
+    const base64 = dataUrl.split(",")[1] || "";
+    const bin = window.atob(base64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      arr[i] = bin.charCodeAt(i);
+    }
+    return arr;
+  });
+
+  const numPages = jpegBytesList.length;
+  // Object IDs:
+  // 1: Catalog
+  // 2: Pages
+  // For page i (0..numPages-1):
+  //   Page object = 3 + i * 3
+  //   Content stream = 4 + i * 3
+  //   Image XObject = 5 + i * 3
+  const totalObjects = 2 + numPages * 3;
+  const chunks: Uint8Array[] = [];
+  const offsets: number[] = new Array(totalObjects + 1).fill(0);
+  let currentOffset = 0;
+
+  const encoder = new TextEncoder();
+  const pushStr = (s: string) => {
+    const bytes = encoder.encode(s);
+    chunks.push(bytes);
+    currentOffset += bytes.byteLength;
+  };
+  const pushBytes = (b: Uint8Array) => {
+    chunks.push(b);
+    currentOffset += b.byteLength;
+  };
+
+  pushStr("%PDF-1.4\n%\xFF\xFF\xFF\xFF\n");
+
+  // 1: Catalog
+  offsets[1] = currentOffset;
+  pushStr("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+  // 2: Pages
+  const kidsRefs = Array.from(
+    { length: numPages },
+    (_, i) => `${3 + i * 3} 0 R`,
+  ).join(" ");
+  offsets[2] = currentOffset;
+  pushStr(
+    `2 0 obj\n<< /Type /Pages /Kids [ ${kidsRefs} ] /Count ${numPages} >>\nendobj\n`,
+  );
+
+  for (let i = 0; i < numPages; i++) {
+    const pageObjId = 3 + i * 3;
+    const contentObjId = 4 + i * 3;
+    const imgObjId = 5 + i * 3;
+    const jpegBytes = jpegBytesList[i];
+
+    // Page object
+    offsets[pageObjId] = currentOffset;
+    pushStr(
+      `${pageObjId} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 ${pageWidthPt.toFixed(
+        2,
+      )} ${pageHeightPt.toFixed(
+        2,
+      )} ] /Resources << /XObject << /Im${i} ${imgObjId} 0 R >> >> /Contents ${contentObjId} 0 R >>\nendobj\n`,
+    );
+
+    // Content stream drawing the full-page image
+    const contentStream = `q\n${pageWidthPt.toFixed(2)} 0 0 ${pageHeightPt.toFixed(
+      2,
+    )} 0 0 cm\n/Im${i} Do\nQ\n`;
+    offsets[contentObjId] = currentOffset;
+    pushStr(
+      `${contentObjId} 0 obj\n<< /Length ${contentStream.length} >>\nstream\n${contentStream}endstream\nendobj\n`,
+    );
+
+    // Image XObject
+    offsets[imgObjId] = currentOffset;
+    pushStr(
+      `${imgObjId} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${pixelWidth} /Height ${pixelHeight} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpegBytes.byteLength} >>\nstream\n`,
+    );
+    pushBytes(jpegBytes);
+    pushStr("\nendstream\nendobj\n");
+  }
+
+  const xrefOffset = currentOffset;
+  pushStr(`xref\n0 ${totalObjects + 1}\n0000000000 65535 f \n`);
+  for (let objId = 1; objId <= totalObjects; objId++) {
+    pushStr(`${String(offsets[objId]).padStart(10, "0")} 00000 n \n`);
+  }
+  pushStr(
+    `trailer\n<< /Size ${totalObjects + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`,
+  );
+
+  const output = new Uint8Array(currentOffset);
+  let pos = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, pos);
+    pos += chunk.byteLength;
+  }
+  return output;
+}
+
+function generateChatBubbleTranscriptPdf(
+  session: InterviewSessionRecord,
+): void {
+  const PAGE_W = 1190;
+  const PAGE_H = 1684;
+  const MARGIN_X = 72;
+  const MAX_BUBBLE_W = 780;
+
+  const canvases: HTMLCanvasElement[] = [];
+  const createPageCanvas = (pageIndex: number) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = PAGE_W;
+    canvas.height = PAGE_H;
+    const ctx = canvas.getContext("2d")!;
+
+    // Page background
+    ctx.fillStyle = "#F8FAFC";
+    ctx.fillRect(0, 0, PAGE_W, PAGE_H);
+
+    // Header Banner on Page 1, compact header on subsequent pages
+    if (pageIndex === 0) {
+      ctx.fillStyle = "#041E41";
+      ctx.fillRect(0, 0, PAGE_W, 195);
+      ctx.fillStyle = "#339A05";
+      ctx.fillRect(0, 195, PAGE_W, 8);
+
+      ctx.fillStyle = "#86EFAC";
+      ctx.font = "bold 20px Inter, Arial, sans-serif";
+      ctx.fillText(
+        "GLOBAL HIRE 360 • INTERVIEW CONVERSATION TRANSCRIPT",
+        MARGIN_X,
+        58,
+      );
+
+      ctx.fillStyle = "#FFFFFF";
+      ctx.font = "bold 34px Inter, Arial, sans-serif";
+      ctx.fillText(
+        `${session.candidateName} — ${session.detectedRole}`,
+        MARGIN_X,
+        108,
+      );
+
+      ctx.fillStyle = "#CBD5E1";
+      ctx.font = "600 22px Inter, Arial, sans-serif";
+      ctx.fillText(
+        `Final Score: ${session.totalScoreOutOf20 ?? session.totalScoreOutOf25} / ${session.maxScore || 20} (${session.percentageScore}%) • ${
+          session.successful ? "PASSED" : "PRACTICE RECOMMENDED"
+        }`,
+        MARGIN_X,
+        152,
+      );
+    } else {
+      ctx.fillStyle = "#041E41";
+      ctx.fillRect(0, 0, PAGE_W, 92);
+      ctx.fillStyle = "#339A05";
+      ctx.fillRect(0, 92, PAGE_W, 5);
+      ctx.fillStyle = "#FFFFFF";
+      ctx.font = "bold 22px Inter, Arial, sans-serif";
+      ctx.fillText(
+        `Global Hire 360 Chat Transcript — ${session.candidateName} (Page ${pageIndex + 1})`,
+        MARGIN_X,
+        56,
+      );
+    }
+
+    canvases.push(canvas);
+    return { canvas, ctx, startY: pageIndex === 0 ? 245 : 135 };
+  };
+
+  let currentPageIndex = 0;
+  let { ctx, startY: cursorY } = createPageCanvas(0);
+
+  for (const item of session.transcript) {
+    const isInterviewer = item.speaker === "interviewer";
+    const speakerLabel = isInterviewer
+      ? "Sarah (Global Hire 360 Hiring Manager)"
+      : `${session.candidateName} (Candidate)`;
+    const timeLabel = new Date(item.timestamp).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    ctx.font = "400 23px Inter, Arial, sans-serif";
+    const textLines = wrapCanvasLines(ctx, item.text, MAX_BUBBLE_W - 56);
+    const lineHeight = 33;
+    const bubbleHeight = 64 + textLines.length * lineHeight + 22;
+
+    if (cursorY + bubbleHeight > PAGE_H - 90) {
+      currentPageIndex += 1;
+      const nextPage = createPageCanvas(currentPageIndex);
+      ctx = nextPage.ctx;
+      cursorY = nextPage.startY;
+    }
+
+    const bubbleX = isInterviewer ? MARGIN_X : PAGE_W - MARGIN_X - MAX_BUBBLE_W;
+
+    // Draw Chat Bubble Box
+    drawRoundedRect(ctx, bubbleX, cursorY, MAX_BUBBLE_W, bubbleHeight, 22);
+    ctx.fillStyle = isInterviewer ? "#FFFFFF" : "#EBF7E3";
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = isInterviewer ? "#CBD5E1" : "#339A05";
+    ctx.stroke();
+
+    // Speaker Name & Timestamp inside Bubble Header
+    ctx.font = "bold 20px Inter, Arial, sans-serif";
+    ctx.fillStyle = isInterviewer ? "#041E41" : "#1E6B03";
+    ctx.fillText(speakerLabel, bubbleX + 28, cursorY + 38);
+
+    ctx.font = "400 18px Inter, Arial, sans-serif";
+    ctx.fillStyle = "#64748B";
+    const timeWidth = ctx.measureText(timeLabel).width;
+    ctx.fillText(
+      timeLabel,
+      bubbleX + MAX_BUBBLE_W - 28 - timeWidth,
+      cursorY + 38,
+    );
+
+    // Spoken Text Lines
+    ctx.font = "400 23px Inter, Arial, sans-serif";
+    ctx.fillStyle = "#0F172A";
+    textLines.forEach((line, i) => {
+      ctx.fillText(line, bubbleX + 28, cursorY + 76 + i * lineHeight);
+    });
+
+    cursorY += bubbleHeight + 26;
+  }
+
+  // Footer on each page
+  canvases.forEach((c, idx) => {
+    const fCtx = c.getContext("2d")!;
+    fCtx.fillStyle = "#64748B";
+    fCtx.font = "500 18px Inter, Arial, sans-serif";
+    fCtx.fillText(
+      `Global Hire 360 • Live Voice AI Interview Transcript • Page ${idx + 1} of ${canvases.length}`,
+      MARGIN_X,
+      PAGE_H - 36,
+    );
+  });
+
+  const jpegUrls = canvases.map((c) => c.toDataURL("image/jpeg", 0.92));
+  const pdfBytes = buildMultiPagePdfFromJpegDataUrls(jpegUrls);
+  const blob = new Blob([pdfBytes as unknown as BlobPart], {
+    type: "application/pdf",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `GlobalHire360_Transcript_${session.candidateName.replace(/\s+/g, "_")}.pdf`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ============================================================================
+// PAGE 3: SCORING PAGE (/scoring) — Short, Simple & Executive B2B Layout
+// 1. Final Score First
+// 2. Mark Attributed to Each Question + Suggested Answer
+// 3. Chat-Bubble Conversation Transcript + Download Transcript in PDF
 // ============================================================================
 interface ScoringPageProps {
   session: InterviewSessionRecord | null;
   onStartNewSession: () => void;
 }
 
-const ScoringPage: React.FC<ScoringPageProps> = ({ session, onStartNewSession }) => {
+const ScoringPage: React.FC<ScoringPageProps> = ({
+  session,
+  onStartNewSession,
+}) => {
   const navigate = useNavigate();
+  const [emailNote, setEmailNote] = useState<string>(
+    session?.emailDeliveryNote || "",
+  );
+  const [emailSentStatus, setEmailSentStatus] = useState<boolean>(
+    Boolean(session?.emailSent),
+  );
+  const [isSendingEmail, setIsSendingEmail] = useState<boolean>(false);
 
   useEffect(() => {
     if (!session) {
-      navigate('/', { replace: true });
+      navigate("/", { replace: true });
+    } else {
+      // The interview is over: nothing left to resume on this device.
+      if (session.currentPhase === "finished") clearActiveSessionAuth();
+      setEmailNote(
+        session.emailDeliveryNote ||
+          `Summary & score sent to ${session.candidateEmail}`,
+      );
+      setEmailSentStatus(Boolean(session.emailSent));
     }
   }, [session, navigate]);
 
+  const uniqueQuestionEvaluations = React.useMemo(() => {
+    if (!session?.questionEvaluations) return [];
+    const map = new Map<number, QuestionEvaluation>();
+    for (const q of session.questionEvaluations) {
+      map.set(q.questionNumber, q);
+    }
+    return Array.from(map.values()).sort(
+      (a, b) => a.questionNumber - b.questionNumber,
+    );
+  }, [session]);
+
   if (!session) return null;
 
-  const handleDownloadTranscript = () => {
-    const lines = [
-      `GLOBAL HIRE 360 — INTERVIEW ASSESSMENT & VOICE TRANSCRIPT`,
-      `Candidate: ${session.candidateName} (${session.candidateEmail})`,
-      `Job Position: ${session.detectedRole}`,
-      `Overall Score: ${session.totalScoreOutOf25} / 25 (${session.percentageScore}%)`,
-      `Verdict: ${session.successful ? 'SUCCESSFUL' : 'UNSUCCESSFUL - PRACTICE FURTHER'}`,
-      ``,
-      `INTERVIEWER FINAL IMPRESSION:`,
-      session.interviewerFinalImpression,
-      ``,
-      `QUESTION BREAKDOWN (/ 5):`,
-      ...session.questionEvaluations.map(
-        (q) =>
-          `Q${q.questionNumber} (${q.category}): ${q.scoreOutOf5}/5\nQuestion: ${q.questionText}\nCandidate Answer: ${q.candidateAnswer}${
-            q.proposedAnswer ? `\nMarking Guide Reference: ${q.proposedAnswer}` : ''
-          }\nFeedback: ${q.feedback}\n`
-      ),
-      `FULL VOICE TRANSCRIPT:`,
-      ...session.transcript.map(
-        (t) => `[${new Date(t.timestamp).toLocaleTimeString()}] ${t.speakerName}: ${t.text}`
-      ),
-    ];
+  const candidateAvatarUrl = findCandidateProfilePicture(
+    session.candidateEmail,
+    session.candidateName,
+    session.candidateGoogleAvatarUrl,
+  );
 
-    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `GlobalHire360_Transcript_${session.candidateName.replace(/\s+/g, '_')}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleResendEmail = async () => {
+    setIsSendingEmail(true);
+    try {
+      const res = await fetch(
+        `/api/session/${encodeURIComponent(session.id)}/send-email`,
+        {
+          method: "POST",
+          headers: sessionHeaders(),
+        },
+      );
+      const data = await res.json();
+      if (data.note) {
+        setEmailNote(data.note);
+      }
+      setEmailSentStatus(Boolean(data.sent));
+    } catch {
+      setEmailNote(
+        "Could not trigger Resend email delivery. Please try again.",
+      );
+    } finally {
+      setIsSendingEmail(false);
+    }
   };
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-900 pb-14">
-      {/* Header */}
+      {/* Clean Executive Header */}
       <header className="bg-white border-b border-slate-200">
-        <div className="max-w-4xl mx-auto px-6 py-4 flex items-center justify-between">
+        <div className="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <img
               src={LOGO_URL}
@@ -1633,7 +2865,7 @@ const ScoringPage: React.FC<ScoringPageProps> = ({ session, onStartNewSession })
             />
             <div>
               <span className="block text-sm font-extrabold text-[#041E41]">
-                Interview Assessment Results
+                Interview Scorecard
               </span>
               <span className="block text-xs text-slate-500">
                 {session.candidateName} &bull; {session.detectedRole}
@@ -1645,156 +2877,217 @@ const ScoringPage: React.FC<ScoringPageProps> = ({ session, onStartNewSession })
             type="button"
             onClick={() => {
               onStartNewSession();
-              navigate('/');
+              navigate("/");
             }}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#041E41] hover:bg-[#062d61] text-white text-xs font-bold transition-colors cursor-pointer"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#339A05] hover:bg-[#2b8204] text-white text-xs font-bold transition-colors cursor-pointer"
           >
-            Start New Interview
+            <RotateCcw className="w-3.5 h-3.5" />
+            Retake Practice Interview
           </button>
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto px-6 pt-8 space-y-6">
-        {/* Overall Verdict & Score Banner */}
-        <section className="bg-[#041E41] text-white rounded-2xl p-6 sm:p-8 shadow-sm border-b-4 border-[#339A05]">
+      <main className="max-w-3xl mx-auto px-6 pt-7 space-y-6">
+        {/* 1. FINAL SCORE FIRST */}
+        <section className="bg-[#041E41] text-white rounded-2xl p-6 sm:p-7 shadow-sm border-b-4 border-[#339A05]">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-6">
             <div className="space-y-2">
               <span
                 className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-extrabold uppercase tracking-wider ${
                   session.successful
-                    ? 'bg-[#339A05] text-white'
-                    : 'bg-amber-500 text-slate-950'
+                    ? "bg-[#339A05] text-white"
+                    : "bg-amber-500 text-slate-950"
                 }`}
               >
                 <Award className="w-4 h-4" />
                 {session.successful
-                  ? 'Successful — Ready for Placement'
-                  : 'Unsuccessful — Practice Recommended'}
+                  ? "Passed Assessment"
+                  : "Practice Recommended"}
               </span>
-              <h1 className="text-2xl font-extrabold tracking-tight">
-                {session.candidateName} — {session.detectedRole}
+              <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight">
+                {session.successful
+                  ? `Great job, ${session.candidateName}!`
+                  : `Good effort, ${session.candidateName}!`}
               </h1>
-              <p className="text-sm text-slate-200 leading-relaxed max-w-2xl">
+              <p className="text-xs sm:text-sm text-slate-200 leading-relaxed max-w-xl">
                 {session.interviewerFinalImpression}
               </p>
             </div>
 
-            <div className="bg-white/10 border border-white/15 rounded-xl p-5 text-center shrink-0 min-w-[150px]">
-              <div className="text-xs uppercase font-bold text-slate-300">Overall Score</div>
-              <div className="text-3xl font-black text-white mt-1">
-                {session.totalScoreOutOf25}{' '}
-                <span className="text-lg font-normal text-slate-300">/ 25</span>
+            <div className="bg-white/10 border border-white/15 rounded-xl p-5 text-center shrink-0 min-w-[155px]">
+              <div className="text-[11px] uppercase font-bold tracking-wider text-slate-300">
+                Final Score
               </div>
-              <div className="text-xs font-bold text-[#339A05] mt-1">
-                {session.percentageScore}% Performance
+              <div className="text-3xl font-black text-white mt-1">
+                {session.totalScoreOutOf20 ?? session.totalScoreOutOf25}{" "}
+                <span className="text-lg font-normal text-slate-300">
+                  / {session.maxScore || 20}
+                </span>
+              </div>
+              <div className="text-xs font-bold text-[#86EFAC] mt-1">
+                {session.percentageScore}% Overall
               </div>
             </div>
           </div>
 
-          {/* Email & Database Status Strip */}
+          {/* Concise Email Summary Confirmation */}
           <div className="mt-5 pt-4 border-t border-white/10 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-300">
             <div className="flex items-center gap-2">
               <Mail className="w-4 h-4 text-[#339A05]" />
-              <span>{session.emailDeliveryNote || `Results prepared for ${session.candidateEmail}`}</span>
+              <span>{emailNote}</span>
             </div>
             <button
               type="button"
-              onClick={handleDownloadTranscript}
-              className="inline-flex items-center gap-1.5 text-xs font-bold text-white hover:text-[#339A05] transition-colors cursor-pointer"
+              onClick={handleResendEmail}
+              disabled={isSendingEmail}
+              className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-300 hover:text-white disabled:opacity-50 transition-colors cursor-pointer"
             >
-              <Download className="w-4 h-4" />
-              Download Transcript (.TXT)
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${isSendingEmail ? "animate-spin" : ""}`}
+              />
+              {isSendingEmail
+                ? "Sending Email..."
+                : emailSentStatus
+                  ? "Resend Summary Email"
+                  : "Send Summary Email"}
             </button>
           </div>
         </section>
 
-        {/* Per-Question Scores (/ 5) */}
+        {/* 2. MARK ATTRIBUTED TO EACH QUESTION + SUGGESTED ANSWER */}
         <section className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
-          <h2 className="text-base font-extrabold text-[#041E41] border-b border-slate-100 pb-3">
-            Question-by-Question Marking Guide Evaluation (0 to 5 Scale)
-          </h2>
+          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+            <h2 className="text-base font-extrabold text-[#041E41]">
+              Question Marks &amp; Suggested Answers
+            </h2>
+            <span className="text-xs font-semibold text-slate-500">
+              {session.questions?.length || 4} Questions (0–5 pts each)
+            </span>
+          </div>
 
           <div className="space-y-4">
-            {session.questionEvaluations.map((q) => {
-              const pct = Math.round((q.scoreOutOf5 / 5) * 100);
-              return (
-                <div
-                  key={q.questionId}
-                  className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 space-y-2.5"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-extrabold uppercase tracking-wider text-[#041E41]">
-                      Question {q.questionNumber}: {q.category}
-                    </span>
-                    <span
-                      className={`px-2.5 py-1 rounded-md text-xs font-extrabold text-white ${
-                        q.scoreOutOf5 >= 3.5 ? 'bg-[#339A05]' : 'bg-[#041E41]'
-                      }`}
-                    >
-                      {q.scoreOutOf5} / 5
-                    </span>
-                  </div>
-
-                  {/* Progress Bar */}
-                  <div className="w-full h-2 rounded-full bg-slate-200 overflow-hidden">
-                    <div
-                      className={`h-full rounded-full ${
-                        q.scoreOutOf5 >= 3.5 ? 'bg-[#339A05]' : 'bg-[#041E41]'
-                      }`}
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-
-                  <p className="text-sm font-semibold text-slate-800">{q.questionText}</p>
-                  <p className="text-xs text-slate-700">
-                    <strong>Candidate Response:</strong> {q.candidateAnswer}
-                  </p>
-                  {q.proposedAnswer && (
-                    <div className="text-xs text-slate-700 bg-[#339A05]/10 border border-[#339A05]/25 p-2.5 rounded-lg">
-                      <strong className="text-[#041E41]">Marking Guide Reference Answer:</strong>{' '}
-                      {q.proposedAnswer}
-                    </div>
-                  )}
-                  <p className="text-xs text-[#041E41] bg-white p-2.5 rounded-lg border border-slate-200">
-                    <strong>Interviewer Feedback:</strong> {q.feedback}
-                  </p>
+            {uniqueQuestionEvaluations.map((q, idx) => (
+              <div
+                key={`${q.questionId || "q"}-${q.questionNumber}-${idx}`}
+                className="p-4 rounded-xl border border-slate-200 bg-slate-50/50 space-y-2.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-extrabold uppercase tracking-wider text-[#041E41]">
+                    Question {q.questionNumber} &bull; {q.category}
+                  </span>
+                  <span
+                    className={`px-2.5 py-1 rounded-md text-xs font-extrabold text-white ${
+                      q.scoreOutOf5 >= 3.5 ? "bg-[#339A05]" : "bg-[#041E41]"
+                    }`}
+                  >
+                    Mark: {q.scoreOutOf5} / 5
+                  </span>
                 </div>
-              );
-            })}
+
+                <p className="text-sm font-bold text-slate-900">
+                  {q.questionText}
+                </p>
+
+                <div className="text-xs text-slate-700 bg-white p-3 rounded-lg border border-slate-200">
+                  <strong className="text-slate-900 block mb-0.5">
+                    Your Answer:
+                  </strong>
+                  {q.candidateAnswer}
+                </div>
+
+                <div className="text-xs text-slate-800 bg-[#339A05]/10 border border-[#339A05]/25 p-3 rounded-lg">
+                  <strong className="text-[#041E41] block mb-0.5">
+                    Suggested Answer:
+                  </strong>
+                  {q.proposedAnswer || q.improvementTip}
+                </div>
+              </div>
+            ))}
           </div>
         </section>
 
-        {/* Full Voice Call Transcript */}
+        {/* 3. CONVERSATION TRANSCRIPT IN CHAT BUBBLES + DOWNLOAD TRANSCRIPT IN PDF */}
         <section className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
-          <h2 className="text-base font-extrabold text-[#041E41] border-b border-slate-100 pb-3">
-            Full Interview Voice Transcript
-          </h2>
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+            <div>
+              <h2 className="text-base font-extrabold text-[#041E41]">
+                Interview Conversation Transcript
+              </h2>
+              <p className="text-xs text-slate-500">
+                Full dialogue between Sarah (AI Hiring Manager) and{" "}
+                {session.candidateName}
+              </p>
+            </div>
 
-          <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
-            {session.transcript.map((item) => (
-              <div
-                key={item.id}
-                className={`p-3.5 rounded-xl border text-xs leading-relaxed ${
-                  item.speaker === 'interviewer'
-                    ? 'bg-slate-50 border-slate-200 text-slate-800'
-                    : 'bg-[#339A05]/10 border-[#339A05]/30 text-slate-900'
-                }`}
-              >
-                <div className="flex items-center justify-between font-bold mb-1">
-                  <span
-                    className={
-                      item.speaker === 'interviewer' ? 'text-[#041E41]' : 'text-[#339A05]'
-                    }
+            <button
+              type="button"
+              onClick={() => generateChatBubbleTranscriptPdf(session)}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#041E41] hover:bg-[#062d61] text-white text-xs font-bold shadow-xs transition-colors cursor-pointer"
+            >
+              <Download className="w-4 h-4 text-[#86EFAC]" />
+              Download Transcript (PDF)
+            </button>
+          </div>
+
+          {/* Chat Bubbles Container */}
+          <div className="space-y-4 max-h-[480px] overflow-y-auto p-3 rounded-xl bg-slate-50 border border-slate-200/80">
+            {session.transcript.map((item, idx) => {
+              const isInterviewer = item.speaker === "interviewer";
+              return (
+                <div
+                  key={`${item.id || "tr"}-${idx}`}
+                  className={`flex items-start gap-3 ${
+                    isInterviewer ? "justify-start" : "justify-end"
+                  }`}
+                >
+                  {isInterviewer && (
+                    <div className="w-8 h-8 rounded-full bg-[#041E41] text-white font-bold text-xs flex items-center justify-center shrink-0 mt-0.5 shadow-xs">
+                      S
+                    </div>
+                  )}
+
+                  <div
+                    className={`max-w-[80%] rounded-2xl px-4 py-3 text-xs leading-relaxed shadow-2xs ${
+                      isInterviewer
+                        ? "bg-white border border-slate-200 text-slate-800 rounded-tl-xs"
+                        : "bg-[#041E41] text-white rounded-tr-xs"
+                    }`}
                   >
-                    {item.speakerName}
-                  </span>
-                  <span className="text-[11px] font-normal text-slate-400">
-                    {new Date(item.timestamp).toLocaleTimeString()}
-                  </span>
+                    <div className="flex items-center justify-between gap-4 mb-1">
+                      <span
+                        className={`font-extrabold text-[11px] ${
+                          isInterviewer ? "text-[#041E41]" : "text-[#86EFAC]"
+                        }`}
+                      >
+                        {isInterviewer
+                          ? "Sarah (Hiring Manager)"
+                          : session.candidateName}
+                      </span>
+                      <span
+                        className={`text-[10px] ${
+                          isInterviewer ? "text-slate-400" : "text-slate-300"
+                        }`}
+                      >
+                        {new Date(item.timestamp).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </span>
+                    </div>
+                    <p className="whitespace-pre-wrap">{item.text}</p>
+                  </div>
+
+                  {!isInterviewer && (
+                    <img
+                      src={candidateAvatarUrl}
+                      alt={session.candidateName}
+                      referrerPolicy="no-referrer"
+                      className="w-8 h-8 rounded-full object-cover border border-[#339A05] shrink-0 mt-0.5 bg-[#041E41]"
+                    />
+                  )}
                 </div>
-                <p>{item.text}</p>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       </main>
@@ -1806,8 +3099,10 @@ const ScoringPage: React.FC<ScoringPageProps> = ({ session, onStartNewSession })
 // ROOT ROUTER APP — Routes: / (Homepage), /interview (Interview Room), /scoring (Scoring Page)
 // ============================================================================
 export default function App() {
-  const [activeSession, setActiveSession] = useState<InterviewSessionRecord | null>(null);
-  const [initialInterviewerMessage, setInitialInterviewerMessage] = useState<string>('');
+  const [activeSession, setActiveSession] =
+    useState<InterviewSessionRecord | null>(null);
+  const [initialInterviewerMessage, setInitialInterviewerMessage] =
+    useState<string>("");
   const [liveWsAvailable, setLiveWsAvailable] = useState<boolean>(false);
 
   return (
@@ -1845,7 +3140,7 @@ export default function App() {
               session={activeSession}
               onStartNewSession={() => {
                 setActiveSession(null);
-                setInitialInterviewerMessage('');
+                setInitialInterviewerMessage("");
               }}
             />
           }
