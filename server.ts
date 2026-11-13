@@ -35,7 +35,7 @@ dotenv.config();
 
 const app = express();
 const httpServer = http.createServer(app);
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // ============================================================================
 // 0. BACKEND SECURITY: headers, body limits, rate limiting, admin & session auth
@@ -8457,8 +8457,9 @@ async function startServer() {
     clientWs.on('close', () => shutdown());
   });
 
-  // Bind port 3000 immediately so container health checks succeed without delay
-  httpServer.listen(PORT, '0.0.0.0', () => {
+  // Vercel invokes the exported Express handler directly. Only bind a port when
+  // running as a standalone server (local development or a regular container).
+  if (!process.env.VERCEL) httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Global Hire 360 Server running on http://localhost:${PORT}`);
     // Automatically provision & seed Supabase tables on startup when credentials are configured
     const resendKey = (process.env.RESEND_API_KEY || '').trim();
@@ -8516,5 +8517,5 @@ async function startServer() {
   }
 }
 
-export default httpServer;
+export default app;
 startServer();
