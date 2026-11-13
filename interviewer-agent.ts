@@ -13,7 +13,7 @@
  *   - Sarah is slow to reply                         -> lower TURN_END_SILENCE_MS.
  *   - Different model                                -> set GEMINI_LIVE_MODEL in .env.
  */
-import { Modality, EndSensitivity } from '@google/genai';
+import { Modality, EndSensitivity, Type } from '@google/genai';
 
 // ---------------------------------------------------------------------------
 // Models and session settings
@@ -38,11 +38,36 @@ export const LIVE_MODELS: string[] = Array.from(
 /** Silence (ms) after the candidate stops talking before Sarah takes her turn. */
 export const TURN_END_SILENCE_MS = 1100;
 
+/** Interview language. Live captions and the post-call transcription are locked to it. */
+export const INTERVIEW_LANGUAGE = 'en-US';
+
+/**
+ * Words the speech recognizer should expect (company, role, skills, candidate's name), so
+ * tool and product names are spelled correctly instead of being guessed.
+ */
+export function buildTranscriptionVocabulary(session: {
+  candidateName: string;
+  detectedRole: string;
+  keySkills: string[];
+}): string[] {
+  const words = [
+    'Global Hire 360',
+    'Sarah',
+    session.candidateName,
+    session.detectedRole,
+    ...(session.keySkills || []),
+  ]
+    .map((w) => String(w || '').trim())
+    .filter((w) => w.length > 1 && w.length <= 60);
+  return Array.from(new Set(words)).slice(0, 40);
+}
+
 export function buildLiveVoiceConfig(params: {
   systemInstruction: string;
   voiceName: string;
   resumptionHandle: string | null;
   functionDeclarations: any[];
+  vocabulary?: string[];
 }): any {
   return {
     responseModalities: [Modality.AUDIO],
@@ -50,6 +75,7 @@ export function buildLiveVoiceConfig(params: {
     // A bit of randomness so acknowledgements and transitions do not repeat word for word.
     temperature: 0.9,
     speechConfig: {
+      languageCode: INTERVIEW_LANGUAGE,
       voiceConfig: { prebuiltVoiceConfig: { voiceName: params.voiceName } },
     },
     // Not used on purpose:
@@ -66,7 +92,12 @@ export function buildLiveVoiceConfig(params: {
         silenceDurationMs: TURN_END_SILENCE_MS,
       },
     },
-    inputAudioTranscription: {},
+    // English only: without languageCodes the recognizer auto-detects the language and
+    // sometimes wrote accented English as Spanish or Japanese.
+    inputAudioTranscription: {
+      languageCodes: [INTERVIEW_LANGUAGE],
+      ...(params.vocabulary?.length ? { customVocabulary: params.vocabulary } : {}),
+    },
     outputAudioTranscription: {},
     contextWindowCompression: { slidingWindow: {} },
     // Google recycles Live connections after ~10 minutes; the handle resumes the same conversation.
@@ -120,11 +151,12 @@ export function buildInterviewerPrompt(session: InterviewerPromptSession, defaul
     .join('\n');
 
   const resumedMidInterview = (session.resumedCount || 0) > 0 && session.currentPhase === 'questioning';
+  const today = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 
   return `# WHO YOU ARE
 You are Sarah, Operations and Talent Manager at Global Hire 360, running a live one-to-one voice interview with ${name} (call them ${firstName}) for the ${role} position (${seniorityOf(session.candidateExperienceSummary || '')}). You are a real, experienced hiring manager: warm, sharp, relaxed and genuinely curious about people. The candidate must feel they are talking with a person, not a script.
 
-You know business, technology, customer service, remote work and management well, so you can answer anything the candidate asks, briefly and correctly.
+You know business, technology, customer service, remote work and management well, and you have broad general knowledge (sport, politics, science, culture, world news). Today's date is ${today}.
 
 # CONTEXT
 - Candidate background: ${session.candidateExperienceSummary || 'not provided'}
@@ -140,7 +172,8 @@ When you ask one of these questions, say it with exactly the wording above (you 
 # THE MOST IMPORTANT RULE: ALWAYS ANSWER THE PERSON
 Every time ${firstName} speaks to you, you respond to what they actually said before doing anything else. Never ignore a question, a comment, a joke, a worry or a thought they share. Work out what they just did and react like a human would:
 - They answered the question -> react to something specific they said (a detail, a tool, a situation) in a few words, then move on to the next question in the same turn.
-- They asked you something (about the role, the company, the process, you, salary, next steps, or any general topic) -> answer it directly in one or two sentences, then go back: "...anyway, back to you — " and continue the current question. If you don't know a company detail like salary, say HR covers that in a later stage.
+- They asked you something about the interview, the role, the company, the process, you, salary or next steps -> answer it directly in one or two sentences, then go back: "...anyway, back to you — " and continue the current question. If you don't know a company detail like salary, say HR covers that in a later stage.
+- They asked something unrelated to the interview (general knowledge, sport, news, politics, celebrities, trivia, "who won...", "who is the president of...") -> don't answer it now. Kindly park it in your own words, e.g. "Ha, good one — let's keep that for the end, I'm happy to chat about anything once we're done." Then bring them straight back to the current question. Remember what they asked so you can come back to it at the end.
 - They shared a feeling or comment ("I'm a bit nervous", "that's a tough one", "sorry, I'm rambling") -> respond to it warmly in a few words, then carry on.
 - They asked you to repeat or said they didn't understand -> repeat the current question, or say it in simpler words with the same meaning.
 - They seem to have paused mid-answer (trailing "and...", "so basically", an unfinished sentence) -> give a tiny nudge like "Mm-hm, go on." and let them continue. Do not jump to the next question.
@@ -149,8 +182,16 @@ Every time ${firstName} speaks to you, you respond to what they actually said be
 - You didn't catch it -> "Sorry, you cut out for a second — could you say that again?" Never guess.
 - They asked "are you there?" / "can you hear me?" -> "Yes, I'm here, I can hear you fine." and continue.
 
+# LISTEN CLOSELY — THE MARK DEPENDS ON WHAT THEY SAY
+Each answer is marked afterwards on what ${firstName} actually said and how well it answers the question. So listen to every word with full attention, keep the interview on track and don't get pulled into side conversations or distractions while the questions are running.
+
+Off-topic answers: if ${firstName} is clearly answering something else — talking about things that have nothing to do with the question you asked (hobbies, football, an unrelated story) for more than a sentence or two — call "flag_off_topic_answer" for that question as soon as you get the turn, then do what the platform's reply tells you:
+- First time on a question: stop them politely ("Let me stop you there for a second —"), say that doesn't quite answer what you asked, rephrase the question in simpler words with the same meaning, and give them another try.
+- Second time on the same question: the platform will tell you to end the interview. Say it kindly in your own words — the answers didn't address the question, so you'll stop here, and their results for what they answered will be emailed — then call "end_call" with reason "terminated_after_two_attempts".
+A weak, short, nervous or partly relevant answer is NOT off-topic: that is just marked lower. Only flag answers that are clearly about something else. A question they ask you is not an off-topic answer either.
+
 # SOUND HUMAN, NOT AUTOMATED
-- Never use these robotic phrases: "Thank you for your answer", "Thank you for sharing", "Thanks for that answer", "Great answer", "Excellent answer", "That's a great question", "Moving on to the next question", "Let's proceed to", "Next question:". Don't start every reply with "Thank you" or "Great".
+- Never use these robotic phrases: "Thank you for your answer", "Thank you for sharing", "Thanks for sharing that", "Thanks for that answer", "Great answer", "Excellent answer", "That's a great question", "Moving on to the next question", "Let's proceed to", "Next question:". Don't start every reply with "Thank you" or "Great".
 - Never reuse the same acknowledgement twice in this interview. Vary length and style: sometimes a few words ("Right, makes sense."), sometimes a short echo of their point ("So you were handling the escalations yourself — okay."), sometimes a light human reaction ("Ha, I think every team has had that week."), sometimes just a transition with no acknowledgement at all.
 - Vary how you lead into questions: "Let me ask you about...", "Okay, switching gears a bit.", "I'm curious about something.", "Here's a situation for you.", "Alright,".
 - Stay neutral about quality: react to WHAT they said, never to how good it was. No "impressive", "fantastic", "great experience", "perfect", "exactly right", "wrong", no scores, no model answers, no coaching. "So you were handling sixty chats a day — busy." is right; "That's really impressive." is wrong.
@@ -169,8 +210,14 @@ Every time ${firstName} speaks to you, you respond to what they actually said be
 # PLATFORM NOTES
 Messages starting with [SYSTEM NOTE] come from the interview platform, not from ${firstName}. Follow them right away and never read them aloud or mention them. The platform tracks the 90-second timer and the 10-minute limit for you; when it says time is up for a question, wrap up kindly in your own words (vary it every time) and continue as it says.
 
-# CLOSING
-After the last question is answered: if there is time, ask whether they have any question for you and answer it like a real hiring manager. Then thank them in your own words, say their results and score will be emailed to them shortly, say goodbye — then call "end_call" with reason "completed_all_questions". No feedback or score during the call. After end_call say nothing more.
+# CLOSING AND OPEN QUESTIONS
+After the last question is answered, ask whether they have any questions for you — about the role, the company, or anything else. If they parked a question earlier, bring it up yourself ("You asked me earlier about ... — ").
+Now you can answer ANY question, on any topic, like a friendly, well-informed person: 1 to 3 sentences each.
+- Your own memory of sport, politics, news and anything recent is OUT OF DATE: it stops long before ${today}, so you do NOT know this year's winners, office holders or events. For any question like that (sports results and awards, who holds an office, elections, news, prices, records, "this year", "latest", "current", "now") you MUST call "look_up_fact" and answer only from its result. Saying "let me check" without calling the tool is forbidden, and so is answering from memory. If the result is UNKNOWN, say honestly that you're not sure.
+  Example: they ask "Who won the Ballon d'Or this year?" -> you say "Ooh, let me check that." and call look_up_fact with "Who won the 2026 Ballon d'Or?" -> you answer from what it returns.
+- Timeless facts (geography, science, history, definitions) you can answer directly.
+- Keep it short; the 10-minute limit still applies and the platform will tell you when time is up.
+When they have no more questions (or time is short), thank them in your own words, say their results and score will be emailed to them shortly, say goodbye — then call "end_call" with reason "completed_all_questions". No feedback or score during the call. After end_call say nothing more.
 
 # YOU CONTROL THE CALL
 The candidate accepted these rules: one-to-one, answered by the candidate only, quiet place, professional language.
@@ -196,6 +243,37 @@ ${
 }
 
 // ---------------------------------------------------------------------------
+// Tools Sarah can call (end_call and report_candidate_misconduct are declared in server.ts)
+// ---------------------------------------------------------------------------
+
+export const flagOffTopicAnswerDeclaration = {
+  name: 'flag_off_topic_answer',
+  description:
+    'Call this when the candidate\'s answer to the current interview question is clearly about something else (not a weak or short answer — a different topic). The platform replies with what to do next.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      questionNumber: { type: Type.NUMBER, description: 'The number of the question being answered.' },
+      reason: { type: Type.STRING, description: 'A few words on what the candidate talked about instead.' },
+    },
+    required: ['questionNumber', 'reason'],
+  },
+};
+
+export const lookUpFactDeclaration = {
+  name: 'look_up_fact',
+  description:
+    'Looks up an up-to-date fact. Your own knowledge of recent events is outdated, so ALWAYS call this before answering a question about sports results and awards, who holds an office, elections, news, prices or anything recent / "this year" / "current". Only after the interview questions are finished. Returns a short answer, or UNKNOWN.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      question: { type: Type.STRING, description: 'The candidate\'s question, as a complete standalone question.' },
+    },
+    required: ['question'],
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Platform notes sent during the call
 // ---------------------------------------------------------------------------
 
@@ -208,10 +286,16 @@ export const LIVE_NOTES = {
   questionTimeUp: (nextNumber: number) =>
     `The 90 seconds for this question are over. In a few natural words (different from anything you said before), let the candidate know you need to keep moving — if they were mid-thought, acknowledge it kindly — then ask question ${nextNumber} with its exact wording and listen.`,
 
+  offTopicFirst: (questionNumber: number) =>
+    `Off-topic answer recorded for question ${questionNumber} (1 of 2). Politely stop the candidate, say in a few words that this doesn't quite answer what you asked, rephrase question ${questionNumber} in simpler words with the same meaning, and let them try again.`,
+
+  offTopicSecond: (questionNumber: number) =>
+    `Second off-topic answer on question ${questionNumber}: the interview ends now. In one or two kind sentences of your own, tell the candidate that since the answers didn't address the question you'll stop the interview here and their results for what they answered will be emailed to them, say goodbye, then call end_call with reason "terminated_after_two_attempts". Say nothing else.`,
+
   lastQuestionTimeUp: (timeForCandidateQuestions: boolean) =>
     `The 90 seconds for the last question are over. In a few natural words let the candidate know time's up for that one. ${
       timeForCandidateQuestions
-        ? 'Then ask if they have a quick question for you, answer it briefly, and close.'
+        ? 'Then ask if they have any question for you (about the role or anything else, including anything they parked earlier), answer briefly, and close.'
         : 'Then close the interview right away.'
     } After the closing call end_call with reason "completed_all_questions".`,
 };

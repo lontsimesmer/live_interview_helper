@@ -97,6 +97,7 @@ import {
   Download,
   ArrowRight,
   RotateCcw,
+  ChevronDown,
 } from "lucide-react";
 
 const LOGO_URL =
@@ -2789,10 +2790,6 @@ const ScoringPage: React.FC<ScoringPageProps> = ({
   const [emailNote, setEmailNote] = useState<string>(
     session?.emailDeliveryNote || "",
   );
-  const [emailSentStatus, setEmailSentStatus] = useState<boolean>(
-    Boolean(session?.emailSent),
-  );
-  const [isSendingEmail, setIsSendingEmail] = useState<boolean>(false);
 
   useEffect(() => {
     if (!session) {
@@ -2800,11 +2797,13 @@ const ScoringPage: React.FC<ScoringPageProps> = ({
     } else {
       // The interview is over: nothing left to resume on this device.
       if (session.currentPhase === "finished") clearActiveSessionAuth();
+      // The results email is sent once, automatically, when the interview ends.
       setEmailNote(
         session.emailDeliveryNote ||
-          `Summary & score sent to ${session.candidateEmail}`,
+          (session.emailSent
+            ? `Your results were emailed to ${session.candidateEmail}.`
+            : `Your results will be emailed to ${session.candidateEmail}.`),
       );
-      setEmailSentStatus(Boolean(session.emailSent));
     }
   }, [session, navigate]);
 
@@ -2826,30 +2825,6 @@ const ScoringPage: React.FC<ScoringPageProps> = ({
     session.candidateName,
     session.candidateGoogleAvatarUrl,
   );
-
-  const handleResendEmail = async () => {
-    setIsSendingEmail(true);
-    try {
-      const res = await fetch(
-        `/api/session/${encodeURIComponent(session.id)}/send-email`,
-        {
-          method: "POST",
-          headers: sessionHeaders(),
-        },
-      );
-      const data = await res.json();
-      if (data.note) {
-        setEmailNote(data.note);
-      }
-      setEmailSentStatus(Boolean(data.sent));
-    } catch {
-      setEmailNote(
-        "Could not trigger Resend email delivery. Please try again.",
-      );
-    } finally {
-      setIsSendingEmail(false);
-    }
-  };
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-900 pb-14">
@@ -2904,12 +2879,7 @@ const ScoringPage: React.FC<ScoringPageProps> = ({
                   ? "Passed Assessment"
                   : "Practice Recommended"}
               </span>
-              <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight">
-                {session.successful
-                  ? `Great job, ${session.candidateName}!`
-                  : `Good effort, ${session.candidateName}!`}
-              </h1>
-              <p className="text-xs sm:text-sm text-slate-200 leading-relaxed max-w-xl">
+              <p className="text-base sm:text-lg font-bold leading-snug max-w-xl">
                 {session.interviewerFinalImpression}
               </p>
             </div>
@@ -2931,104 +2901,108 @@ const ScoringPage: React.FC<ScoringPageProps> = ({
           </div>
 
           {/* Concise Email Summary Confirmation */}
-          <div className="mt-5 pt-4 border-t border-white/10 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-300">
-            <div className="flex items-center gap-2">
-              <Mail className="w-4 h-4 text-[#339A05]" />
-              <span>{emailNote}</span>
-            </div>
-            <button
-              type="button"
-              onClick={handleResendEmail}
-              disabled={isSendingEmail}
-              className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-300 hover:text-white disabled:opacity-50 transition-colors cursor-pointer"
-            >
-              <RefreshCw
-                className={`w-3.5 h-3.5 ${isSendingEmail ? "animate-spin" : ""}`}
-              />
-              {isSendingEmail
-                ? "Sending Email..."
-                : emailSentStatus
-                  ? "Resend Summary Email"
-                  : "Send Summary Email"}
-            </button>
+          <div className="mt-5 pt-4 border-t border-white/10 flex items-center gap-2 text-xs text-slate-300">
+            <Mail className="w-4 h-4 text-[#339A05] shrink-0" />
+            <span>{emailNote}</span>
           </div>
         </section>
 
-        {/* 2. MARK ATTRIBUTED TO EACH QUESTION + SUGGESTED ANSWER */}
+        {/* 2. MARK PER QUESTION (OUT OF 5, WITH PROGRESS BAR) + SUGGESTED ANSWER */}
         <section className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <h2 className="text-base font-extrabold text-[#041E41]">
-              Question Marks &amp; Suggested Answers
+              Your Marks &amp; Suggested Answers
             </h2>
             <span className="text-xs font-semibold text-slate-500">
-              {session.questions?.length || 4} Questions (0–5 pts each)
+              {uniqueQuestionEvaluations.length} questions &bull; 5 pts each
             </span>
           </div>
 
           <div className="space-y-4">
-            {uniqueQuestionEvaluations.map((q, idx) => (
-              <div
-                key={`${q.questionId || "q"}-${q.questionNumber}-${idx}`}
-                className="p-4 rounded-xl border border-slate-200 bg-slate-50/50 space-y-2.5"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-extrabold uppercase tracking-wider text-[#041E41]">
+            {uniqueQuestionEvaluations.map((q, idx) => {
+              const score = Math.max(0, Math.min(5, Number(q.scoreOutOf5) || 0));
+              const pct = (score / 5) * 100;
+              const barColor =
+                score >= 3.5
+                  ? "bg-[#339A05]"
+                  : score >= 2
+                    ? "bg-amber-500"
+                    : "bg-red-500";
+              return (
+                <div
+                  key={`${q.questionId || "q"}-${q.questionNumber}-${idx}`}
+                  className="p-4 rounded-xl border border-slate-200 bg-slate-50/50 space-y-3"
+                >
+                  <span className="block text-xs font-extrabold uppercase tracking-wider text-[#041E41]">
                     Question {q.questionNumber} &bull; {q.category}
                   </span>
-                  <span
-                    className={`px-2.5 py-1 rounded-md text-xs font-extrabold text-white ${
-                      q.scoreOutOf5 >= 3.5 ? "bg-[#339A05]" : "bg-[#041E41]"
-                    }`}
-                  >
-                    Mark: {q.scoreOutOf5} / 5
-                  </span>
-                </div>
+                  <p className="text-sm font-bold text-slate-900">
+                    {q.questionText}
+                  </p>
 
-                <p className="text-sm font-bold text-slate-900">
-                  {q.questionText}
-                </p>
+                  <div className="flex items-center gap-3">
+                    <div
+                      className="flex-1 h-2.5 rounded-full bg-slate-200 overflow-hidden"
+                      role="progressbar"
+                      aria-label={`Question ${q.questionNumber} mark`}
+                      aria-valuemin={0}
+                      aria-valuemax={5}
+                      aria-valuenow={score}
+                    >
+                      <div
+                        className={`h-full rounded-full ${barColor} transition-all`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <span className="text-sm font-extrabold text-[#041E41] tabular-nums shrink-0">
+                      {score} / 5
+                    </span>
+                  </div>
 
-                <div className="text-xs text-slate-700 bg-white p-3 rounded-lg border border-slate-200">
-                  <strong className="text-slate-900 block mb-0.5">
-                    Your Answer:
-                  </strong>
-                  {q.candidateAnswer}
+                  <div className="text-xs text-slate-800 bg-[#339A05]/10 border border-[#339A05]/25 p-3 rounded-lg leading-relaxed">
+                    <strong className="text-[#041E41] block mb-0.5">
+                      Suggested Answer
+                    </strong>
+                    {q.proposedAnswer || q.improvementTip}
+                  </div>
                 </div>
-
-                <div className="text-xs text-slate-800 bg-[#339A05]/10 border border-[#339A05]/25 p-3 rounded-lg">
-                  <strong className="text-[#041E41] block mb-0.5">
-                    Suggested Answer:
-                  </strong>
-                  {q.proposedAnswer || q.improvementTip}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
 
-        {/* 3. CONVERSATION TRANSCRIPT IN CHAT BUBBLES + DOWNLOAD TRANSCRIPT IN PDF */}
-        <section className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
-            <div>
-              <h2 className="text-base font-extrabold text-[#041E41]">
-                Interview Conversation Transcript
-              </h2>
-              <p className="text-xs text-slate-500">
-                Full dialogue between Sarah (AI Hiring Manager) and{" "}
-                {session.candidateName}
-              </p>
-            </div>
+        {/* 3. CONVERSATION TRANSCRIPT (EXPANDABLE) + PDF DOWNLOAD ICON */}
+        <section className="bg-white rounded-2xl border border-slate-200 shadow-xs">
+          <details className="group">
+            <summary className="flex items-center justify-between gap-3 p-5 cursor-pointer list-none select-none [&::-webkit-details-marker]:hidden">
+              <div>
+                <h2 className="text-base font-extrabold text-[#041E41]">
+                  Conversation Transcript
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Your answers and Sarah's questions, word for word
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    // Don't toggle the dropdown when downloading.
+                    e.preventDefault();
+                    e.stopPropagation();
+                    generateChatBubbleTranscriptPdf(session);
+                  }}
+                  title="Download transcript (PDF)"
+                  aria-label="Download transcript (PDF)"
+                  className="inline-flex items-center justify-center w-9 h-9 rounded-lg bg-[#041E41] hover:bg-[#062d61] text-white transition-colors cursor-pointer"
+                >
+                  <Download className="w-4 h-4 text-[#86EFAC]" />
+                </button>
+                <ChevronDown className="w-5 h-5 text-slate-500 transition-transform group-open:rotate-180" />
+              </div>
+            </summary>
 
-            <button
-              type="button"
-              onClick={() => generateChatBubbleTranscriptPdf(session)}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#041E41] hover:bg-[#062d61] text-white text-xs font-bold shadow-xs transition-colors cursor-pointer"
-            >
-              <Download className="w-4 h-4 text-[#86EFAC]" />
-              Download Transcript (PDF)
-            </button>
-          </div>
-
+            <div className="px-5 pb-5">
           {/* Chat Bubbles Container */}
           <div className="space-y-4 max-h-[480px] overflow-y-auto p-3 rounded-xl bg-slate-50 border border-slate-200/80">
             {session.transcript.map((item, idx) => {
@@ -3089,6 +3063,8 @@ const ScoringPage: React.FC<ScoringPageProps> = ({
               );
             })}
           </div>
+            </div>
+          </details>
         </section>
       </main>
     </div>

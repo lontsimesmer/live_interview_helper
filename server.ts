@@ -17,7 +17,13 @@ import {
   buildLiveVoiceConfig,
   interviewerTextAsksQuestion,
   recentSpeechAsksQuestion,
+  buildTranscriptionVocabulary,
+  flagOffTopicAnswerDeclaration,
+  lookUpFactDeclaration,
 } from './interviewer-agent';
+import { candidateRecorders, pruneRecorders, recorderFor, transcribeCandidateAudio } from './candidate-audio';
+import { gradeAnswersWithRubric, wordCount } from './answer-grading';
+import { lookUpFact } from './fact-lookup';
 import mammoth from 'mammoth';
 import path from 'path';
 import fs from 'fs';
@@ -76,7 +82,6 @@ const limitResume = rateLimit({ windowMs: 10 * 60_000, max: 20, name: 'resume' }
 const limitStart = rateLimit({ windowMs: 10 * 60_000, max: 15, name: 'session start' });
 const limitTurn = rateLimit({ windowMs: 60_000, max: 60, name: 'interview turn' });
 const limitTts = rateLimit({ windowMs: 60_000, max: 90, name: 'tts' });
-const limitEmail = rateLimit({ windowMs: 60 * 60_000, max: 10, name: 'email' });
 const limitLookup = rateLimit({ windowMs: 60_000, max: 30, name: 'lookup' });
 
 app.use('/api/examine-resume', limitResume);
@@ -1228,6 +1233,7 @@ function singleLine(value: unknown, max = 160): string {
  *  2. In-process lock for concurrent callers in the same tick.
  *  3. Resend Idempotency-Key header derived from the session id, so even if two server
  *     instances race, Resend itself delivers only one email (24h idempotency window).
+ *  4. No manual resend: candidates cannot trigger it; failed sends are retried automatically.
  */
 async function sendResendAssessmentEmail(
   session: InterviewSessionRecord
@@ -1283,15 +1289,14 @@ async function sendResendAssessmentEmail(
     const passed = Boolean(session.successful);
     const name = escapeHtml(session.candidateName);
     const role = escapeHtml(session.detectedRole);
+    const totalDisplayScore = session.totalScoreOutOf20 ?? session.totalScoreOutOf25;
+    const maxScore = INTERVIEW_MAX_SCORE;
     const appreciationTitle = passed
       ? 'Congratulations — You Passed This Practice Interview!'
       : 'Good Effort — Keep Practicing to Reach Placement Readiness';
     const appreciationBodyText = passed
       ? `Outstanding work, ${session.candidateName}! You demonstrated strong communication, clear role knowledge, and composure for the ${session.detectedRole} position. You are well-prepared for your upcoming employer interview.`
       : `Thank you for practicing with us, ${session.candidateName}. Every practice conversation builds your confidence for the real ${session.detectedRole} interview. Review the suggested answers on your results page and retake the practice session whenever you are ready.`;
-
-    const totalDisplayScore = session.totalScoreOutOf20 ?? session.totalScoreOutOf25;
-    const maxScore = INTERVIEW_MAX_SCORE;
 
     const htmlContent = `
     <div style="font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; border: 1px solid #E2E8F0; border-radius: 14px; overflow: hidden; background: #FFFFFF;">
@@ -1350,80 +1355,99 @@ async function sendResendAssessmentEmail(
       200
     );
 
-    const sendWith = (fromAddress: string, idempotencyKey: string) =>
-      fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${resendApiKey}`,
-          'Content-Type': 'application/json',
-          'Idempotency-Key': idempotencyKey,
-        },
-        body: JSON.stringify({
-          from: formatFromHeader(fromAddress),
-          to: [session.candidateEmail],
-          subject: subjectLine,
-          html: htmlContent,
-          text: plainTextContent,
-        }),
-      });
-
-    const baseKey = `gh360-results-${session.id}`;
-    let response = await sendWith(rawSenderEmail, baseKey);
-
-    // If the custom sender domain is not verified yet (4xx validation), retry once with onboarding@resend.dev.
-    // The first attempt was rejected, so nothing was delivered; the fallback uses its own idempotency key.
-    if (!response.ok && rawSenderEmail.toLowerCase() !== 'onboarding@resend.dev') {
-      const firstErrText = await response.text();
-      if (response.status >= 400 && response.status < 500 && /domain|not verified|validation_error/i.test(firstErrText)) {
-        console.warn(`Resend custom sender (${rawSenderEmail}) not verified yet, retrying with onboarding@resend.dev...`);
-        response = await sendWith('onboarding@resend.dev', `${baseKey}-fallback`);
-      } else {
-        console.warn('Resend API non-200 response:', response.status, firstErrText);
-        session.emailStatus = 'failed';
-        return {
-          sent: false,
-          note: `Resend API returned status ${response.status}. Please verify RESEND_API_KEY and RESEND_FROM_EMAIL.`,
-        };
+    const requestBody = JSON.stringify({
+      from: formatFromHeader(rawSenderEmail),
+      to: [session.candidateEmail],
+      subject: subjectLine,
+      html: htmlContent,
+      text: plainTextContent,
+    });
+    // Same key for every attempt (and after a restart): Resend delivers at most one email per
+    // session even if an attempt that looked failed actually went through.
+    const idempotencyKey = `gh360-results-${session.id}`;
+    // Temporary problems (network, rate limit, Resend 5xx) are retried; anything else
+    // (invalid address, sender not allowed...) will not get better by retrying.
+    const retryDelaysMs = [0, 2000, 5000];
+    let lastProblem = '';
+    for (const delay of retryDelaysMs) {
+      if (delay) await new Promise((r) => setTimeout(r, delay));
+      let response: Response;
+      try {
+        response = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${resendApiKey}`,
+            'Content-Type': 'application/json',
+            'Idempotency-Key': idempotencyKey,
+          },
+          body: requestBody,
+          signal: AbortSignal.timeout(15000),
+        });
+      } catch (netErr: any) {
+        lastProblem = `network error: ${netErr?.message || netErr}`;
+        console.warn('Resend request failed (will retry):', lastProblem);
+        continue;
       }
+      if (response.ok) {
+        const resData = (await response.json().catch(() => ({}))) as { id?: string };
+        session.emailSent = true;
+        session.emailStatus = 'sent';
+        session.emailId = resData?.id;
+        session.emailDeliveryNote = `Your results were emailed to ${session.candidateEmail}.`;
+        console.log(`[Resend] Results email sent for session ${session.id}${resData?.id ? ` (ID: ${resData.id})` : ''}.`);
+        return { sent: true, emailId: resData?.id, note: session.emailDeliveryNote };
+      }
+      const errText = await response.text().catch(() => '');
+      lastProblem = `HTTP ${response.status}: ${errText.slice(0, 300)}`;
+      console.warn('Resend API non-200 response:', lastProblem);
+      if (response.status !== 429 && response.status < 500) break;
     }
 
-    if (!response.ok) {
-      const errBody = await response.text();
-      console.warn('Resend API non-200 response:', response.status, errBody);
-      session.emailStatus = 'failed';
-      return {
-        sent: false,
-        note: `Resend API returned status ${response.status}. Please verify RESEND_API_KEY and verified sender domain in Resend.`,
-      };
-    }
-
-    const resData = (await response.json().catch(() => ({}))) as { id?: string };
-    session.emailSent = true;
-    session.emailStatus = 'sent';
-    session.emailId = resData?.id;
-    session.emailDeliveryNote = `Assessment report emailed to ${session.candidateEmail} via Resend${
-      resData?.id ? ` (ID: ${resData.id})` : ''
-    }.`;
-
+    session.emailStatus = 'failed';
+    console.warn(`[Resend] Results email NOT sent for session ${session.id} (${lastProblem}).`);
     return {
-      sent: true,
-      emailId: resData?.id,
-      note: session.emailDeliveryNote,
+      sent: false,
+      note: `We couldn't email your results to ${session.candidateEmail} right now. We'll try again automatically.`,
     };
   } catch (err: any) {
     console.error('Resend email error:', err);
-    // Network failure: we cannot know whether Resend accepted it. The idempotency key makes a
-    // later retry safe (Resend will not deliver a second copy), so mark as failed/retryable.
+    // The idempotency key makes a later retry safe (Resend will not deliver a second copy).
     session.emailStatus = 'failed';
     return {
       sent: false,
-      note: `Could not reach Resend API: ${err?.message || 'Unknown error'}`,
+      note: `We couldn't email your results to ${session.candidateEmail} right now. We'll try again automatically.`,
     };
   } finally {
     sessionEmailLocks.delete(session.id);
     activeSessions.set(session.id, session);
     flushCandidatesAndSessionsToDisk();
   }
+}
+
+async function retryResultEmail(session: InterviewSessionRecord): Promise<void> {
+  if (session.emailSent || session.emailStatus === 'sent') return;
+  const res = await sendResendAssessmentEmail(session);
+  if (!res.inProgress) session.emailDeliveryNote = res.note;
+  await saveSessionToSupabase(session).catch(() => undefined);
+}
+
+/**
+ * At server start: finished interviews from the last 23 hours whose results email never went
+ * out (server stopped mid-send, or Resend was unreachable) are sent now. Resend's idempotency
+ * window is 24 hours, so a send that did go through is not delivered twice.
+ */
+async function retryUnsentResultEmails(): Promise<void> {
+  const cutoff = Date.now() - 23 * 60 * 60_000;
+  const pending = Array.from(activeSessions.values()).filter(
+    (s) =>
+      s.currentPhase === 'finished' &&
+      !s.emailSent &&
+      (s.emailStatus === 'sending' || s.emailStatus === 'failed') &&
+      s.completedAt &&
+      new Date(s.completedAt).getTime() > cutoff
+  );
+  for (const session of pending) await retryResultEmail(session);
+  if (pending.length) console.log(`[Resend] Retried ${pending.length} unsent results email(s).`);
 }
 
 // ============================================================================
@@ -6850,12 +6874,11 @@ async function runSessionFinalization(
   );
 
   // Every interview is marked on 20, whether 4 or 5 questions were asked.
-  const { rawOutOf20: rawScore, totalOutOf20: totalScore } = recomputeSessionScore(session, {
+  const { totalOutOf20: totalScore } = recomputeSessionScore(session, {
     forceZero: terminatedForMisconduct,
   });
   const penaltyPoints = Number(session.misconductPenaltyPoints || 0);
   const qCount = session.questions.length || DEFAULT_QUESTION_COUNT;
-  const maxScore = INTERVIEW_MAX_SCORE;
   const passingScore = INTERVIEW_PASSING_SCORE;
 
   session.successful =
@@ -6866,13 +6889,10 @@ async function runSessionFinalization(
   const answeredCount = session.questionEvaluations.filter(
     (ev) => ev.candidateAnswer && !/^\[(not answered|no response|not reached)/i.test(ev.candidateAnswer)
   ).length;
-  const completedPhrase =
-    answeredCount >= qCount ? `all ${qCount} questions` : `${answeredCount} of the ${qCount} questions`;
-
-  const penaltyNoteSuffix =
-    !terminatedForMisconduct && penaltyPoints > 0
-      ? ` (Note: ${penaltyPoints} points were deducted from your raw score of ${rawScore}/${maxScore} due to a professional conduct warning during the session.)`
-      : '';
+  const firstName = session.candidateName.split(/\s+/)[0] || session.candidateName;
+  const pct = session.percentageScore;
+  const penaltyNote =
+    !terminatedForMisconduct && penaltyPoints > 0 ? ` ${penaltyPoints} points were deducted for a conduct warning.` : '';
 
   if (terminatedForMisconduct) {
     session.status = 'terminated_misconduct';
@@ -6883,28 +6903,31 @@ async function runSessionFinalization(
         reason: 'Inappropriate language or professional misconduct during live interview.',
       });
     }
-    session.interviewerFinalImpression = `${session.candidateName}, I am ending this Global Hire 360 interview immediately due to inappropriate language and professional misconduct. Mutual respect and workplace professionalism are non-negotiable standards for all Global Hire 360 candidates. Your score for this session is 0 out of ${maxScore} (Unsuccessful), and your candidate profile has been suspended from attempting another interview for the next 24 hours (until ${new Date(
+    session.interviewerFinalImpression = `This interview was ended for unprofessional language, so it scores 0. You can try again after ${new Date(
       session.suspendedUntil
-    ).toLocaleString()}).`;
+    ).toLocaleString()}.`;
   } else if (session.liveEndReason === 'terminated_rules_violation') {
     session.successful = false;
     session.status = 'terminated_rules_violation';
-    session.interviewerFinalImpression = `${session.candidateName}, this Global Hire 360 interview was ended by the interviewer because the interview rules were not respected (the interview must be a one-to-one conversation between you and the interviewer, answered by you only). Your score for the questions completed is ${totalScore} out of ${maxScore}, and this attempt is marked as unsuccessful. You are welcome to try again in a quiet space, on your own.`;
+    session.interviewerFinalImpression = `This interview was ended because the one-to-one rules weren't respected. Try again on your own, in a quiet place.`;
   } else if (terminatedEarlyForAttempts) {
     session.status = 'terminated_attempts';
-    session.interviewerFinalImpression = `${session.candidateName}, thank you for stepping into the Global Hire 360 interview room today. Since we tried Question ${
-      session.currentQuestionIndex + 1
-    } twice and still didn't quite hit the specific ${
-      session.detectedRole
-    } examples needed, I am going to wrap up our live call here so you were not successful on this attempt.${penaltyNoteSuffix} Please don't be discouraged—you have strong potential! Review your scorecard and marking guide sent to ${
-      session.candidateEmail
-    }, practice structuring your answers with the Global Hire 360 Interview Helper, and come back stronger!`;
-  } else if (session.successful) {
-    session.status = 'completed_success';
-    session.interviewerFinalImpression = `Congratulations, ${session.candidateName}! You completed ${completedPhrase} for the ${session.detectedRole} position with an impressive final score of ${totalScore} out of ${maxScore} (${session.percentageScore}%).${penaltyNoteSuffix} Your responses made strong sense and aligned well with our Global Hire 360 marking guide—you were successful in this interview assessment! I have sent your full scorecard and voice transcript to ${session.candidateEmail}.`;
+    session.interviewerFinalImpression = `The interview ended early because two answers didn't address the question.${penaltyNote} Read each question carefully, compare with the suggested answers, and try again, ${firstName}.`;
   } else {
-    session.status = 'completed_unsuccessful';
-    session.interviewerFinalImpression = `Thank you for completing ${completedPhrase} for the ${session.detectedRole} position, ${session.candidateName}. You achieved ${totalScore} out of ${maxScore} (${session.percentageScore}%),${penaltyNoteSuffix} which is below our ${passingScore}/${maxScore} placement benchmark, so you were not yet successful on this attempt. Keep your head up—I've emailed your detailed question breakdown, marking guide tips, and full transcript to ${session.candidateEmail} so you can refine your answers and succeed on your next session!`;
+    session.status = session.successful ? 'completed_success' : 'completed_unsuccessful';
+    // Short appreciation that matches the effort: how much was answered and how well.
+    const answeredAll = answeredCount >= qCount;
+    session.interviewerFinalImpression =
+      pct >= 85
+        ? `Excellent work, ${firstName} — clear, relevant answers that match what employers look for.`
+        : session.successful
+        ? `Well done, ${firstName}, you passed. A few more concrete examples will make your answers even stronger.`
+        : pct >= 45
+        ? `Good effort, ${firstName} — you're close. Compare your answers with the suggested ones and try again.`
+        : answeredAll
+        ? `Thanks for answering every question, ${firstName}. Study the suggested answers and practice — you'll improve quickly.`
+        : `You made a start, ${firstName}. Next time, try to answer every question fully.`;
+    session.interviewerFinalImpression += penaltyNote;
   }
 
   session.transcript.push({
@@ -6939,6 +6962,10 @@ async function runSessionFinalization(
   }
   // Record final email state in the database row too.
   await saveSessionToSupabase(session);
+  if (!resendRes.sent && !resendRes.inProgress && session.emailStatus === 'failed') {
+    // One more automatic try a few minutes later (same idempotency key: never a duplicate).
+    setTimeout(() => void retryResultEmail(session), 3 * 60_000).unref();
+  }
 
   return spokenClosingMessage;
 }
@@ -6995,102 +7022,61 @@ export function collectCandidateAnswersPerQuestion(session: InterviewSessionReco
 }
 
 /**
- * Grades a live voice interview question by question: the candidate's real words are compared
- * with the suggested answer (marking guide) and, when Gemini is available, an AI judgement of
- * whether the answer makes sense against the suggested answer is blended in.
+ * Replaces the live captions of the candidate's turns with an accurate English transcript of
+ * the recorded microphone audio (see candidate-audio.ts). Turns that cannot be transcribed
+ * keep their live caption. The audio is discarded afterwards.
+ */
+async function applyAccurateCandidateTranscript(session: InterviewSessionRecord): Promise<void> {
+  const recorder = candidateRecorders.get(session.id);
+  const ai = getGenAIClientOrNull();
+  try {
+    if (!recorder || !ai || !recorder.hasAudio) return;
+    const byEntry = await transcribeCandidateAudio(ai, recorder, {
+      vocabulary: buildTranscriptionVocabulary(session),
+      questions: session.questions,
+    });
+    let replaced = 0;
+    for (const entry of session.transcript) {
+      const accurate = entry.speaker === 'candidate' ? byEntry.get(entry.id) : undefined;
+      if (accurate) {
+        entry.text = clampText(accurate, 6000);
+        replaced += 1;
+      }
+    }
+    console.log(`[Transcript] ${session.id}: ${replaced} candidate turn(s) re-transcribed from audio.`);
+  } catch (err: any) {
+    console.warn('Accurate candidate transcript unavailable, keeping live captions:', err?.message || err);
+  } finally {
+    candidateRecorders.delete(session.id);
+  }
+}
+
+/**
+ * Grades a live voice interview question by question: each answer (the candidate's own words,
+ * from the accurate transcript) is marked out of 5 against the suggested answer with a fixed
+ * rubric (answer-grading.ts). The keyword marking guide is used only when AI grading fails.
  */
 async function gradeLiveInterviewAnswers(session: InterviewSessionRecord): Promise<QuestionEvaluation[]> {
   const answers = collectCandidateAnswersPerQuestion(session);
-  const aiByNumber = new Map<
-    number,
-    { score: number; verbatim: string; feedback: string; strengths: string[]; improvementTip: string }
-  >();
-
   const ai = getGenAIClientOrNull();
-  const hasCandidateSpeech = session.transcript.some((t) => t.speaker === 'candidate' && t.text.trim());
-  if (ai && hasCandidateSpeech) {
-    try {
-      const transcriptFormatted = session.transcript
-        .map((t) => `[${t.speaker.toUpperCase()}]: ${t.text}`)
-        .join('\n')
-        .slice(-24000);
-      const questionsFormatted = session.questions
-        .map(
-          (q) =>
-            `Q${q.number}: ${q.question}\n  - Suggested answer: ${q.proposedAnswer || q.expectedFocus}\n  - Key focus: ${q.expectedFocus}\n  - Candidate's answer as recorded: ${
-              answers.get(q.number) || '[not detected — find it in the transcript]'
-            }`
-        )
-        .join('\n\n');
-
-      const gradeResp = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `You are the Senior Assessment Grader for Global Hire 360.
-Candidate: ${session.candidateName}
-Job Position: ${session.detectedRole}
-
-Questions, suggested answers and the candidate's recorded answers:
-${questionsFormatted}
-
-Full interview transcript (speech-to-text, may contain small recognition errors):
-${transcriptFormatted}
-
-For each question, score the candidate's answer from 0 to 5 (0.5 steps) on whether it makes sense and goes in the same direction as the suggested answer: same key ideas, a relevant example and a clear result. A word-for-word match is NOT required — judge the meaning. Ignore small speech-recognition errors. Only the candidate's own words count; never credit what the interviewer said. Requests to repeat the question, small talk or "I don't know" score 0 to 1. Also return the candidate's answer for that question, copied from the transcript (empty string if they did not answer).`,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              evaluations: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    questionNumber: { type: Type.NUMBER },
-                    candidateAnswerVerbatim: { type: Type.STRING },
-                    scoreOutOf5: { type: Type.NUMBER },
-                    feedback: { type: Type.STRING },
-                    strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    improvementTip: { type: Type.STRING },
-                  },
-                  required: [
-                    'questionNumber',
-                    'candidateAnswerVerbatim',
-                    'scoreOutOf5',
-                    'feedback',
-                    'strengths',
-                    'improvementTip',
-                  ],
-                },
-              },
-            },
-            required: ['evaluations'],
+  const rubric = ai
+    ? await gradeAnswersWithRubric(
+        ai,
+        session.detectedRole,
+        session.questions.map((q) => ({
+          question: {
+            number: q.number,
+            question: q.question,
+            suggestedAnswer: q.proposedAnswer || q.expectedFocus,
+            expectedFocus: q.expectedFocus,
           },
-        },
-      });
-      const parsed = JSON.parse(gradeResp.text || '{}');
-      if (Array.isArray(parsed.evaluations)) {
-        for (const ev of parsed.evaluations) {
-          const n = Number(ev?.questionNumber);
-          const score = Number(ev?.scoreOutOf5);
-          if (!Number.isInteger(n) || !Number.isFinite(score)) continue;
-          aiByNumber.set(n, {
-            score: Math.max(0, Math.min(5, score)),
-            verbatim: clampText(ev.candidateAnswerVerbatim, 6000).trim(),
-            feedback: clampText(ev.feedback, 1500),
-            strengths: Array.isArray(ev.strengths) ? ev.strengths.slice(0, 3).map((x: any) => clampText(x, 300)) : [],
-            improvementTip: clampText(ev.improvementTip, 800),
-          });
-        }
-      }
-    } catch (gradeErr) {
-      console.warn('Live transcript AI grading unavailable, using marking guide only:', gradeErr);
-    }
-  }
+          answer: answers.get(q.number) || '',
+        }))
+      )
+    : new Map();
 
   return session.questions.map((q) => {
-    const aiEv = aiByNumber.get(q.number);
-    const text = (answers.get(q.number) || aiEv?.verbatim || '').trim();
+    const text = (answers.get(q.number) || '').trim();
     const base = {
       questionId: q.id,
       questionNumber: q.number,
@@ -7098,7 +7084,7 @@ For each question, score the candidate's answer from 0 to 5 (0.5 steps) on wheth
       questionText: q.question,
       proposedAnswer: q.proposedAnswer,
     };
-    if (text.split(/\s+/).filter(Boolean).length < 2) {
+    if (wordCount(text) < 2) {
       return {
         ...base,
         candidateAnswer: '[No response recorded for this question]',
@@ -7110,7 +7096,7 @@ For each question, score the candidate's answer from 0 to 5 (0.5 steps) on wheth
         improvementTip: `Key marking guide focus: ${q.expectedFocus}`,
       } as QuestionEvaluation;
     }
-    const mg = gradeAnswerAgainstSuggestedAnswer({
+    const guide = gradeAnswerAgainstSuggestedAnswer({
       questionId: q.id,
       questionText: q.question,
       category: q.category,
@@ -7118,21 +7104,22 @@ For each question, score the candidate's answer from 0 to 5 (0.5 steps) on wheth
       proposedAnswer: q.proposedAnswer,
       candidateText: text,
       role: session.detectedRole,
-      aiScoreOutOf5: aiEv ? aiEv.score : null,
+      aiScoreOutOf5: null,
     });
+    const r = rubric.get(q.number);
     return {
       ...base,
       candidateAnswer: text,
       attemptsUsed: 1,
       timedOut: false,
-      scoreOutOf5: mg.scoreOutOf5,
-      feedback: aiEv?.feedback || mg.feedback,
-      strengths: aiEv?.strengths?.length ? aiEv.strengths : mg.strengths,
-      improvementTip: aiEv?.improvementTip || mg.improvementTip,
-      alignmentPercent: mg.alignmentPercent,
-      matchedPoints: mg.matchedPoints,
-      missedPoints: mg.missedPoints,
-      gradingMethod: mg.gradingMethod,
+      scoreOutOf5: r ? r.scoreOutOf5 : guide.scoreOutOf5,
+      feedback: r?.feedback || guide.feedback,
+      strengths: r ? r.strengths : guide.strengths,
+      improvementTip: r?.improvementTip || guide.improvementTip,
+      alignmentPercent: r ? Math.round((r.alignment / 2) * 100) : guide.alignmentPercent,
+      matchedPoints: guide.matchedPoints,
+      missedPoints: guide.missedPoints,
+      gradingMethod: r ? 'marking_guide+ai' : 'marking_guide',
     } as QuestionEvaluation;
   });
 }
@@ -7212,6 +7199,8 @@ app.post('/api/finalize-live-ws-session', async (req, res) => {
     // Text/fallback-voice interviews are already graded answer by answer in /api/interview-turn.
     const alreadyGradedTurnByTurn = !session.liveMode && session.questionEvaluations.length > 0;
     if (!alreadyGradedTurnByTurn) {
+      // Answers are marked on what the candidate said: first get that text exactly right.
+      if (session.liveMode) await applyAccurateCandidateTranscript(session);
       session.questionEvaluations = await gradeLiveInterviewAnswers(session);
     }
 
@@ -7240,26 +7229,8 @@ app.get('/api/session/:id', (req, res) => {
   return res.json({ session });
 });
 
-app.post('/api/session/:id/send-email', limitEmail, async (req, res) => {
-  const session = activeSessions.get(req.params.id);
-  if (!session || !sessionTokenMatches(session, readSessionToken(req))) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  if (session.currentPhase !== 'finished') {
-    return res.status(409).json({ error: 'Results can only be emailed after the interview has finished.' });
-  }
-  // Idempotent: if the results were already delivered this returns "already sent" and sends nothing.
-  const resendRes = await sendResendAssessmentEmail(session);
-  if (!resendRes.inProgress) session.emailDeliveryNote = resendRes.note;
-  await saveSessionToSupabase(session);
-  return res.json({
-    sent: resendRes.sent,
-    inProgress: Boolean(resendRes.inProgress),
-    emailId: resendRes.emailId,
-    note: resendRes.note,
-    session,
-  });
-});
+// No manual (re)send endpoint: the results email is sent exactly once, automatically, when the
+// interview is finalized (see sendResendAssessmentEmail and retryUnsentResultEmails).
 
 function stripSessionSecrets(s: InterviewSessionRecord) {
   const { accessToken: _t, ...rest } = s;
@@ -7741,7 +7712,7 @@ const endCallFunctionDeclaration: FunctionDeclaration = {
       reason: {
         type: Type.STRING,
         description:
-          'completed_all_questions (normal end after the closing), time_up (the 10 minutes are over), terminated_rules_violation (the interview rules were broken again after a warning), or terminated_misconduct (abusive / repeated inappropriate language).',
+          'completed_all_questions (normal end after the closing), time_up (the 10 minutes are over), terminated_rules_violation (the interview rules were broken again after a warning), terminated_after_two_attempts (the platform said to end after a second off-topic answer), or terminated_misconduct (abusive / repeated inappropriate language).',
       },
     },
     required: ['reason'],
@@ -7788,6 +7759,14 @@ const reportMisconductFunctionDeclaration: FunctionDeclaration = {
     required: ['action', 'reason'],
   },
 };
+
+// Recorded candidate audio is only needed until the interview is graded.
+setInterval(() => {
+  pruneRecorders((id) => {
+    const s = activeSessions.get(id);
+    return Boolean(s && s.currentPhase !== 'finished');
+  });
+}, 5 * 60_000).unref();
 
 /** One live voice bridge per interview session: a new connection always replaces the old one. */
 const liveVoiceConnections = new Map<string, { clientWs: WebSocket; shutdown: () => void }>();
@@ -7955,11 +7934,14 @@ async function startServer() {
       const last = session.transcript[session.transcript.length - 1];
       if (last && last.speaker === speaker && last.questionIndex === questionIndex) {
         last.text = clampText(`${last.text}${chunk}`.replace(/\s+/g, ' '), 6000);
+        if (speaker === 'candidate') recorder.linkEntry(last.id);
       } else {
         const text = chunk.replace(/\s+/g, ' ').trim();
         if (!text) return;
+        const id = `tr_${Date.now()}_${speaker === 'interviewer' ? 'i' : 'c'}_${session.transcript.length}`;
+        if (speaker === 'candidate') recorder.linkEntry(id);
         session.transcript.push({
-          id: `tr_${Date.now()}_${speaker === 'interviewer' ? 'i' : 'c'}_${session.transcript.length}`,
+          id,
           speaker,
           speakerName:
             speaker === 'interviewer' ? 'Sarah (Global Hire 360 Hiring Manager)' : session.candidateName,
@@ -7974,6 +7956,10 @@ async function startServer() {
     // Candidate words spoken since the current question started (decides whether a re-ask
     // of the same question restarts its 90-second timer).
     let candidateWordsThisQuestion = 0;
+    // The candidate's microphone audio, per turn, for the accurate post-call transcript.
+    const recorder = recorderFor(session.id);
+    // Off-topic answers flagged by Sarah, per question number (2 on one question ends the call).
+    const offTopicCounts = new Map<number, number>();
     // Only one question detection per interviewer turn.
     let questionDetectedThisTurn = false;
 
@@ -8110,6 +8096,47 @@ async function startServer() {
             }
             await respond(`Warning recorded. Total penalty points: ${session.misconductPenaltyPoints}. Calmly warn the candidate once, then continue the interview.`);
           }
+        } else if (call.name === 'flag_off_topic_answer') {
+          const qNum = Math.round(Number(call.args?.questionNumber)) || currentQuestionNumber;
+          if (endingReason || qNum < 1 || qNum !== currentQuestionNumber) {
+            await respond('Not recorded: that is not the question being answered now. Continue the interview normally.');
+            continue;
+          }
+          const count = (offTopicCounts.get(qNum) || 0) + 1;
+          offTopicCounts.set(qNum, count);
+          const reason = clampText(call.args?.reason || 'Answer did not address the question', 200);
+          session.currentQuestionAttempts = count;
+          session.misconductNotes = session.misconductNotes || [];
+          session.misconductNotes.push(`Off-topic answer ${count}/2 on question ${qNum}: ${reason}`);
+          if (count >= 2) {
+            session.liveEndReason = 'terminated_after_two_attempts';
+            await respond(LIVE_NOTES.offTopicSecond(qNum));
+            // Sarah says her closing words and calls end_call; end it ourselves if she doesn't.
+            endingReason = 'terminated_after_two_attempts';
+            timers.push(setTimeout(() => finishCall('terminated_after_two_attempts'), 25000));
+          } else {
+            // Second try: the rephrased question gets a fresh 90 seconds.
+            candidateWordsThisQuestion = 0;
+            sendToClient({ type: 'question_advanced', questionNumber: qNum, totalQuestions });
+            await respond(LIVE_NOTES.offTopicFirst(qNum));
+          }
+        } else if (call.name === 'look_up_fact') {
+          const question = clampText(call.args?.question, 300);
+          // Questions are kept for the end: during the questions Sarah parks them.
+          if (currentQuestionNumber < totalQuestions) {
+            await respond('Not now: the interview questions are not finished. Tell the candidate kindly you will come back to it at the end, and continue the current question.');
+            continue;
+          }
+          // Capped so the candidate is never left waiting in silence for long.
+          const answer = await Promise.race([
+            lookUpFact(getGenAIClientOrNull(), question),
+            new Promise<string>((resolve) => setTimeout(() => resolve('UNKNOWN'), 14000)),
+          ]);
+          await respond(
+            answer === 'UNKNOWN'
+              ? 'UNKNOWN — no reliable up-to-date answer found. Say honestly that you are not sure about that one.'
+              : `Answer (up to date): ${answer} Tell the candidate in one natural sentence.`
+          );
         } else if (call.name === 'end_call') {
           const allowed = [
             'completed_all_questions',
@@ -8137,6 +8164,15 @@ async function startServer() {
             continue;
           }
           if (reason === 'time_up' && secondsLeft() > 30) reason = 'completed_all_questions';
+          // Ending for off-topic answers is only allowed once the platform counted two on a question.
+          if (reason === 'terminated_after_two_attempts' && !Array.from(offTopicCounts.values()).some((c) => c >= 2)) {
+            if (!rejectedEarlyEnd && currentQuestionNumber < totalQuestions) {
+              rejectedEarlyEnd = true;
+              await respond('The call cannot end for that reason. Continue the interview with the current question.');
+              continue;
+            }
+            reason = 'completed_all_questions';
+          }
           if (reason === 'terminated_misconduct' && !session.suspendedUntil) {
             session.suspendedUntil = await suspendCandidateFor24Hours({
               email: session.candidateEmail,
@@ -8174,6 +8210,7 @@ async function startServer() {
       if (message?.serverContent || message?.toolCall) sendToClient(message);
 
       const serverContent = message?.serverContent;
+      if (serverContent?.modelTurn || serverContent?.outputTranscription) recorder.closeTurn();
       const interviewerChunk = serverContent?.outputTranscription?.text;
       if (interviewerChunk) {
         appendTranscript('interviewer', interviewerChunk);
@@ -8237,7 +8274,13 @@ async function startServer() {
         systemInstruction: buildInterviewerPrompt(session, DEFAULT_QUESTION_COUNT),
         voiceName: liveVoiceName, // NotebookLM female voice ("Aoede")
         resumptionHandle,
-        functionDeclarations: [endCallFunctionDeclaration, reportMisconductFunctionDeclaration],
+        functionDeclarations: [
+          endCallFunctionDeclaration,
+          reportMisconductFunctionDeclaration,
+          flagOffTopicAnswerDeclaration,
+          lookUpFactDeclaration,
+        ],
+        vocabulary: buildTranscriptionVocabulary(session),
       });
 
     // Index in LIVE_MODELS of the model in use (a resumed conversation must stay on it).
@@ -8378,6 +8421,12 @@ async function startServer() {
           if (!geminiSession || endingReason) return;
           const audio = msg.realtimeInput.audio || msg.realtimeInput.mediaChunks?.[0];
           if (!audio?.data || typeof audio.data !== 'string') return;
+          if (audio.data.length <= 64_000) {
+            recorder.addFrame(
+              Buffer.from(audio.data, 'base64'),
+              currentQuestionNumber > 0 ? currentQuestionNumber - 1 : undefined
+            );
+          }
           await geminiSession.sendRealtimeInput({
             audio: { data: audio.data, mimeType: 'audio/pcm;rate=16000' },
           });
@@ -8422,6 +8471,7 @@ async function startServer() {
         }).`
       );
     }
+    void retryUnsentResultEmails().catch((e) => console.warn('Results email retry failed:', e?.message || e));
     provisionSupabaseTablesViaManagementApi()
       .then(() => checkSupabaseTables())
       .then((ready) => (ready ? seedCustomerServiceQuestionsToSupabase() : undefined))
