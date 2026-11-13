@@ -34,6 +34,7 @@ import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 dotenv.config();
 
 const app = express();
+const httpServer = http.createServer(app);
 const PORT = 3000;
 
 // ============================================================================
@@ -7819,7 +7820,6 @@ async function checkSupabaseTables(): Promise<boolean> {
 }
 
 async function startServer() {
-  const httpServer = http.createServer(app);
   // Audio frames are ~6 KB; anything much larger is not a legitimate client frame.
   const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
 
@@ -8516,4 +8516,5 @@ async function startServer() {
   }
 }
 
+export default httpServer;
 startServer();
