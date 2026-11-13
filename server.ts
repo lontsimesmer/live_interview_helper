@@ -20,10 +20,10 @@ import {
   buildTranscriptionVocabulary,
   flagOffTopicAnswerDeclaration,
   lookUpFactDeclaration,
-} from './interviewer-agent';
-import { candidateRecorders, pruneRecorders, recorderFor, transcribeCandidateAudio } from './candidate-audio';
-import { gradeAnswersWithRubric, wordCount } from './answer-grading';
-import { lookUpFact } from './fact-lookup';
+} from './interviewer-agent.js';
+import { candidateRecorders, pruneRecorders, recorderFor, transcribeCandidateAudio } from './candidate-audio.js';
+import { gradeAnswersWithRubric, wordCount } from './answer-grading.js';
+import { lookUpFact } from './fact-lookup.js';
 import mammoth from 'mammoth';
 import path from 'path';
 import fs from 'fs';

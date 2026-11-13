@@ -11,7 +11,7 @@
  * transcript has been produced.
  */
 import { Type, type GoogleGenAI } from '@google/genai';
-import { generateWithFallback } from './gemini-call';
+import { generateWithFallback } from './gemini-call.js';
 
 const SAMPLE_RATE = 16000;
 const BYTES_PER_SECOND = SAMPLE_RATE * 2;

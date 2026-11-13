@@ -9,7 +9,7 @@
  * 3. Otherwise "UNKNOWN" — Sarah then says she isn't sure instead of guessing.
  */
 import type { GoogleGenAI } from '@google/genai';
-import { generateWithFallback } from './gemini-call';
+import { generateWithFallback } from './gemini-call.js';
 
 // Wikipedia asks API clients to identify themselves with a User-Agent.
 const WIKI_HEADERS = { 'User-Agent': 'InterviewAssistant/1.0 (server-side fact lookup)' };

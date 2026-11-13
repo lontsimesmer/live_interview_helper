@@ -10,7 +10,7 @@
  * (off-topic or nearly empty answers cannot score more than 1).
  */
 import { Type, type GoogleGenAI } from '@google/genai';
-import { generateWithFallback } from './gemini-call';
+import { generateWithFallback } from './gemini-call.js';
 
 
 export interface RubricQuestion {
