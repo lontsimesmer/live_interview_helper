@@ -10,3 +10,4 @@ coverage/
 # Local candidate data (names, emails, interview transcripts) — never commit
 data/candidates.json
 data/interview_sessions.json
+.vercel

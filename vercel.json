@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "express",
+  "buildCommand": "npm run build && cp -R dist/. public/",
+  "functions": {
+    "server.ts": {
+      "includeFiles": "dist/**"
+    }
+  },
+  "rewrites": [
+    { "source": "/interview", "destination": "/index.html" },
+    { "source": "/scoring", "destination": "/index.html" }
+  ]
+}
