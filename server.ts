@@ -359,6 +359,7 @@ export interface InterviewSessionRecord {
     | 'terminated_attempts'
     | 'terminated_misconduct'
     | 'terminated_rules_violation'
+    | 'terminated_silence'
     | 'abandoned';
   /** Secret bearer token for this session (never sent to Supabase, stripped from API payloads except on creation/resume). */
   accessToken?: string;
@@ -370,6 +371,7 @@ export interface InterviewSessionRecord {
     | 'time_up'
     | 'terminated_misconduct'
     | 'terminated_rules_violation'
+    | 'terminated_silence'
     | 'terminated_after_two_attempts'
     | 'ended_by_candidate';
   isFirstTimeCandidate?: boolean;
@@ -715,6 +717,7 @@ async function suspendCandidateFor24Hours(params: {
   email: string;
   candidateId?: string;
   reason: string;
+  latestSessionStatus?: string;
 }): Promise<string> {
   const normalizedEmail = params.email.trim().toLowerCase();
   const candId = params.candidateId || buildCandidateIdFromEmail(normalizedEmail);
@@ -733,7 +736,7 @@ async function suspendCandidateFor24Hours(params: {
   if (candidate) {
     candidate.suspendedUntil = suspendedUntilIso;
     candidate.suspensionReason = params.reason;
-    candidate.latestSessionStatus = 'terminated_misconduct';
+    candidate.latestSessionStatus = params.latestSessionStatus || 'terminated_misconduct';
     candidate.updatedAt = new Date().toISOString();
     activeCandidates.set(candidate.id, candidate);
     flushCandidatesAndSessionsToDisk();
@@ -6885,15 +6888,16 @@ async function runSessionFinalization(
   );
 
   // Every interview is marked on 20, whether 4 or 5 questions were asked.
+  const terminatedForSilence = session.liveEndReason === 'terminated_silence';
   const { totalOutOf20: totalScore } = recomputeSessionScore(session, {
-    forceZero: terminatedForMisconduct,
+    forceZero: terminatedForMisconduct || terminatedForSilence,
   });
   const penaltyPoints = Number(session.misconductPenaltyPoints || 0);
   const qCount = session.questions.length || DEFAULT_QUESTION_COUNT;
   const passingScore = INTERVIEW_PASSING_SCORE;
 
   session.successful =
-    !terminatedEarlyForAttempts && !terminatedForMisconduct && totalScore >= passingScore;
+    !terminatedEarlyForAttempts && !terminatedForMisconduct && !terminatedForSilence && totalScore >= passingScore;
   session.currentPhase = 'finished';
   session.completedAt = new Date().toISOString();
 
@@ -6927,6 +6931,10 @@ async function runSessionFinalization(
     session.successful = false;
     session.status = 'terminated_rules_violation';
     session.interviewerFinalImpression = `This interview was ended because the one-to-one rules weren't respected. Try again on your own, in a quiet place.`;
+  } else if (terminatedForSilence) {
+    session.successful = false;
+    session.status = 'terminated_silence';
+    session.interviewerFinalImpression = `The interview ended because there was no response after the question was repeated. Your account is suspended until ${new Date(session.suspendedUntil || Date.now() + 24 * 60 * 60_000).toLocaleString()}.`;
   } else if (terminatedEarlyForAttempts) {
     session.status = 'terminated_attempts';
     session.interviewerFinalImpression = `The interview ended early because two answers didn't address the question.${penaltyNote} Read each question carefully, compare with the suggested answers, and try again, ${firstName}.`;
@@ -7932,6 +7940,13 @@ async function startServer() {
     // Candidate words spoken since the current question started (decides whether a re-ask
     // of the same question restarts its 90-second timer).
     let candidateWordsThisQuestion = 0;
+    let silenceCheckTimer: NodeJS.Timeout | null = null;
+    let candidateAnsweredCurrentQuestion = false;
+    let microphoneMuted = false;
+    const clearSilenceCheck = () => {
+      if (silenceCheckTimer) clearTimeout(silenceCheckTimer);
+      silenceCheckTimer = null;
+    };
     // The candidate's microphone audio, per turn, for the accurate post-call transcript.
     const recorder = recorderFor(session.id);
     // Off-topic answers flagged by Sarah, per question number (2 on one question ends the call).
@@ -7952,6 +7967,8 @@ async function startServer() {
       }
       currentQuestionNumber = qn;
       candidateWordsThisQuestion = 0;
+      candidateAnsweredCurrentQuestion = false;
+      clearSilenceCheck();
       session.currentPhase = 'questioning';
       session.currentQuestionIndex = qn - 1;
       session.currentQuestionAttempts = 0;
@@ -7969,6 +7986,47 @@ async function startServer() {
       } catch (e: any) {
         console.warn('Live system note failed:', e?.message || e);
       }
+    };
+
+    const beginSilenceCheck = (questionNumber: number) => {
+      clearSilenceCheck();
+      if (microphoneMuted || candidateAnsweredCurrentQuestion || questionNumber !== currentQuestionNumber) return;
+      silenceCheckTimer = setTimeout(() => {
+        if (stopped || callEnded || endingReason || microphoneMuted || candidateAnsweredCurrentQuestion || questionNumber !== currentQuestionNumber) return;
+        void sendSystemNote(
+          'The candidate has not spoken for 10 seconds after the question. Ask, "Are you still there?" in one short sentence, then wait for a response.',
+          true
+        );
+        silenceCheckTimer = setTimeout(() => {
+          if (stopped || callEnded || endingReason || microphoneMuted || candidateAnsweredCurrentQuestion || questionNumber !== currentQuestionNumber) return;
+          const question = session.questions.find((q) => q.number === questionNumber)?.question;
+          void sendSystemNote(
+            `There is still no response. Repeat this exact question and wait: "${question || ''}"`,
+            true
+          );
+          silenceCheckTimer = setTimeout(() => {
+            if (stopped || callEnded || endingReason || microphoneMuted || candidateAnsweredCurrentQuestion || questionNumber !== currentQuestionNumber) return;
+            const reason = 'Interview ended after no response to the question or its repeat.';
+            session.status = 'terminated_silence';
+            session.suspendedUntil = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+            void suspendCandidateFor24Hours({
+              email: session.candidateEmail,
+              candidateId: session.candidateId,
+              reason,
+              latestSessionStatus: 'terminated_silence',
+            }).then((until) => {
+              session.suspendedUntil = until;
+              activeSessions.set(session.id, session);
+              flushCandidatesAndSessionsToDisk();
+            }).catch((err) => console.warn('Could not persist silence suspension:', err?.message || err));
+            requestGracefulEnd(
+              'terminated_silence',
+              `The candidate did not respond after you checked in and repeated the question. Tell ${session.candidateName} in one calm sentence that the call is ending and the account is suspended for 24 hours. Then call end_call with reason "terminated_silence".`,
+              9000
+            );
+          }, 10_000);
+        }, 10_000);
+      }, 10_000);
     };
 
     let drainUntil = 0;
@@ -7989,7 +8047,9 @@ async function startServer() {
       callEnded = true;
       session.liveEndReason = reason;
       if (reason === 'terminated_misconduct') session.status = 'terminated_misconduct';
+      if (reason === 'terminated_silence') session.status = 'terminated_silence';
       timers.forEach((t) => clearTimeout(t));
+      clearSilenceCheck();
       sendToClient({ type: 'end_call_triggered', reason, suspendedUntil: session.suspendedUntil });
       flushCandidatesAndSessionsToDisk();
       // Let the closing sentence that is already being spoken finish (current turn only),
@@ -8119,6 +8179,7 @@ async function startServer() {
             'time_up',
             'terminated_rules_violation',
             'terminated_misconduct',
+            'terminated_silence',
           ] as const;
           const asked = String(call.args?.reason || 'completed_all_questions') as (typeof allowed)[number];
           let reason: NonNullable<InterviewSessionRecord['liveEndReason']> =
@@ -8202,6 +8263,7 @@ async function startServer() {
             if (candidateQ && recentSpeechAsksQuestion(interviewerTurnText, candidateQ.question)) {
               questionDetectedThisTurn = true;
               setCurrentQuestion(qn);
+              beginSilenceCheck(qn);
               break;
             }
           }
@@ -8214,6 +8276,10 @@ async function startServer() {
 
       const candidateChunk = serverContent?.inputTranscription?.text;
       if (candidateChunk && !endingReason) {
+        if (candidateChunk.trim()) {
+          candidateAnsweredCurrentQuestion = true;
+          clearSilenceCheck();
+        }
         appendTranscript('candidate', candidateChunk);
         candidateWordsThisQuestion += candidateChunk.split(/\s+/).filter(Boolean).length;
         const liveCheck = detectCandidateMisconduct(candidateChunk);
@@ -8423,6 +8489,17 @@ async function startServer() {
             `The candidate pressed the "rephrase" button. Repeat the current question in simpler words with the same meaning. Do not move to another question.`,
             true
           );
+        } else if (msg?.type === 'microphone_muted') {
+          microphoneMuted = Boolean(msg.muted);
+          if (microphoneMuted) {
+            clearSilenceCheck();
+            void sendSystemNote(
+              'The candidate just muted their microphone. Tell them briefly that their microphone is muted and they can unmute it with the microphone button. Then wait.',
+              true
+            );
+          } else if (!candidateAnsweredCurrentQuestion && currentQuestionNumber > 0) {
+            beginSilenceCheck(currentQuestionNumber);
+          }
         }
         // Any other frame (including arbitrary text prompts) is ignored on purpose.
       } catch (e) {

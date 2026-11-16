@@ -307,6 +307,7 @@ export interface InterviewSessionRecord {
     | "terminated_attempts"
     | "terminated_misconduct"
     | "terminated_rules_violation"
+    | "terminated_silence"
     | "abandoned";
   isFirstTimeCandidate?: boolean;
   currentPhase:
@@ -1565,10 +1566,8 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
         const data = await res.json().catch(() => ({}));
         if (res.ok && data.session) {
           navigationScheduled = true;
-          window.setTimeout(() => {
-            onSessionCompleted(data.session);
-            navigate("/scoring");
-          }, 1200);
+          onSessionCompleted(data.session);
+          navigate("/scoring");
           return;
         }
         throw new Error(data.error || `Results request failed (${res.status}).`);
@@ -2271,12 +2270,16 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
 
   const toggleMic = () => {
     if (!mediaStreamRef.current) return;
+    const willMute = !isMicMuted;
     const audioTracks = mediaStreamRef.current.getAudioTracks();
     audioTracks.forEach((track) => {
       track.enabled = isMicMuted;
     });
-    isMicMutedRef.current = !isMicMuted;
-    setIsMicMuted(!isMicMuted);
+    isMicMutedRef.current = willMute;
+    setIsMicMuted(willMute);
+    if (liveModeRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "microphone_muted", muted: willMute }));
+    }
   };
 
   if (!session) return null;
