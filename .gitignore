@@ -11,3 +11,4 @@ coverage/
 data/candidates.json
 data/interview_sessions.json
 .vercel
+.aws/
