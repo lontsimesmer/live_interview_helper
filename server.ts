@@ -2303,17 +2303,6 @@ async function seedCustomerServiceQuestionsToSupabase(): Promise<{
     'id'
   );
 
-  // All banks (Universal first question, Customer Service, Virtual Assistant, Technical Support).
-  const all = await postgrestUpsert(
-    'interview_questions',
-    ALL_STANDARD_QUESTION_ROWS.map((row) => ({
-      ...toRow(row),
-      alternative_wordings: row.id === UNIVERSAL_FIRST_QUESTION_ROW.id ? UNIVERSAL_FIRST_QUESTION_VARIANTS : [],
-      marking_points: row.markingPillars.map((p) => p.label),
-    })),
-    'id'
-  );
-
   // One table per role, like customer_service_questions.
   const withPoints = (row: CustomerServiceQuestionRow) => ({
     ...toRow(row),
@@ -2330,8 +2319,8 @@ async function seedCustomerServiceQuestionsToSupabase(): Promise<{
     'id'
   );
 
-  if (!all.saved || !va.saved || !ts.saved) {
-    return { seeded: false, error: all.error || va.error || ts.error || legacy.error };
+  if (!va.saved || !ts.saved) {
+    return { seeded: false, error: va.error || ts.error || legacy.error };
   }
   return { seeded: true };
 }
@@ -7721,7 +7710,6 @@ async function checkSupabaseTables(): Promise<boolean> {
   const tables = [
     'candidates',
     'interview_sessions',
-    'interview_questions',
     'customer_service_questions',
     'virtual_assistant_questions',
     'technical_support_questions',

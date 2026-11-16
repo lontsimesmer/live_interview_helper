@@ -3,15 +3,14 @@
 -- ============================================================================
 -- TABLES & RELATIONS IN THIS SCHEMA:
 -- 1. public.customer_service_questions (legacy: 10 Customer Service questions + Marking Guides)
--- 1b. public.interview_questions (ALL banks: Universal Q1, Customer Service, Virtual Assistant, Technical Support)
--- 1c. public.virtual_assistant_questions (10 Virtual Assistant questions + suggested answers)
--- 1d. public.technical_support_questions (10 IT / Technical Support questions + suggested answers)
+-- 1b. public.virtual_assistant_questions (10 Virtual Assistant questions + suggested answers)
+-- 1c. public.technical_support_questions (10 IT / Technical Support questions + suggested answers)
 -- 2. public.candidates (one row per person. Email is the unique identity key.)
 -- 3. public.interview_sessions (each interview session, linked via candidate_id -> candidates.id)
 -- 4. public.candidate_scorecards_summary (relational view joining candidates + interview_sessions)
 --
 -- Safe to re-run: every statement is idempotent (IF NOT EXISTS / ON CONFLICT / DROP IF EXISTS).
--- The backend seeds interview_questions automatically on startup.
+-- Role question banks are seeded by the backend on startup; universal questions live in code.
 -- ============================================================================
 
 -- 1. Customer Service Role Interview Questions & Marking Guide Table
@@ -464,20 +463,8 @@ CREATE INDEX IF NOT EXISTS idx_interview_sessions_job_position ON public.intervi
 CREATE INDEX IF NOT EXISTS idx_interview_sessions_candidate_email ON public.interview_sessions (candidate_email);
 CREATE INDEX IF NOT EXISTS idx_interview_sessions_created_at ON public.interview_sessions (created_at DESC);
 
--- 1b. All interview question banks & marking guides (seeded automatically by the backend)
-CREATE TABLE IF NOT EXISTS public.interview_questions (
-  id TEXT PRIMARY KEY,
-  role_category TEXT NOT NULL,
-  category TEXT NOT NULL,
-  question_text TEXT NOT NULL,
-  proposed_answer TEXT NOT NULL,
-  expected_focus TEXT NOT NULL,
-  is_behavioral_star BOOLEAN NOT NULL DEFAULT FALSE,
-  alternative_wordings JSONB NOT NULL DEFAULT '[]'::jsonb,
-  marking_points JSONB NOT NULL DEFAULT '[]'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_interview_questions_role ON public.interview_questions (role_category);
+-- The old combined question table duplicated the role banks below and is not queried.
+DROP TABLE IF EXISTS public.interview_questions;
 
 -- Per-question answers and scores already live in interview_sessions.question_evaluations.
 -- Remove the old duplicate relational table; keep interview_sessions as the source of truth.
@@ -515,7 +502,6 @@ ORDER BY s.created_at DESC;
 -- frontend bundle cannot be used to read candidate emails, transcripts or answers,
 -- or to tamper with scores.
 ALTER TABLE public.customer_service_questions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.interview_questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.virtual_assistant_questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.technical_support_questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.candidates ENABLE ROW LEVEL SECURITY;
@@ -527,7 +513,6 @@ DROP POLICY IF EXISTS "Allow backend read/write candidates" ON public.candidates
 DROP POLICY IF EXISTS "Allow backend read/write interview_sessions" ON public.interview_sessions;
 
 REVOKE ALL ON TABLE public.customer_service_questions FROM anon, authenticated;
-REVOKE ALL ON TABLE public.interview_questions FROM anon, authenticated;
 REVOKE ALL ON TABLE public.virtual_assistant_questions FROM anon, authenticated;
 REVOKE ALL ON TABLE public.technical_support_questions FROM anon, authenticated;
 REVOKE ALL ON TABLE public.candidates FROM anon, authenticated;
@@ -536,7 +521,6 @@ REVOKE ALL ON public.candidate_scorecards_summary FROM anon, authenticated;
 
 GRANT USAGE ON SCHEMA public TO service_role;
 GRANT ALL ON TABLE public.customer_service_questions TO service_role;
-GRANT ALL ON TABLE public.interview_questions TO service_role;
 GRANT ALL ON TABLE public.virtual_assistant_questions TO service_role;
 GRANT ALL ON TABLE public.technical_support_questions TO service_role;
 GRANT ALL ON TABLE public.candidates TO service_role;
