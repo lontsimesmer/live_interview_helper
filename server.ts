@@ -6210,7 +6210,7 @@ app.post('/api/interview-turn', async (req, res) => {
         stage1Ack = `I'm doing really well, thank you for asking, ${session.candidateName}!`;
       }
 
-      const walkthroughReply = `${stage1Ack} Before we dive in, let me quickly walk you through how our interview will go. We have about ten minutes together: I'll ask you ${session.questions.length === 5 ? 'five' : 'four'} questions about your background and realistic scenarios for the ${session.detectedRole} role, with up to 90 seconds per question, and at the end you'll have time to ask me any questions of your own. Does that sound good, or do you have any questions before we start?`;
+      const walkthroughReply = `${stage1Ack} This will be a short conversation about the ${session.detectedRole} role. You can ask me to repeat anything, and there'll be time for your questions at the end. Ready to start?`;
 
       session.transcript.push({
         id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
@@ -6441,7 +6441,13 @@ Rephrase this question calmly and warmly in simpler words, keeping exactly the s
         session.currentQuestionIndex += 1;
         session.currentQuestionAttempts = 0;
         const nextQ = session.questions[session.currentQuestionIndex];
-        const timeoutMsg = `Thank you, ${session.candidateName}—our 90 seconds for Question ${currentQ.number} are up, so let's move smoothly to Question ${nextQ.number}: ${nextQ.question}`;
+        const transitions = [
+          `That gives me a helpful picture. Let's look at another part of the role. ${nextQ.question}`,
+          `I understand. Let me ask you about a different situation. ${nextQ.question}`,
+          `All right, let's shift to another area. ${nextQ.question}`,
+          `Thanks, that helps me understand your approach. Here's another scenario. ${nextQ.question}`,
+        ];
+        const timeoutMsg = transitions[Math.floor(Math.random() * transitions.length)];
 
         session.transcript.push({
           id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
@@ -6463,7 +6469,12 @@ Rephrase this question calmly and warmly in simpler words, keeping exactly the s
         });
       } else {
         session.currentPhase = 'candidate_questions';
-        const stage5Msg = `Thank you, ${session.candidateName}—our 90 seconds on that final question are up. That's everything from my side. Before we wrap up, do you have any questions for me about the ${session.detectedRole} role or Global Hire 360?`;
+        const closingOptions = [
+          `That covers my questions. What would you like to ask me about the ${session.detectedRole} role or Global Hire 360?`,
+          `All right, let's turn it over to you. What questions do you have about the ${session.detectedRole} role or Global Hire 360?`,
+          `Thanks for talking that through with me. Is there anything you'd like to ask about the ${session.detectedRole} role or Global Hire 360?`,
+        ];
+        const stage5Msg = closingOptions[Math.floor(Math.random() * closingOptions.length)];
         session.transcript.push({
           id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
           speaker: 'interviewer',

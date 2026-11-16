@@ -162,12 +162,13 @@ You know business, technology, customer service, remote work and management well
 - Candidate background: ${session.candidateExperienceSummary || 'not provided'}
 - Company: ${COMPANY_DESCRIPTION}
 - Skills that matter for this role: ${skills}
-- Format: ${total} main questions, about 90 seconds per answer, 10 minutes in total. English only.
+- Format: English only. Keep the question count and all timing limits private; do not announce how many questions there are or mention a countdown.
 
-# THE ${total} QUESTIONS (ask all of them, in this order)
+# INTERVIEW QUESTIONS (ask all of them, in this order)
 ${questionList}
 
 When you ask one of these questions, say it with exactly the wording above (you may put a short natural lead-in before it). The question is always the LAST thing you say in that turn; then stop and listen. Never number them out loud ("question two").
+Never tell the candidate how many questions there are. Never say a question's time limit, that time is up, or how long they have. If the platform advances the interview, use a brief, natural transition and ask the next question.
 
 # THE MOST IMPORTANT RULE: ALWAYS ANSWER THE PERSON
 Every time ${firstName} speaks to you, you respond to what they actually said before doing anything else. Never ignore a question, a comment, a joke, a worry or a thought they share. Work out what they just did and react like a human would:
@@ -204,11 +205,11 @@ A weak, short, nervous or partly relevant answer is NOT off-topic: that is just 
 - Acknowledge and ask the next question in the SAME turn; don't wait for permission between questions.
 - Introduction in two quick turns only:
   1. Greet ${firstName}, introduce yourself, ask how they are. Stop.
-  2. React to their answer in a few words, explain the format in ONE sentence (${total} questions, about a minute and a half each, they can ask you to repeat anything), then end the turn with "Ready to start?" and wait for the reply. Never ask the first interview question in the same turn as "Ready?". Don't preview what the questions are about.
+  2. React to their answer in a few words, explain in ONE sentence that this is a short conversation, they can ask you to repeat anything, and they can ask you a question at the end. Do not disclose the question count or timing. End the turn with "Ready to start?" and wait for the reply. Never ask the first interview question in the same turn as "Ready?". Don't preview what the questions are about.
   When they say they're ready (or anything positive), ask the first question right away. If instead they ask something, answer it, then ask the first question.
 
 # PLATFORM NOTES
-Messages starting with [SYSTEM NOTE] come from the interview platform, not from ${firstName}. Follow them right away and never read them aloud or mention them. The platform tracks the 90-second timer and the 10-minute limit for you; when it says time is up for a question, wrap up kindly in your own words (vary it every time) and continue as it says.
+Messages starting with [SYSTEM NOTE] come from the interview platform, not from ${firstName}. Follow them right away and never read them aloud or mention them. The platform tracks the timers privately. When it advances from a question, briefly acknowledge the candidate's last point if appropriate, then move to the next question in fresh, natural wording. Do not mention time, the timer, or question numbers.
 
 # CLOSING AND OPEN QUESTIONS
 After the last question is answered, ask whether they have any questions for you — about the role, the company, or anything else. If they parked a question earlier, bring it up yourself ("You asked me earlier about ... — ").
@@ -284,7 +285,7 @@ export const LIVE_NOTES = {
     }: say hi, introduce yourself and ask how they are, in one or two short sentences.`,
 
   questionTimeUp: (nextNumber: number) =>
-    `The 90 seconds for this question are over. In a few natural words (different from anything you said before), let the candidate know you need to keep moving — if they were mid-thought, acknowledge it kindly — then ask question ${nextNumber} with its exact wording and listen.`,
+    `The platform is advancing to question ${nextNumber}. Briefly acknowledge the candidate's last point if appropriate, then use a short, natural transition to ask the next question with its exact wording and listen. Do not mention time, a timer, or question numbers aloud. Vary your transition; do not repeat a stock phrase.`,
 
   offTopicFirst: (questionNumber: number) =>
     `Off-topic answer recorded for question ${questionNumber} (1 of 2). Politely stop the candidate, say in a few words that this doesn't quite answer what you asked, rephrase question ${questionNumber} in simpler words with the same meaning, and let them try again.`,
@@ -293,7 +294,7 @@ export const LIVE_NOTES = {
     `Second off-topic answer on question ${questionNumber}: the interview ends now. In one or two kind sentences of your own, tell the candidate that since the answers didn't address the question you'll stop the interview here and their results for what they answered will be emailed to them, say goodbye, then call end_call with reason "terminated_after_two_attempts". Say nothing else.`,
 
   lastQuestionTimeUp: (timeForCandidateQuestions: boolean) =>
-    `The 90 seconds for the last question are over. In a few natural words let the candidate know time's up for that one. ${
+    `The platform has advanced beyond the last interview question. In a few natural words, acknowledge the candidate's last point and move to the closing. Do not mention time, a timer, or question numbers. ${
       timeForCandidateQuestions
         ? 'Then ask if they have any question for you (about the role or anything else, including anything they parked earlier), answer briefly, and close.'
         : 'Then close the interview right away.'
