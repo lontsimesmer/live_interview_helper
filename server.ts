@@ -7,6 +7,7 @@ import {
   Modality,
   FunctionDeclaration,
 } from '@google/genai';
+import { waitUntil } from '@vercel/functions';
 import dotenv from 'dotenv';
 import {
   ANSWER_STARTED_WORDS,
@@ -21,8 +22,8 @@ import {
   flagOffTopicAnswerDeclaration,
   lookUpFactDeclaration,
 } from './interviewer-agent.js';
-import { candidateRecorders, pruneRecorders, recorderFor, transcribeCandidateAudio } from './candidate-audio.js';
-import { gradeAnswersWithRubric, wordCount } from './answer-grading.js';
+import { candidateRecorders, pruneRecorders, recorderFor } from './candidate-audio.js';
+import { wordCount } from './answer-grading.js';
 import { lookUpFact } from './fact-lookup.js';
 import mammoth from 'mammoth';
 import path from 'path';
@@ -6907,11 +6908,17 @@ async function runSessionFinalization(
   if (terminatedForMisconduct) {
     session.status = 'terminated_misconduct';
     if (!session.suspendedUntil) {
-      session.suspendedUntil = await suspendCandidateFor24Hours({
+      session.suspendedUntil = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+      const suspensionTask = suspendCandidateFor24Hours({
         email: session.candidateEmail,
         candidateId: session.candidateId,
         reason: 'Inappropriate language or professional misconduct during live interview.',
       });
+      void suspensionTask.then((until) => {
+        session.suspendedUntil = until;
+        activeSessions.set(session.id, session);
+        flushCandidatesAndSessionsToDisk();
+      }).catch((err) => console.warn('Could not persist misconduct suspension:', err?.message || err));
     }
     session.interviewerFinalImpression = `This interview was ended for unprofessional language, so it scores 0. You can try again after ${new Date(
       session.suspendedUntil
@@ -6962,20 +6969,27 @@ async function runSessionFinalization(
     }
   }
 
-  // Persist the finished session (and its per-answer rows) first, then send the single
-  // results email; sendResendAssessmentEmail is itself idempotent per session.
-  const supabaseRes = await saveSessionToSupabase(session);
-  session.supabaseSaved = supabaseRes.saved;
-  const resendRes = await sendResendAssessmentEmail(session);
-  if (!resendRes.inProgress) {
-    session.emailDeliveryNote = resendRes.note;
-  }
-  // Record final email state in the database row too.
-  await saveSessionToSupabase(session);
-  if (!resendRes.sent && !resendRes.inProgress && session.emailStatus === 'failed') {
-    // One more automatic try a few minutes later (same idempotency key: never a duplicate).
-    setTimeout(() => void retryResultEmail(session), 3 * 60_000).unref();
-  }
+  // Save locally now, then finish remote persistence and email delivery in the
+  // background. Neither service should keep the candidate waiting for their score.
+  const persistPromise = saveSessionToSupabase(session).then((result) => {
+    session.supabaseSaved = result.saved;
+  });
+  const emailPromise = sendResendAssessmentEmail(session).then((result) => {
+    if (!result.inProgress) session.emailDeliveryNote = result.note;
+    return result;
+  });
+  const backgroundWork = Promise.allSettled([persistPromise, emailPromise]).then(async (results) => {
+    const emailResult = results[1].status === 'fulfilled' ? results[1].value : null;
+    await saveSessionToSupabase(session).catch((err) => {
+      console.warn('Could not save final email state:', err?.message || err);
+      return { saved: false };
+    });
+    if (emailResult && !emailResult.sent && !emailResult.inProgress && session.emailStatus === 'failed') {
+      setTimeout(() => void retryResultEmail(session), 3 * 60_000).unref();
+    }
+  }).catch((err) => console.warn('Final session background work failed:', err?.message || err));
+  if (process.env.VERCEL) waitUntil(backgroundWork);
+  else void backgroundWork;
 
   return spokenClosingMessage;
 }
@@ -7032,58 +7046,11 @@ export function collectCandidateAnswersPerQuestion(session: InterviewSessionReco
 }
 
 /**
- * Replaces the live captions of the candidate's turns with an accurate English transcript of
- * the recorded microphone audio (see candidate-audio.ts). Turns that cannot be transcribed
- * keep their live caption. The audio is discarded afterwards.
+ * Grades live captions against the local answer guide. This is synchronous so provider
+ * outages cannot hold up results.
  */
-async function applyAccurateCandidateTranscript(session: InterviewSessionRecord): Promise<void> {
-  const recorder = candidateRecorders.get(session.id);
-  const ai = getGenAIClientOrNull();
-  try {
-    if (!recorder || !ai || !recorder.hasAudio) return;
-    const byEntry = await transcribeCandidateAudio(ai, recorder, {
-      vocabulary: buildTranscriptionVocabulary(session),
-      questions: session.questions,
-    });
-    let replaced = 0;
-    for (const entry of session.transcript) {
-      const accurate = entry.speaker === 'candidate' ? byEntry.get(entry.id) : undefined;
-      if (accurate) {
-        entry.text = clampText(accurate, 6000);
-        replaced += 1;
-      }
-    }
-    console.log(`[Transcript] ${session.id}: ${replaced} candidate turn(s) re-transcribed from audio.`);
-  } catch (err: any) {
-    console.warn('Accurate candidate transcript unavailable, keeping live captions:', err?.message || err);
-  } finally {
-    candidateRecorders.delete(session.id);
-  }
-}
-
-/**
- * Grades a live voice interview question by question: each answer (the candidate's own words,
- * from the accurate transcript) is marked out of 5 against the suggested answer with a fixed
- * rubric (answer-grading.ts). The keyword marking guide is used only when AI grading fails.
- */
-async function gradeLiveInterviewAnswers(session: InterviewSessionRecord): Promise<QuestionEvaluation[]> {
+function gradeLiveInterviewAnswers(session: InterviewSessionRecord): QuestionEvaluation[] {
   const answers = collectCandidateAnswersPerQuestion(session);
-  const ai = getGenAIClientOrNull();
-  const rubric = ai
-    ? await gradeAnswersWithRubric(
-        ai,
-        session.detectedRole,
-        session.questions.map((q) => ({
-          question: {
-            number: q.number,
-            question: q.question,
-            suggestedAnswer: q.proposedAnswer || q.expectedFocus,
-            expectedFocus: q.expectedFocus,
-          },
-          answer: answers.get(q.number) || '',
-        }))
-      )
-    : new Map();
 
   return session.questions.map((q) => {
     const text = (answers.get(q.number) || '').trim();
@@ -7116,20 +7083,19 @@ async function gradeLiveInterviewAnswers(session: InterviewSessionRecord): Promi
       role: session.detectedRole,
       aiScoreOutOf5: null,
     });
-    const r = rubric.get(q.number);
     return {
       ...base,
       candidateAnswer: text,
       attemptsUsed: 1,
       timedOut: false,
-      scoreOutOf5: r ? r.scoreOutOf5 : guide.scoreOutOf5,
-      feedback: r?.feedback || guide.feedback,
-      strengths: r ? r.strengths : guide.strengths,
-      improvementTip: r?.improvementTip || guide.improvementTip,
-      alignmentPercent: r ? Math.round((r.alignment / 2) * 100) : guide.alignmentPercent,
+      scoreOutOf5: guide.scoreOutOf5,
+      feedback: guide.feedback,
+      strengths: guide.strengths,
+      improvementTip: guide.improvementTip,
+      alignmentPercent: guide.alignmentPercent,
       matchedPoints: guide.matchedPoints,
       missedPoints: guide.missedPoints,
-      gradingMethod: r ? 'marking_guide+ai' : 'marking_guide',
+      gradingMethod: 'marking_guide',
     } as QuestionEvaluation;
   });
 }
@@ -7209,10 +7175,11 @@ app.post('/api/finalize-live-ws-session', async (req, res) => {
     // Text/fallback-voice interviews are already graded answer by answer in /api/interview-turn.
     const alreadyGradedTurnByTurn = !session.liveMode && session.questionEvaluations.length > 0;
     if (!alreadyGradedTurnByTurn) {
-      // Answers are marked on what the candidate said: first get that text exactly right.
-      if (session.liveMode) await applyAccurateCandidateTranscript(session);
-      session.questionEvaluations = await gradeLiveInterviewAnswers(session);
+      // Use the live captions and local marking guide here so provider outages cannot
+      // hold the results page open. Audio transcription is best effort after the call.
+      session.questionEvaluations = gradeLiveInterviewAnswers(session);
     }
+    candidateRecorders.delete(session.id);
 
     return await concludeAndFinalizeSession(
       session,

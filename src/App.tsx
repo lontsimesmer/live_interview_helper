@@ -1012,6 +1012,7 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
   const [isReconnectingVoice, setIsReconnectingVoice] =
     useState<boolean>(false);
   const [isScrutinizingCall, setIsScrutinizingCall] = useState<boolean>(false);
+  const [finalizeError, setFinalizeError] = useState<string | null>(null);
   const [usingGeminiLiveWs, setUsingGeminiLiveWs] = useState<boolean>(false);
   const [misconductBanner, setMisconductBanner] = useState<{
     pointsDeducted: number;
@@ -1053,6 +1054,10 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
   // Silent background timers (90s per question + 10m total session) — hidden from UI per specification
   const questionSecondsRef = useRef<number>(90);
   const finalizeRequestedRef = useRef<boolean>(false);
+  const finalizeParamsRef = useRef({
+    terminatedByAttemptRule: false,
+    terminatedByMisconduct: false,
+  });
   const sessionSecondsRef = useRef<number>(
     (() => {
       const max = initialSession?.maxDurationSeconds || 600;
@@ -1531,6 +1536,8 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
       // another results email.
       if (finalizeRequestedRef.current) return;
       finalizeRequestedRef.current = true;
+      finalizeParamsRef.current = { terminatedByAttemptRule, terminatedByMisconduct };
+      setFinalizeError(null);
       // The call is over: close the mic path and silence the interviewer for good.
       callEndingRef.current = true;
       stopLiveAudio();
@@ -1542,10 +1549,12 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
       } catch {
         // ignore
       }
+      let navigationScheduled = false;
       try {
         const res = await fetch("/api/finalize-live-ws-session", {
           method: "POST",
           headers: sessionHeaders(),
+          signal: AbortSignal.timeout(30000),
           body: JSON.stringify({
             sessionId: currentSession.id,
             liveTranscript: liveTranscriptRef.current,
@@ -1553,20 +1562,38 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
             terminatedByMisconduct,
           }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (res.ok && data.session) {
+          navigationScheduled = true;
           window.setTimeout(() => {
             onSessionCompleted(data.session);
             navigate("/scoring");
           }, 1200);
           return;
         }
+        throw new Error(data.error || `Results request failed (${res.status}).`);
       } catch (e) {
         console.warn("Finalize live session error:", e);
-        setIsScrutinizingCall(false);
-        finalizeRequestedRef.current = false; // allow a manual retry after a network failure
+        try {
+          const resultRes = await fetch(
+            `/api/session/${encodeURIComponent(currentSession.id)}`,
+            { headers: sessionHeaders(), signal: AbortSignal.timeout(8000) },
+          );
+          const resultData = await resultRes.json().catch(() => ({}));
+          if (resultRes.ok && resultData.session?.currentPhase === "finished") {
+            navigationScheduled = true;
+            onSessionCompleted(resultData.session);
+            navigate("/scoring");
+            return;
+          }
+        } catch (recoveryError) {
+          console.warn("Could not recover the completed interview:", recoveryError);
+        }
+        setFinalizeError("Your interview has ended, but the results did not load. Try again.");
+        finalizeRequestedRef.current = false;
       } finally {
         setIsProcessingTurn(false);
+        if (!navigationScheduled) setIsScrutinizingCall(false);
       }
     },
     [clearCurrentSpeechPlayback, stopLiveAudio, onSessionCompleted, navigate],
@@ -2310,6 +2337,24 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
             <span>{misconductBanner.message}</span>
           </div>
         )}
+        {finalizeError && (
+          <div className="mb-8 max-w-md w-full px-4 py-3 rounded-xl bg-amber-950/80 border border-amber-400/60 text-amber-100 text-sm text-left">
+            <p>{finalizeError}</p>
+            <button
+              type="button"
+              onClick={() =>
+                void finalizeGeminiLiveCallRef.current(
+                  finalizeParamsRef.current.terminatedByAttemptRule,
+                  finalizeParamsRef.current.terminatedByMisconduct,
+                )
+              }
+              disabled={isProcessingTurn}
+              className="mt-3 rounded-lg bg-white/15 px-3 py-2 font-semibold hover:bg-white/25 disabled:opacity-50"
+            >
+              Try again
+            </button>
+          </div>
+        )}
 
         <div
           className={`w-40 h-40 rounded-full bg-gradient-to-br from-[#339A05] to-[#1f5f03] flex items-center justify-center text-6xl font-extrabold shadow-2xl border-4 transition-colors duration-300 ${
@@ -2396,7 +2441,12 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
         </button>
         <button
           type="button"
-          onClick={() => finalizeGeminiLiveCall(false)}
+          onClick={() =>
+            void finalizeGeminiLiveCall(
+              finalizeParamsRef.current.terminatedByAttemptRule,
+              finalizeParamsRef.current.terminatedByMisconduct,
+            )
+          }
           disabled={isProcessingTurn && !usingGeminiLiveWs}
           aria-label="End call"
           title="End call"
