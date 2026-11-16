@@ -75,11 +75,11 @@ export const CORE_INTERVIEW_QUESTIONS: InterviewQuestion[] = [
     whyWeAsk:
       'Evaluates your baseline Workplace English clarity, professional confidence, and how clearly you connect your past work to remote employer needs.',
     whatGoodLooksLike: [
-      'Summarizes 2–3 relevant past roles or core strengths in plain, confident English',
+      'Summarizes 2-3 relevant past roles or core strengths in clear English',
       'Mentions specific remote tools or workflows you have used (e.g., Zoom, Slack, CRM, Google Workspace)',
       'Focuses on reliability and value delivered to employers rather than personal convenience',
     ],
-    recommendedFramework: 'Present – Past – Remote Readiness',
+    recommendedFramework: 'Present, Past, Remote Readiness',
     sampleStrongAnswer:
       'Over the past four years, I have worked in client-facing support and administrative coordination, managing high-volume email, shared calendars, and CRM records. In my last role, I collaborated daily with team members across three time zones using Slack, Zoom, and Google Workspace, maintaining a 98% customer satisfaction score. I am ready for a Global Hire 360 remote placement because I have a quiet, dedicated home office, reliable high-speed internet with a backup connection, and proven discipline in meeting daily KPIs without micromanagement.',
   },
@@ -98,7 +98,7 @@ export const CORE_INTERVIEW_QUESTIONS: InterviewQuestion[] = [
       'Shows proactive problem-solving before escalating (checking documentation, testing backup connections)',
       'Explains how to write a clear, actionable async update so the manager can respond quickly',
     ],
-    recommendedFramework: 'Routine – Troubleshoot – Communicate Proactively',
+    recommendedFramework: 'Routine, Troubleshoot, Communicate Proactively',
     sampleStrongAnswer:
       'I start each morning 15 minutes before my shift to review urgent messages, check my task board, and rank my top three priorities. If I run into unclear instructions while my manager is offline, I first check our standard operating procedures and past tickets for context. I then send a structured message stating the issue, the two best options I see, and which option I am proceeding with in the meantime so work never comes to a complete halt. For technical issues, I maintain a mobile hotspot backup and immediately notify the team channel if any system outage occurs.',
   },
@@ -132,13 +132,13 @@ export const CORE_INTERVIEW_QUESTIONS: InterviewQuestion[] = [
     whyWeAsk:
       'Verifies that you understand how Global Hire 360 operates as a direct staffing agency, how onboarding works, and how to conduct yourself professionally in the candidate community.',
     whatGoodLooksLike: [
-      'Understands that "NOT MATCHING" means not currently under active review—not a rejection—and knows to contact support if status reverts after an interview',
+      'Understands that "NOT MATCHING" means the profile is not under active review, not that the candidate was rejected, and knows to contact support if the status changes after an interview',
       'Confirms clicking "Mark Complete" on all Workforce English lessons and keeping profile/ID strictly in the private verification portal (never in group chats)',
       'Demonstrates readiness to respond promptly and professionally when a "MATCHED" opportunity appears on the dashboard',
     ],
-    recommendedFramework: 'Compliance – Dashboard Literacy – Professional Conduct',
+    recommendedFramework: 'Compliance, Dashboard Literacy, Professional Conduct',
     sampleStrongAnswer:
-      'I understand that Global Hire 360 is a direct staffing and talent-matching agency rather than an open job board. To stay 100% match-ready, I make sure every lesson in the Workforce English certification is explicitly marked complete, my government ID is uploaded only inside the secure verification section of my dashboard—never in public group chats—and I check my candidate portal daily. I also know that "Not Matching" is not a rejection, whereas "Matching" means my profile is under review, and if I receive a "Matched" status or recruiter message, I will respond promptly and follow all dashboard instructions.',
+      'I understand that Global Hire 360 is a staffing and talent-matching agency, not an open job board. I complete every Workforce English lesson and upload my government ID only in the secure verification section of my dashboard. I check my candidate portal daily. I know that "Not Matching" is not a rejection, while "Matching" means my profile is under review. If I receive a "Matched" status or recruiter message, I respond promptly and follow the dashboard instructions.',
   },
 ];
 
@@ -166,7 +166,7 @@ export const ROLE_TRACKS: RoleTrack[] = [
           'Verifies the account details and explains the exact next step and timeline transparently',
           'Follows up proactively until the billing issue is confirmed resolved',
         ],
-        recommendedFramework: 'Acknowledge – Investigate – Set Clear Timeline – Follow Through',
+        recommendedFramework: 'Acknowledge, Investigate, Set a Clear Timeline, Follow Through',
         sampleStrongAnswer:
           'First, I would thank the customer for bringing this to my attention and sincerely apologize for the stress caused by a duplicate charge. While pulling up their billing record, I would confirm both transaction IDs so they know I am taking immediate action. I would then explain clearly that I have submitted an urgent priority refund request to my supervisor, give them the exact ticket reference number, and let them know I will personally email them an update within two hours so they do not have to call back.',
       },
@@ -195,9 +195,9 @@ export const ROLE_TRACKS: RoleTrack[] = [
           'Proposes concrete alternative time slots before reaching out to reschedule',
           'Communicates clearly with the executive on progress for the 4:00 PM deliverable',
         ],
-        recommendedFramework: 'Triage Urgency – Propose Solutions – Execute Cleanly',
+        recommendedFramework: 'Triage Urgency, Propose Solutions, Execute Cleanly',
         sampleStrongAnswer:
-          'I would immediately check the context of both 2:00 PM meetings—such as whether one is a new client pitch and the other is a routine check-in—and find two open reschedule slots on the calendar. I would send my executive a concise message recommending which meeting to keep and offering to move the other right away. Once the calendar conflict is settled within 10 minutes, I would block uninterrupted focus time to complete and double-check the 500-row spreadsheet audit well before the 4:00 PM EST deadline.',
+          'I would check the context of both 2:00 PM meetings, including whether one is a new client pitch and the other is a routine check-in. I would find two open reschedule slots and send my executive a brief recommendation. After resolving the conflict, I would block time to finish and double-check the 500-row spreadsheet audit before the 4:00 PM EST deadline.',
       },
     ],
   },
@@ -224,9 +224,9 @@ export const ROLE_TRACKS: RoleTrack[] = [
           'Confirms what the user sees on their screen at each step',
           'Documents the root cause and resolution clearly in the helpdesk ticket',
         ],
-        recommendedFramework: 'Reassure – Isolate One Step at a Time – Verify & Document',
+        recommendedFramework: 'Reassure, Isolate One Step at a Time, Verify and Document',
         sampleStrongAnswer:
-          'I start by reassuring the user that we will get them back up and running step by step. Instead of using technical terms like DNS cache or VPN tunnel, I use simple visual landmarks on their screen—for example, asking them to look at the bottom-right corner by the clock and tell me what icon they see. I give one instruction at a time, confirm it worked before moving to the next, and once resolved, I summarize the fix in plain English and log the technical details in the ticket.',
+          'I reassure the user that we will work through the problem together. I use clear directions and avoid unnecessary technical terms. I give one instruction at a time, check that it worked, then summarize the fix and document it in the ticket.',
       },
     ],
   },
@@ -253,7 +253,7 @@ export const ROLE_TRACKS: RoleTrack[] = [
           'Pivots with a short, value-focused question or offers a low-friction follow-up',
           'Logs accurate notes in the CRM for future nurturing',
         ],
-        recommendedFramework: 'Acknowledge – Pivot with Value – Low-Friction Next Step',
+        recommendedFramework: 'Acknowledge, Pivot with Value, Suggest a Simple Next Step',
         sampleStrongAnswer:
           'I would respond warmly: "I completely understand, and it is great to hear you already have a solid setup in place. Many of the teams we support felt the same way until they used our workflow to cut their weekly processing time by 30% alongside their existing provider. Would you be open to me sending a 60-second comparison summary by email, and if it is relevant, we can chat for 10 minutes next Tuesday?"',
       },
@@ -282,9 +282,9 @@ export const ROLE_TRACKS: RoleTrack[] = [
           'Tracks concrete KPIs (click-through rate, conversion rate, organic traffic, qualified leads)',
           'Explains how to iterate when a campaign underperforms',
         ],
-        recommendedFramework: 'Goal & Audience – Execution – KPI Measurement & Iteration',
+        recommendedFramework: 'Goal and Audience, Execution, Measure and Improve',
         sampleStrongAnswer:
-          'I begin by reviewing the client’s brand guidelines, target customer persona, and primary conversion goal. Before launching a full campaign, I draft clear copy with a single call-to-action and test two subject lines or visual hooks. After launch, I track open rates, click-through rates, and actual lead conversions—not just vanity likes—and share a simple weekly performance summary showing what worked and what we are optimizing next.',
+          'I review the client’s brand guidelines, target customer and main goal. Before launch, I draft clear copy with one call to action and test two subject lines or visuals. After launch, I track opens, clicks and leads, then share a weekly summary of the results and next steps.',
       },
     ],
   },
@@ -311,7 +311,7 @@ export const ROLE_TRACKS: RoleTrack[] = [
           'Never guesses or forces a reconciliation balance',
           'Presents the finding clearly with supporting documentation and recommended correction',
         ],
-        recommendedFramework: 'Verify Source Docs – Isolate Variance – Report with Evidence',
+        recommendedFramework: 'Verify Source Documents, Isolate Differences, Report with Evidence',
         sampleStrongAnswer:
           'First, I compare the bank statement lines against the original vendor invoices and payment confirmations to see if the variance comes from foreign exchange fees, duplicate entries, or an unrecorded credit memo. I never force a reconciliation plug. Once I isolate the exact transactions causing the gap, I document them in a clean summary table with invoice attachments and present the exact adjustment needed for the controller or business owner to approve.',
       },
@@ -340,7 +340,7 @@ export const ROLE_TRACKS: RoleTrack[] = [
           'Verifies identity before sharing any protected health or scheduling details',
           'Records accurate notes in the care management system',
         ],
-        recommendedFramework: 'Compassionate Tone – Identity Verification – Accurate Intake',
+        recommendedFramework: 'Compassionate Tone, Verify Identity, Record Details Accurately',
         sampleStrongAnswer:
           'When speaking with an anxious patient or family member, I lower my speaking pace and reassure them that I am here to help them step by step. Before discussing any appointment or record details, I politely explain that for their protection I need to verify two identity details first. Once verified, I walk them through the intake or scheduling options clearly, confirm they have no remaining questions, and log all updates accurately in the secure portal.',
       },

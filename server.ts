@@ -191,7 +191,7 @@ function getSupabaseConfig(): { url: string; key: string; projectRef?: string } 
     warnedAboutAnonSupabaseKey = true;
     console.warn(
       'SECURITY: SUPABASE_SERVICE_ROLE_KEY is not set; falling back to the public anon key. ' +
-        'After applying the hardened supabase-schema.sql, anon writes are rejected — set SUPABASE_SERVICE_ROLE_KEY.'
+        'After applying the hardened supabase-schema.sql, anon writes are rejected. Set SUPABASE_SERVICE_ROLE_KEY.'
     );
   }
   const supabaseKey = serviceRoleKey || anonFallbackKey;
@@ -1293,11 +1293,11 @@ async function sendResendAssessmentEmail(
     const totalDisplayScore = session.totalScoreOutOf20 ?? session.totalScoreOutOf25;
     const maxScore = INTERVIEW_MAX_SCORE;
     const appreciationTitle = passed
-      ? 'Congratulations — You Passed This Practice Interview!'
-      : 'Good Effort — Keep Practicing to Reach Placement Readiness';
+      ? 'Congratulations, you passed this practice interview!'
+      : 'Keep practicing for your next interview';
     const appreciationBodyText = passed
-      ? `Outstanding work, ${session.candidateName}! You demonstrated strong communication, clear role knowledge, and composure for the ${session.detectedRole} position. You are well-prepared for your upcoming employer interview.`
-      : `Thank you for practicing with us, ${session.candidateName}. Every practice conversation builds your confidence for the real ${session.detectedRole} interview. Review the suggested answers on your results page and retake the practice session whenever you are ready.`;
+      ? `You passed the ${session.detectedRole} practice interview. Review your score and feedback below.`
+      : `Review the feedback and suggested answers on your results page before trying again.`;
 
     const htmlContent = `
     <div style="font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; border: 1px solid #E2E8F0; border-radius: 14px; overflow: hidden; background: #FFFFFF;">
@@ -1331,16 +1331,16 @@ async function sendResendAssessmentEmail(
         </div>
       </div>
       <div style="background: #F8FAFC; border-top: 1px solid #E2E8F0; padding: 14px 28px; text-align: center; font-size: 11px; color: #64748B;">
-        Global Hire 360 &bull; AI Interview Preparation &amp; Recruiting Readiness Platform
+        Global Hire 360 &bull; Interview Practice
       </div>
     </div>
   `;
 
     const plainTextContent = [
-      `GLOBAL HIRE 360 — INTERVIEW PRACTICE SUMMARY`,
+      `GLOBAL HIRE 360 INTERVIEW PRACTICE SUMMARY`,
       `Candidate: ${session.candidateName}`,
       `Role: ${session.detectedRole}`,
-      `Overall Score: ${totalDisplayScore} / ${maxScore} (${session.percentageScore}%) — ${passed ? 'PASSED' : 'PRACTICE RECOMMENDED'}`,
+      `Overall Score: ${totalDisplayScore} / ${maxScore} (${session.percentageScore}%). ${passed ? 'PASSED' : 'PRACTICE RECOMMENDED'}`,
       ``,
       appreciationTitle,
       appreciationBodyText,
@@ -1352,7 +1352,7 @@ async function sendResendAssessmentEmail(
     ].join('\n');
 
     const subjectLine = singleLine(
-      `Global Hire 360 Interview Results: ${session.candidateName} (${session.detectedRole}) — ${totalDisplayScore}/${maxScore}`,
+      `Global Hire 360 Interview Results: ${session.candidateName} (${session.detectedRole}), ${totalDisplayScore}/${maxScore}`,
       200
     );
 
@@ -2048,7 +2048,7 @@ export const CUSTOMER_SERVICE_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
       },
       {
         label: 'Persistence & willingness to research when a problem needs another approach',
-        tip: 'Show persistence—not giving up quickly when an issue requires extra research or a different approach.',
+        tip: 'Show persistence. Keep researching when the first approach does not work.',
         regex:
           /\b(?:don'?t\s+give\s+up|persist(?:ent|ence)|research(?:ing)?|another\s+approach|alternative|dig\s+deeper|follow\s+through|determined|resourceful|solution)\b/i,
       },
@@ -2153,13 +2153,13 @@ export const CUSTOMER_SERVICE_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
       },
       {
         label: 'Resolution Action: investigated details, followed procedures & explained options',
-        tip: 'Detail the concrete steps you took—checking the account/order, following procedures, explaining options, and following up.',
+        tip: 'Describe what you checked, the steps you followed, the options you explained and how you followed up.',
         regex:
           /\b(?:check(?:ed|ing)|investigat(?:ed|ing)|looked\s+into|verified|option(?:s)?|solution|procedure(?:s)?|polic(?:y|ies)|follow(?:ed)?\s+up|next\s+step(?:s)?)\b/i,
       },
       {
         label: 'Positive Result & Takeaway: customer satisfied and conversation ended positively',
-        tip: 'Share the positive outcome—how the customer accepted the solution and left satisfied.',
+        tip: 'Share the positive outcome and explain how the customer responded.',
         regex:
           /\b(?:result|outcome|accepted|positive(?:ly)?|satisfied|happy|thanked|calmed\s+down|resolved|reinforced|learned)\b/i,
       },
@@ -2190,7 +2190,7 @@ export const CUSTOMER_SERVICE_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
       },
       {
         label: 'Quality Action: used resources efficiently & communicated clearly rather than rushing wrong answers',
-        tip: 'Show how you protected accuracy—using resources and communicating transparently instead of rushing an incorrect answer.',
+        tip: 'Explain how you checked the details and kept the customer informed instead of guessing.',
         regex:
           /\b(?:accura(?:te|cy)|resources|efficient(?:ly)?|research|communicat(?:ed|ing)|instead\s+of\s+rushing|correct|verified|tools|templates)\b/i,
       },
@@ -2270,7 +2270,7 @@ export const CUSTOMER_SERVICE_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
       },
       {
         label: 'Result & Growth: issue resolved and stronger confidence in researching tough problems',
-        tip: 'Share the outcome—how the issue was resolved and how it strengthened your problem-solving skills.',
+        tip: 'Share how you resolved the issue and what you learned from it.',
         regex:
           /\b(?:resolved|solved|fixed|result|outcome|comfortable\s+researching|learned|confident|satisfied|happy)\b/i,
       },
@@ -2307,7 +2307,7 @@ export const CUSTOMER_SERVICE_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
       },
       {
         label: 'Positive Result: customer became satisfied & reinforced the importance of follow-through',
-        tip: 'Highlight the turnaround result—how the customer left satisfied and their confidence was restored.',
+        tip: 'Explain how you resolved the issue and restored the customer\'s confidence.',
         regex:
           /\b(?:satisfied|positive|happy|appreciated|thanked|loyal|restored|result|outcome|reminded|important)\b/i,
       },
@@ -2878,7 +2878,7 @@ export const TECHNICAL_SUPPORT_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
     category: 'Technical Support Introduction',
     question: 'Tell me about yourself.',
     proposedAnswer:
-      'I’m a technically minded professional who enjoys troubleshooting problems and helping people use technology effectively. I’m comfortable researching issues, following logical troubleshooting steps and learning new systems. I also understand that technical support is not only about fixing the technology — it is about communicating clearly with the person experiencing the problem. I’m interested in this role because it would allow me to combine problem-solving with customer support.',
+      'I enjoy troubleshooting problems and helping people use technology. I research issues, follow clear steps and learn new systems. Good technical support also means communicating clearly with the person who needs help. This role would let me combine problem-solving with customer service.',
     expectedFocus:
       'Technically minded, enjoys troubleshooting and helping people use technology, researching issues and following logical steps, learning new systems, communicating clearly with users, and combining problem-solving with customer support.',
     isBehavioralStar: false,
@@ -2903,7 +2903,7 @@ export const TECHNICAL_SUPPORT_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
       },
       {
         label: 'Motivation: combining problem-solving with customer support',
-        tip: 'Explain why this role interests you — combining problem-solving with helping customers.',
+        tip: 'Explain why you want to combine problem-solving with customer support.',
         regex:
           /\b(?:interested|combine|customer\s+support|help(?:ing)?\s+(?:people|users|customers)|this\s+role|enjoy|passion(?:ate)?)\b/i,
       },
@@ -3075,7 +3075,7 @@ export const TECHNICAL_SUPPORT_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
           /\b(?:difficult|complex|unusual|not\s+resolved|first\s+(?:troubleshooting\s+)?steps|issue|problem|user\s+reported|restore|ability\s+to\s+work|couldn'?t\s+(?:log|connect|access))\b/i,
       },
       {
-        label: 'Action: gathered information — when it started & what was already tried',
+        label: 'Action: gathered information, when it started and what was already tried',
         tip: 'Explain how you gathered information: when the issue started and what the user had already tried.',
         regex:
           /\b(?:gather(?:ed|ing)|information|when\s+(?:it|the\s+issue)\s+started|already\s+tried|asked|logs?|error\s+messages?|details)\b/i,
@@ -3235,7 +3235,7 @@ export const TECHNICAL_SUPPORT_QUESTION_TABLE: CustomerServiceQuestionRow[] = [
           /\b(?:restor(?:e|ed)|revert(?:ed)?|roll(?:ed)?\s+back|correct(?:ed)?|test(?:ed|ing)?|document(?:ed|ation)?|undo|backup)\b/i,
       },
       {
-        label: 'Result: corrected & added a verification step — slow down and verify changes',
+        label: 'Result: corrected the issue and added a verification step',
         tip: 'Close with the result: it was corrected, and you added a verification step and learned to verify changes before assuming they work.',
         regex:
           /\b(?:verif(?:y|ication|ied)|extra\s+step|checklist|slow\s+down|double[\s-]?check|learn(?:ed|t)|taught|process|result|lesson)\b/i,
@@ -3280,8 +3280,8 @@ export const UNIVERSAL_FIRST_QUESTION_VARIANTS: string[] = [
 
 /** Max score every interview is marked on, regardless of how many questions were asked. */
 export const INTERVIEW_MAX_SCORE = 20;
-/** Passing benchmark on the /20 scale (65%). */
-export const INTERVIEW_PASSING_SCORE = 13;
+/** Passing benchmark on the /20 scale (85%). */
+export const INTERVIEW_PASSING_SCORE = 17;
 export const DEFAULT_QUESTION_COUNT = 4;
 export const EXTENDED_QUESTION_COUNT = 5;
 
@@ -5767,7 +5767,7 @@ function buildResumeResponse(session: InterviewSessionRecord) {
   if (session.currentPhase === 'questioning' && session.questions[session.currentQuestionIndex]) {
     const q = session.questions[session.currentQuestionIndex];
     session.currentQuestionAttempts = 0;
-    continueLine = `Welcome back, ${name}! Let's pick up right where we left off. Question ${q.number}: ${q.question}`;
+    continueLine = `Welcome back, ${name}. Let's pick up where we left off. ${q.question}`;
   } else if (session.currentPhase === 'candidate_questions') {
     continueLine = `Welcome back, ${name}! We had finished the core questions. Before we wrap up, do you have any questions for me about the ${session.detectedRole} role or Global Hire 360?`;
   } else if (session.currentPhase === 'process_walkthrough') {
@@ -5779,7 +5779,7 @@ function buildResumeResponse(session: InterviewSessionRecord) {
   session.transcript.push({
     id: `tr_${Date.now()}_${crypto.randomBytes(3).toString('hex')}_resume`,
     speaker: 'interviewer',
-    speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+    speakerName: 'Operations and Talent Manager',
     text: continueLine,
     timestamp: new Date().toISOString(),
     questionIndex: session.currentPhase === 'questioning' ? session.currentQuestionIndex : undefined,
@@ -5959,8 +5959,8 @@ app.post('/api/start-interview-session', async (req, res) => {
       });
 
       const greetingText = isFirstTimeCandidate
-        ? `Hi, good morning ${candidateName}! I'm Sarah, the Operations and Talent Manager here at Global Hire 360. Thanks for joining me today for the ${examined.detectedRole} interview. How are you doing today?`
-        : `Hi ${candidateName}, welcome back! It's Sarah from Global Hire 360 again. Great to see you practicing for the ${examined.detectedRole} role once more. How are you doing today?`;
+        ? `Good morning, ${candidateName}. I'm the Operations and Talent Manager at Global Hire 360. How are you today?`
+        : `Welcome back, ${candidateName}. How are you doing today?`;
 
       const newSession: InterviewSessionRecord = {
         id: sessionId,
@@ -6074,7 +6074,7 @@ app.post('/api/interview-turn', async (req, res) => {
           : timedOut
           ? cleanText
             ? `${cleanText} [90-Second Timer Expired]`
-            : '[90-Second Timer Expired — No response completed within 90s]'
+            : '[No response completed within the question time limit]'
           : requestedRephrase
           ? cleanText || 'Could you please rephrase the question for me?'
           : cleanText,
@@ -6114,12 +6114,10 @@ app.post('/api/interview-turn', async (req, res) => {
 
           const activePromptToRepeat =
             session.currentPhase === 'questioning' && session.questions[session.currentQuestionIndex]
-              ? `Now, let's reset your timer and try Question ${
-                  session.questions[session.currentQuestionIndex].number
-                } again in a strictly professional manner: ${
+              ? `Let's try that question again. ${
                   session.questions[session.currentQuestionIndex].question
                 }`
-              : `Now, let's keep things strictly professional—how are you doing today, and are you ready for Question 1?`;
+              : `Let's keep the conversation respectful. How are you today?`;
 
           const warningReply = `Hold on right there, ${session.candidateName}. While I enjoy keeping our interview warm and engaging, this is an official Global Hire 360 assessment and inappropriate language is strictly not acceptable. I have deducted 3 points from your overall score for misconduct. Please note that if any further inappropriate language is used, I will immediately end this call and your profile will be suspended from attempting another interview for the next 24 hours. ${activePromptToRepeat}`;
 
@@ -6215,7 +6213,7 @@ app.post('/api/interview-turn', async (req, res) => {
       session.transcript.push({
         id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
         speaker: 'interviewer',
-        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        speakerName: 'Operations and Talent Manager',
         text: walkthroughReply,
         timestamp: new Date().toISOString(),
         eventTag: 'greeting',
@@ -6243,17 +6241,17 @@ app.post('/api/interview-turn', async (req, res) => {
           cleanText
         ) && !/\b(no\s+questions|nothing|ready|let'?s\s+go|sounds\s+good|all\s+good|okay|yes|sure)\b/i.test(cleanText);
 
-      let preAnswerBridge = `Wonderful, let's get started.`;
+      let preAnswerBridge = `All right, let's begin.`;
       if (hasPreQuestion) {
-        preAnswerBridge = `Good question—this session is designed to feel just like a real conversation with a hiring manager. Take your time with each answer, and if you ever want me to rephrase a question or help guide you through a tricky spot, just let me know.`;
+        preAnswerBridge = `This is a practice interview. You can ask me to repeat or rephrase any question.`;
       }
 
-      const startQ1Reply = `${preAnswerBridge} Let's start with Question 1: ${firstQ.question}`;
+      const startQ1Reply = `${preAnswerBridge} ${firstQ.question}`;
 
       session.transcript.push({
         id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
         speaker: 'interviewer',
-        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        speakerName: 'Operations and Talent Manager',
         text: startQ1Reply,
         timestamp: new Date().toISOString(),
         questionIndex: 0,
@@ -6292,7 +6290,7 @@ app.post('/api/interview-turn', async (req, res) => {
         session.transcript.push({
           id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
           speaker: 'interviewer',
-          speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+          speakerName: 'Operations and Talent Manager',
           text: managerAnswer,
           timestamp: new Date().toISOString(),
           eventTag: 'closing',
@@ -6319,7 +6317,7 @@ app.post('/api/interview-turn', async (req, res) => {
         try {
           const resp = await ai.models.generateContent({
             model: 'gemini-3-flash-preview',
-            contents: `You are Sarah, Operations and Talent Manager at Global Hire 360, interviewing ${session.candidateName} for the ${session.detectedRole} position in a live spoken interview.
+            contents: `You are the Operations and Talent Manager at Global Hire 360, interviewing ${session.candidateName} for the ${session.detectedRole} position in a live spoken interview.
 You just asked Question ${currentQ.number}: "${currentQ.question}"
 Instead of answering, the candidate said: "${clampText(cleanText, 600)}"
 Reply as a real, intelligent hiring manager in at most 2 short spoken sentences: answer their question correctly and briefly (or reassure them that you are here and can hear them). Then ask the question again using exactly this wording: "${currentQ.question}". No lists, no markdown, never reveal how answers are scored.`,
@@ -6337,7 +6335,7 @@ Reply as a real, intelligent hiring manager in at most 2 short spoken sentences:
       session.transcript.push({
         id: `tr_${Date.now()}_i`,
         speaker: 'interviewer',
-        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        speakerName: 'Operations and Talent Manager',
         text: replyText,
         timestamp: new Date().toISOString(),
         questionIndex: session.currentQuestionIndex,
@@ -6354,14 +6352,14 @@ Reply as a real, intelligent hiring manager in at most 2 short spoken sentences:
       )
     ) {
       // Without AI the question is repeated exactly as written (never the hidden marking notes).
-      let rephrasedText = `Of course, ${session.candidateName}. Here's Question ${currentQ.number} again: ${currentQ.question} Take your time.`;
+      let rephrasedText = `Of course, ${session.candidateName}. Here's the question again: ${currentQ.question} Take your time.`;
 
       const ai = getGenAIClientOrNull();
       if (ai) {
         try {
           const resp = await ai.models.generateContent({
             model: 'gemini-3-flash-preview',
-            contents: `You are Sarah, Operations and Talent Manager at Global Hire 360.
+            contents: `You are the Operations and Talent Manager at Global Hire 360.
 The candidate (${session.candidateName}, applying for ${session.detectedRole}) asked you to repeat or clarify Question ${currentQ.number}: "${currentQ.question}".
 Rephrase this question calmly and warmly in simpler words, keeping exactly the same meaning, in at most 2 short spoken sentences. Do not hint at the answer, do not list what to include, no markdown.`,
           });
@@ -6374,7 +6372,7 @@ Rephrase this question calmly and warmly in simpler words, keeping exactly the s
       session.transcript.push({
         id: `tr_${Date.now()}_i`,
         speaker: 'interviewer',
-        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        speakerName: 'Operations and Talent Manager',
         text: rephrasedText,
         timestamp: new Date().toISOString(),
         questionIndex: session.currentQuestionIndex,
@@ -6452,7 +6450,7 @@ Rephrase this question calmly and warmly in simpler words, keeping exactly the s
         session.transcript.push({
           id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
           speaker: 'interviewer',
-          speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+          speakerName: 'Operations and Talent Manager',
           text: timeoutMsg,
           timestamp: new Date().toISOString(),
           questionIndex: session.currentQuestionIndex,
@@ -6478,7 +6476,7 @@ Rephrase this question calmly and warmly in simpler words, keeping exactly the s
         session.transcript.push({
           id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
           speaker: 'interviewer',
-          speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+          speakerName: 'Operations and Talent Manager',
           text: stage5Msg,
           timestamp: new Date().toISOString(),
           eventTag: 'question',
@@ -6524,7 +6522,7 @@ Rephrase this question calmly and warmly in simpler words, keeping exactly the s
       try {
         const evalResp = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
-          contents: `You are Sarah, Operations and Talent Manager at Global Hire 360.
+          contents: `You are the Operations and Talent Manager at Global Hire 360.
 Candidate: ${session.candidateName}
 Target Job Position: ${session.detectedRole}
 Question ${currentQ.number} (${currentQ.category}): "${currentQ.question}"
@@ -6592,14 +6590,14 @@ MARKING GUIDE SCORING PROTOCOL:
     if (!isOnTopic || seemsNotToKnow) {
       if (session.currentQuestionAttempts === 1) {
         const rephraseMsg = seemsNotToKnow
-          ? `That's completely okay, ${session.candidateName}—it's normal to pause on a question like this. Think of it simply from a day-to-day perspective: ${currentQ.expectedFocus.toLowerCase()}. Even a brief example from past work or how you'd approach it is great—give it a try!`
+          ? `It's okay to pause, ${session.candidateName}. Think about how you would handle this at work. What would you do first?`
           : coachingRephraseMessage ||
-            `I see what you mean, ${session.candidateName}. Let me reframe Question ${currentQ.number} slightly so we connect it directly to the role: think about ${currentQ.expectedFocus.toLowerCase()}. How would you handle that situation?`;
+            `I see what you mean, ${session.candidateName}. Think about ${currentQ.expectedFocus.toLowerCase()}. How would you handle that situation?`;
 
         session.transcript.push({
           id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
           speaker: 'interviewer',
-          speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+          speakerName: 'Operations and Talent Manager',
           text: rephraseMsg,
           timestamp: new Date().toISOString(),
           questionIndex: session.currentQuestionIndex,
@@ -6650,12 +6648,12 @@ MARKING GUIDE SCORING PROTOCOL:
           session.currentQuestionIndex += 1;
           session.currentQuestionAttempts = 0;
           const nextQ = session.questions[session.currentQuestionIndex];
-          const takeoverMsg = `No problem at all, ${session.candidateName}—let me help you out here. In a real interview for ${session.detectedRole}, employers mainly look for how you focus on ${currentQ.expectedFocus.toLowerCase()}, and I've included a full suggested answer for you on your score page. Let's keep going with Question ${nextQ.number}: ${nextQ.question}`;
+          const takeoverMsg = `No problem, ${session.candidateName}. For this role, employers look for ${currentQ.expectedFocus.toLowerCase()}. Let's look at another area. ${nextQ.question}`;
 
           session.transcript.push({
             id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
             speaker: 'interviewer',
-            speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+            speakerName: 'Operations and Talent Manager',
             text: takeoverMsg,
             timestamp: new Date().toISOString(),
             questionIndex: session.currentQuestionIndex,
@@ -6672,12 +6670,12 @@ MARKING GUIDE SCORING PROTOCOL:
           });
         } else {
           session.currentPhase = 'candidate_questions';
-          const takeoverFinalQMsg = `No problem at all, ${session.candidateName}. On that question, employers mainly look for ${currentQ.expectedFocus.toLowerCase()}, and I've included a full suggested answer on your score page. That wraps up my ${session.questions.length} questions—do you have any questions for me about the ${session.detectedRole} role or Global Hire 360?`;
+          const takeoverFinalQMsg = `No problem, ${session.candidateName}. Employers look for ${currentQ.expectedFocus.toLowerCase()}. What would you like to ask about the ${session.detectedRole} role or Global Hire 360?`;
 
           session.transcript.push({
             id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
             speaker: 'interviewer',
-            speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+            speakerName: 'Operations and Talent Manager',
             text: takeoverFinalQMsg,
             timestamp: new Date().toISOString(),
             eventTag: 'question',
@@ -6744,12 +6742,12 @@ MARKING GUIDE SCORING PROTOCOL:
       session.currentQuestionAttempts = 0;
       const nextQ = session.questions[session.currentQuestionIndex];
 
-      const nextMsg = `${bridgeText} Let's move on to Question ${nextQ.number}: ${nextQ.question}`;
+      const nextMsg = `${bridgeText} ${nextQ.question}`;
 
       session.transcript.push({
         id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
         speaker: 'interviewer',
-        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        speakerName: 'Operations and Talent Manager',
         text: nextMsg,
         timestamp: new Date().toISOString(),
         questionIndex: session.currentQuestionIndex,
@@ -6772,7 +6770,7 @@ MARKING GUIDE SCORING PROTOCOL:
       session.transcript.push({
         id: `tr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_i`,
         speaker: 'interviewer',
-        speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+        speakerName: 'Operations and Talent Manager',
         text: stage5Invite,
         timestamp: new Date().toISOString(),
         eventTag: 'question',
@@ -6863,9 +6861,9 @@ async function runSessionFinalization(
         questionText: q.question,
         proposedAnswer: q.proposedAnswer,
         candidateAnswer: terminatedForMisconduct
-          ? '[Session terminated due to professional misconduct — 24-hour suspension applied]'
+          ? '[Session ended for professional misconduct. 24-hour suspension applied]'
           : terminatedEarlyForAttempts
-          ? '[Not reached — Session concluded early for additional workshop practice]'
+          ? '[Not reached. Session ended early for additional practice]'
           : '[Not answered]',
         attemptsUsed: 0,
         timedOut: false,
@@ -6931,13 +6929,13 @@ async function runSessionFinalization(
     const answeredAll = answeredCount >= qCount;
     session.interviewerFinalImpression =
       pct >= 85
-        ? `Excellent work, ${firstName} — clear, relevant answers that match what employers look for.`
+        ? `Excellent work, ${firstName}. Your answers were clear and relevant.`
         : session.successful
         ? `Well done, ${firstName}, you passed. A few more concrete examples will make your answers even stronger.`
         : pct >= 45
-        ? `Good effort, ${firstName} — you're close. Compare your answers with the suggested ones and try again.`
+        ? `You're close, ${firstName}. Compare your answers with the examples and try again.`
         : answeredAll
-        ? `Thanks for answering every question, ${firstName}. Study the suggested answers and practice — you'll improve quickly.`
+        ? `Thanks for answering every question, ${firstName}. Review the examples and keep practicing.`
         : `You made a start, ${firstName}. Next time, try to answer every question fully.`;
     session.interviewerFinalImpression += penaltyNote;
   }
@@ -6945,7 +6943,7 @@ async function runSessionFinalization(
   session.transcript.push({
     id: `tr_${Date.now()}_final`,
     speaker: 'interviewer',
-    speakerName: 'Sarah (Global Hire 360 Hiring Manager)',
+    speakerName: 'Operations and Talent Manager',
     text: session.interviewerFinalImpression,
     timestamp: new Date().toISOString(),
     eventTag: terminatedForMisconduct
@@ -7353,7 +7351,7 @@ app.post('/api/supabase/sync', requireAdmin, async (_req, res) => {
 export const SINGLE_INTERVIEWER_VOICE = {
   id: 'Aoede',
   edgeNeuralVoice: 'en-US-AvaMultilingualNeural',
-  name: 'Sarah — Global Hire 360 Operations & Talent Manager (NotebookLM Aoede Voice)',
+  name: 'Global Hire 360 Operations and Talent Manager',
   tone: 'Warm, natural, composed NotebookLM female host & hiring manager cadence',
   pitch: 1.0,
   rate: 0.99,
@@ -7601,7 +7599,7 @@ app.get('/api/live-agent-config', (_req, res) => {
     models: LIVE_MODELS,
     voiceName: SINGLE_INTERVIEWER_VOICE.id,
     neuralFallbackVoice: SINGLE_INTERVIEWER_VOICE.edgeNeuralVoice,
-    interviewerName: 'Sarah',
+    interviewerName: 'Operations and Talent Manager',
     interviewerTitle: 'Operations and Talent Manager',
     companyName: 'Global Hire 360',
     turnEndSilenceMs: TURN_END_SILENCE_MS,
@@ -7955,7 +7953,7 @@ async function startServer() {
           id,
           speaker,
           speakerName:
-            speaker === 'interviewer' ? 'Sarah (Global Hire 360 Hiring Manager)' : session.candidateName,
+            speaker === 'interviewer' ? 'Operations and Talent Manager' : session.candidateName,
           text,
           timestamp: new Date().toISOString(),
           questionIndex,
@@ -8145,7 +8143,7 @@ async function startServer() {
           ]);
           await respond(
             answer === 'UNKNOWN'
-              ? 'UNKNOWN — no reliable up-to-date answer found. Say honestly that you are not sure about that one.'
+              ? 'UNKNOWN: no reliable up-to-date answer found. Say honestly that you are not sure about that one.'
               : `Answer (up to date): ${answer} Tell the candidate in one natural sentence.`
           );
         } else if (call.name === 'end_call') {
@@ -8455,7 +8453,7 @@ async function startServer() {
         } else if (msg?.type === 'request_rephrase') {
           if (endingReason || currentQuestionNumber < 1) return;
           await sendSystemNote(
-            `The candidate pressed the "rephrase" button. Say Question ${currentQuestionNumber} again in simpler words with exactly the same meaning. Do not move to another question.`,
+            `The candidate pressed the "rephrase" button. Repeat the current question in simpler words with the same meaning. Do not move to another question.`,
             true
           );
         }

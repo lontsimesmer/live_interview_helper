@@ -1,12 +1,12 @@
 -- ============================================================================
--- GLOBAL HIRE 360 — SUPABASE POSTGRESQL SCHEMA, RELATIONS, SEED DATA & RLS
+-- GLOBAL HIRE 360 SUPABASE POSTGRESQL SCHEMA, RELATIONS, SEED DATA AND RLS
 -- ============================================================================
 -- TABLES & RELATIONS IN THIS SCHEMA:
 -- 1. public.customer_service_questions (legacy: 10 Customer Service questions + Marking Guides)
 -- 1b. public.interview_questions (ALL banks: Universal Q1, Customer Service, Virtual Assistant, Technical Support)
 -- 1c. public.virtual_assistant_questions (10 Virtual Assistant questions + suggested answers)
 -- 1d. public.technical_support_questions (10 IT / Technical Support questions + suggested answers)
--- 2. public.candidates (one row per person — email is the unique identity key)
+-- 2. public.candidates (one row per person. Email is the unique identity key.)
 -- 3. public.interview_sessions (each interview session, linked via candidate_id -> candidates.id)
 -- 4. public.candidate_answers (one row per answered question, linked to session + candidate)
 -- 5. public.candidate_scorecards_summary (relational view joining candidates + interview_sessions)
@@ -282,7 +282,7 @@ INSERT INTO public.technical_support_questions (
   'Technical Support',
   'Technical Support Introduction',
   'Tell me about yourself.',
-  'I’m a technically minded professional who enjoys troubleshooting problems and helping people use technology effectively. I’m comfortable researching issues, following logical troubleshooting steps and learning new systems. I also understand that technical support is not only about fixing the technology — it is about communicating clearly with the person experiencing the problem. I’m interested in this role because it would allow me to combine problem-solving with customer support.',
+  'I enjoy troubleshooting problems and helping people use technology. I research issues, follow clear steps and learn new systems. Good technical support also means communicating clearly with the person who needs help. This role would let me combine problem-solving with customer service.',
   'Technically minded, enjoys troubleshooting and helping people use technology, researching issues and following logical steps, learning new systems, communicating clearly with users, and combining problem-solving with customer support.',
   FALSE,
   '["Technically minded & enjoys troubleshooting problems","Research, logical troubleshooting steps & learning new systems","Support is also about communicating clearly with the user","Motivation: combining problem-solving with customer support"]'::jsonb
@@ -335,7 +335,7 @@ INSERT INTO public.technical_support_questions (
   'Situation: A user reported a technical issue that was not resolved by the normal first troubleshooting steps. Task: I needed to identify the likely cause and restore the user''s ability to work. Action: I gathered information about when the issue started and what the user had already tried. I then isolated the problem by testing the likely causes one at a time rather than changing several things simultaneously. Once I identified the cause, I applied the appropriate fix and tested the system again. Result: The issue was resolved, the user was able to continue working and I documented the solution so it could be referenced if the problem appeared again.',
   'STAR example: issue not fixed by first-line steps, gathering when it started and what was tried, isolating causes one at a time, applying the fix and retesting, restoring the user, and documenting the solution.',
   TRUE,
-  '["Situation/Task: issue not fixed by normal first steps; restore the user’s ability to work","Action: gathered information — when it started & what was already tried","Action: isolated the cause one at a time, applied the fix & retested","Result: issue resolved, user back to work & solution documented"]'::jsonb
+  '["Situation/Task: issue not fixed by normal first steps; restore the user’s ability to work","Action: gathered information, when it started and what was already tried","Action: isolated the cause one at a time, applied the fix and retested","Result: issue resolved, user back to work and solution documented"]'::jsonb
 ),
 (
   'it_q7',
@@ -375,7 +375,7 @@ INSERT INTO public.technical_support_questions (
   'Situation: I once made a technical change that produced an unexpected result. Task: I needed to identify what happened, minimize the impact and restore the correct configuration. Action: I stopped making additional changes, reviewed the steps I had taken, corrected or restored the affected setting and then tested the system carefully before continuing. I also documented what happened and added an extra verification step to my process. Result: The issue was corrected, and the experience taught me to slow down and verify changes rather than assuming a configuration change will behave exactly as expected.',
   'STAR example: a change with an unexpected result, owning it, minimizing impact, stopping further changes, reviewing the steps taken, restoring the correct setting and retesting, documenting it, adding a verification step, and learning to verify changes.',
   TRUE,
-  '["Situation/Task: own technical change caused an unexpected result; minimize impact","Action: stopped further changes & reviewed the steps taken","Action: restored the correct setting, retested & documented it","Result: corrected & added a verification step — slow down and verify changes"]'::jsonb
+  '["Situation/Task: own technical change caused an unexpected result; minimize impact","Action: stopped further changes and reviewed the steps taken","Action: restored the correct setting, retested and documented it","Result: corrected the issue and added a verification step"]'::jsonb
 )
 ON CONFLICT (id) DO UPDATE SET
   role_category = EXCLUDED.role_category,

@@ -143,7 +143,7 @@ export const LunaVoiceOrb: React.FC<LunaVoiceOrbProps> = ({
         >
           <img
             src={logoUrl}
-            alt="Sarah — Global Hire 360 Hiring Manager"
+            alt="Global Hire 360 Hiring Manager"
             referrerPolicy="no-referrer"
             className="w-full h-full object-contain"
           />
@@ -155,7 +155,7 @@ export const LunaVoiceOrb: React.FC<LunaVoiceOrbProps> = ({
               : 'bg-slate-900/85 text-slate-300 border-white/15'
           }`}
         >
-          {isInterviewerSpeaking ? 'Sarah Speaking' : 'Sarah Listening'}
+          {isInterviewerSpeaking ? 'Interviewer speaking' : 'Interviewer listening'}
         </span>
       </div>
     </div>

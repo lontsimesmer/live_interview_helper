@@ -105,8 +105,8 @@ const LOGO_URL =
 
 export const SINGLE_INTERVIEWER_VOICE = {
   id: "Aoede" as const,
-  label: "Sarah — Operations & Talent Manager (Global Hire 360)",
-  shortLabel: "Sarah (Hiring Manager)",
+  label: "Operations & Talent Manager (Global Hire 360)",
+  shortLabel: "Hiring Manager",
   pitch: 1.0,
   rate: 0.99,
   voiceMatchRegex:
@@ -680,7 +680,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 Global Hire 360
               </span>
               <span className="block text-xs text-[#339A05] font-semibold">
-                Live AI Interview Room
+                Live Interview Room
               </span>
             </div>
           </div>
@@ -692,13 +692,11 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
         {/* 1. Short Welcome Message */}
         <section className="bg-[#041E41] text-white rounded-xl p-6 shadow-sm border-b-4 border-[#339A05] mb-6">
           <h1 className="text-xl sm:text-2xl font-bold tracking-tight mb-2">
-            Welcome, Candidate!
+            Welcome
           </h1>
           <p className="text-sm text-slate-200 leading-relaxed">
-            Welcome to the official <strong>Global Hire 360</strong> Live Voice
-            Interview Platform. You are about to enter a live interactive voice
-            interview where our AI Interviewer will examine your resume, greet
-            you, and assess your readiness for your target role.
+            Get ready for your practice interview with the Operations and
+            Talent Manager at <strong>Global Hire 360</strong>.
           </p>
         </section>
 
@@ -706,7 +704,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
         <section className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs mb-6">
           <h2 className="text-sm font-bold uppercase tracking-wider text-[#041E41] mb-3.5 flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-[#339A05]" />
-            Instructions Before Joining the Interview Room
+            Before You Start
           </h2>
           <ul className="space-y-2.5 text-sm text-slate-700">
             <li className="flex items-start gap-2.5">
@@ -714,12 +712,8 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 1
               </span>
               <span>
-                <strong>Camera &amp; Microphone On, One-to-One:</strong> Join
-                alone from a quiet space with your camera and microphone
-                enabled. Headphones give the clearest conversation. Speak when
-                Sarah has finished her sentence — your microphone is paused
-                while she talks. Only you may answer: if someone else answers
-                or coaches you, the interviewer can end the call.
+                Join from a quiet place. Only you may answer. Wait until the
+                interviewer finishes speaking before you respond.
               </span>
             </li>
             <li className="flex items-start gap-2.5">
@@ -727,13 +721,8 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 2
               </span>
               <span>
-                <strong>
-                  10-Minute Max Session &amp; 90-Second Question Timer:
-                </strong>{" "}
-                Each interview consists of <strong>4 questions</strong> (5 for returning candidates) within a{" "}
-                <strong>10-minute maximum session</strong>. You have{" "}
-                <strong>90 seconds</strong> per question before the interviewer
-                politely advances to the next question.
+                Answer in your own words. Ask the interviewer to repeat or
+                rephrase the question if needed.
               </span>
             </li>
             <li className="flex items-start gap-2.5">
@@ -741,42 +730,8 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 3
               </span>
               <span>
-                <strong>Stress-Free Conversational Coaching:</strong> Speak
-                comfortably with Sarah, your AI Hiring Manager. You can ask her
-                anything during the call, or ask her to repeat or rephrase a
-                question. If you feel stuck, she will rephrase it in simpler
-                words before moving on to the next question.
-              </span>
-            </li>
-            <li className="flex items-start gap-2.5">
-              <span className="w-5 h-5 rounded-full bg-[#339A05]/15 text-[#339A05] font-bold text-xs flex items-center justify-center shrink-0 mt-0.5">
-                4
-              </span>
-              <span>
-                <strong>
-                  Professional Conduct &amp; 24-Hour Suspension Policy:
-                </strong>{" "}
-                Enjoy a natural, warm conversation with your interviewer, but
-                keep all dialogue strictly professional. Inappropriate or
-                profane language results in a{" "}
-                <strong>3-point score deduction</strong>, or immediate call
-                termination and a <strong>24-hour suspension</strong> from
-                attempting another interview.
-              </span>
-            </li>
-            <li className="flex items-start gap-2.5">
-              <span className="w-5 h-5 rounded-full bg-[#339A05]/15 text-[#339A05] font-bold text-xs flex items-center justify-center shrink-0 mt-0.5">
-                5
-              </span>
-              <span>
-                <strong>
-                  Marking Guide Scoring (0 to 5 Scale) &amp; Email Report:
-                </strong>{" "}
-                Each question is graded from <strong>0 to 5 points</strong>{" "}
-                on how closely your answer follows the direction of the
-                suggested answer, and your total is always marked{" "}
-                <strong>out of 20</strong> (passing benchmark: 13/20 = 65%). Results and transcript are
-                sent to your email.
+                Keep your language respectful. Abusive language may end the
+                call and suspend access for 24 hours.
               </span>
             </li>
           </ul>
@@ -788,7 +743,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
           className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs space-y-5"
         >
           <h2 className="text-base font-bold text-[#041E41] border-b border-slate-100 pb-3 flex items-center justify-between">
-            <span>Candidate Details &amp; Resume Check-In</span>
+            <span>Your Details</span>
             {recognizedCandidate && (
               <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-emerald-100 text-[#15803D] inline-flex items-center gap-1">
                 <CheckCircle2 className="w-3.5 h-3.5" />
@@ -887,7 +842,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
               Upload Resume (.PDF or .DOCX){" "}
               {recognizedCandidate?.hasSavedProfile ? (
                 <span className="text-slate-500 normal-case font-medium">
-                  (optional — saved profile on file)
+                  (optional, saved profile on file)
                 </span>
               ) : (
                 <span className="text-red-500">*</span>
@@ -913,7 +868,7 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 {resumeFile
                   ? resumeFile.name
                   : rejectedDocumentInfo
-                    ? `${rejectedDocumentInfo.fileName} (Rejected — Click to upload a valid Resume/CV)`
+                    ? `${rejectedDocumentInfo.fileName} (Rejected. Upload a valid resume or CV.)`
                     : "Click to upload your resume (.pdf or .docx)"}
               </span>
               <span className="text-xs text-slate-500 mt-0.5">
@@ -2197,7 +2152,7 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
                 list.push({
                   id: `tr_${Date.now()}_i`,
                   speaker: "interviewer",
-                  speakerName: "Sarah (Global Hire 360 Hiring Manager)",
+                  speakerName: "Operations and Talent Manager",
                   text: chunk.trim(),
                   timestamp: new Date().toISOString(),
                 });
@@ -2305,12 +2260,11 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
       <div className="min-h-screen bg-[#041E41] text-white flex flex-col items-center justify-center px-6 text-center select-none">
         <div className="w-14 h-14 rounded-full border-4 border-[#339A05]/30 border-t-[#339A05] animate-spin mb-6" />
         <h2 className="text-xl font-bold">Interview complete</h2>
-        <p className="text-sm text-slate-300 mt-2">Marking your answers…</p>
+        <p className="text-sm text-slate-300 mt-2">Scoring your answers</p>
       </div>
     );
   }
 
-  const totalQuestions = session.questions?.length || 4;
   const isQuestioning = session.currentPhase === "questioning";
   const sarahSpeaking = speakerState === "interviewer";
   const timerNotStarted = isQuestioning && sarahSpeaking && questionSecondsLeft >= 90;
@@ -2320,16 +2274,16 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
   ).padStart(2, "0")}`;
 
   const statusText = isInitializingCall
-    ? "Connecting to Sarah…"
+    ? "Connecting to the interviewer"
     : isReconnectingVoice
-      ? "Reconnecting…"
+      ? "Reconnecting"
       : isMicMuted
         ? "Your microphone is muted"
         : sarahSpeaking
-          ? "Sarah is speaking…"
+          ? "The interviewer is speaking"
           : isQuestioning
-            ? "Your turn — answer when you're ready"
-            : "Listening…";
+            ? "Your turn. Answer when you're ready"
+            : "Listening";
 
   return (
     <div className="min-h-screen bg-[#041E41] text-white flex flex-col">
@@ -2365,7 +2319,7 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
         >
           S
         </div>
-        <h1 className="mt-6 text-2xl font-bold">Sarah</h1>
+        <h1 className="mt-6 text-2xl font-bold">Hiring Manager</h1>
         <p className="text-sm text-slate-300">
           Operations &amp; Talent Manager · Global Hire 360
         </p>
@@ -2382,10 +2336,6 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
         {/* 90-second question timer — appears once the questions start */}
         {isQuestioning && (
           <div className="mt-8 w-full max-w-xs">
-            <div className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-              Question {Math.min(totalQuestions, session.currentQuestionIndex + 1)} of{" "}
-              {totalQuestions}
-            </div>
             <div
               className={`mt-2 text-5xl font-extrabold tabular-nums ${
                 timerLow ? "text-red-400" : "text-white"
@@ -2403,7 +2353,7 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
             </div>
             {timerNotStarted && (
               <div className="mt-2 text-xs text-slate-400">
-                Starts when Sarah finishes the question
+                Starts when the interviewer finishes speaking
               </div>
             )}
           </div>
@@ -2424,7 +2374,7 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
             className="mt-8 inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-40 border border-white/15 text-xs font-bold cursor-pointer"
           >
             <Check className="w-4 h-4 text-[#339A05]" />
-            {isProcessingTurn ? "Processing…" : "I'm done answering"}
+            {isProcessingTurn ? "Scoring your answer" : "I'm done answering"}
           </button>
         )}
       </main>
@@ -2647,7 +2597,7 @@ function generateChatBubbleTranscriptPdf(
       ctx.fillStyle = "#86EFAC";
       ctx.font = "bold 20px Inter, Arial, sans-serif";
       ctx.fillText(
-        "GLOBAL HIRE 360 • INTERVIEW CONVERSATION TRANSCRIPT",
+        "GLOBAL HIRE 360 INTERVIEW TRANSCRIPT",
         MARGIN_X,
         58,
       );
@@ -2655,7 +2605,7 @@ function generateChatBubbleTranscriptPdf(
       ctx.fillStyle = "#FFFFFF";
       ctx.font = "bold 34px Inter, Arial, sans-serif";
       ctx.fillText(
-        `${session.candidateName} — ${session.detectedRole}`,
+        `${session.candidateName}: ${session.detectedRole}`,
         MARGIN_X,
         108,
       );
@@ -2663,7 +2613,7 @@ function generateChatBubbleTranscriptPdf(
       ctx.fillStyle = "#CBD5E1";
       ctx.font = "600 22px Inter, Arial, sans-serif";
       ctx.fillText(
-        `Final Score: ${session.totalScoreOutOf20 ?? session.totalScoreOutOf25} / ${session.maxScore || 20} (${session.percentageScore}%) • ${
+        `Final Score: ${session.totalScoreOutOf20 ?? session.totalScoreOutOf25} / ${session.maxScore || 20} (${session.percentageScore}%). ${
           session.successful ? "PASSED" : "PRACTICE RECOMMENDED"
         }`,
         MARGIN_X,
@@ -2677,7 +2627,7 @@ function generateChatBubbleTranscriptPdf(
       ctx.fillStyle = "#FFFFFF";
       ctx.font = "bold 22px Inter, Arial, sans-serif";
       ctx.fillText(
-        `Global Hire 360 Chat Transcript — ${session.candidateName} (Page ${pageIndex + 1})`,
+        `Global Hire 360 Chat Transcript: ${session.candidateName} (Page ${pageIndex + 1})`,
         MARGIN_X,
         56,
       );
@@ -2693,7 +2643,7 @@ function generateChatBubbleTranscriptPdf(
   for (const item of session.transcript) {
     const isInterviewer = item.speaker === "interviewer";
     const speakerLabel = isInterviewer
-      ? "Sarah (Global Hire 360 Hiring Manager)"
+      ? "Operations and Talent Manager"
       : `${session.candidateName} (Candidate)`;
     const timeLabel = new Date(item.timestamp).toLocaleTimeString([], {
       hour: "2-digit",
@@ -2752,7 +2702,7 @@ function generateChatBubbleTranscriptPdf(
     fCtx.fillStyle = "#64748B";
     fCtx.font = "500 18px Inter, Arial, sans-serif";
     fCtx.fillText(
-      `Global Hire 360 • Live Voice AI Interview Transcript • Page ${idx + 1} of ${canvases.length}`,
+      `Global Hire 360 Interview Transcript, page ${idx + 1} of ${canvases.length}`,
       MARGIN_X,
       PAGE_H - 36,
     );
@@ -2980,7 +2930,7 @@ const ScoringPage: React.FC<ScoringPageProps> = ({
                   Conversation Transcript
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Your answers and Sarah's questions, word for word
+                  Your answers and the interviewer's questions
                 </p>
               </div>
               <div className="flex items-center gap-2 shrink-0">
@@ -3034,7 +2984,7 @@ const ScoringPage: React.FC<ScoringPageProps> = ({
                         }`}
                       >
                         {isInterviewer
-                          ? "Sarah (Hiring Manager)"
+                          ? "Hiring Manager"
                           : session.candidateName}
                       </span>
                       <span
