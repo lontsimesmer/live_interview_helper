@@ -1,0 +1,4 @@
+.aws/
+.env*
+data/candidates.json
+data/interview_sessions.json
