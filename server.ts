@@ -1103,47 +1103,6 @@ async function upsertCandidateOnCheckIn(params: {
   return candidate;
 }
 
-/**
- * One row per answered question in public.candidate_answers (unique per session + question
- * number, so re-saving a session updates rows instead of duplicating them).
- */
-async function saveCandidateAnswersToSupabase(
-  session: InterviewSessionRecord
-): Promise<{ saved: boolean; error?: string }> {
-  const answered = session.questionEvaluations.filter((ev) => ev && ev.questionNumber);
-  if (answered.length === 0) return { saved: true };
-  const questionCount = Math.max(1, session.questions.length);
-  const rows = answered.map((ev) => {
-    const q = session.questions.find((qq) => qq.number === ev.questionNumber);
-    return {
-      id: `${session.id}_q${ev.questionNumber}`,
-      session_id: session.id,
-      candidate_id: session.candidateId,
-      candidate_email: session.candidateEmail,
-      candidate_name: session.candidateName,
-      job_position: session.detectedRole,
-      question_id: q?.id || ev.questionId,
-      question_number: ev.questionNumber,
-      question_category: ev.category,
-      question_text: ev.questionText,
-      candidate_answer: ev.candidateAnswer,
-      suggested_answer: ev.proposedAnswer || q?.proposedAnswer || null,
-      score_out_of_5: ev.scoreOutOf5,
-      score_contribution_out_of_20: Number(((ev.scoreOutOf5 / (questionCount * 5)) * INTERVIEW_MAX_SCORE).toFixed(2)),
-      alignment_percent: ev.alignmentPercent ?? null,
-      matched_points: ev.matchedPoints || [],
-      missed_points: ev.missedPoints || [],
-      feedback: ev.feedback,
-      improvement_tip: ev.improvementTip,
-      attempts_used: ev.attemptsUsed,
-      timed_out: ev.timedOut,
-      grading_method: ev.gradingMethod || 'marking_guide',
-      updated_at: new Date().toISOString(),
-    };
-  });
-  return postgrestUpsert('candidate_answers', rows, 'session_id,question_number');
-}
-
 async function saveSessionToSupabase(session: InterviewSessionRecord): Promise<{ saved: boolean; error?: string }> {
   // Always update linked candidate record & flush to local disk first
   const linkedCandidate = activeCandidates.get(session.candidateId);
@@ -1202,10 +1161,6 @@ async function saveSessionToSupabase(session: InterviewSessionRecord): Promise<{
     ['current_phase', 'question_count', 'is_first_time_candidate', 'email_status', 'email_sent']
   );
 
-  const answersRes = await saveCandidateAnswersToSupabase(session);
-  if (!answersRes.saved) {
-    console.warn('candidate_answers not saved (run supabase-schema.sql to create the table):', answersRes.error);
-  }
   return sessionRes;
 }
 
@@ -7225,7 +7180,7 @@ function stripSessionSecrets(s: InterviewSessionRecord) {
 // 5g. Candidates & Relational Interview Sessions Endpoints (ADMIN ONLY — contains personal data)
 app.get('/api/candidates', requireAdmin, async (_req, res) => {
   const supabaseRelationalData = await postgrestSelect(
-    'candidates?select=*,interview_sessions(*),candidate_answers(*)&order=updated_at.desc'
+    'candidates?select=*,interview_sessions(*)&order=updated_at.desc'
   );
 
   const allSessions = Array.from(activeSessions.values());
@@ -7243,7 +7198,7 @@ app.get('/api/candidates', requireAdmin, async (_req, res) => {
     totalCandidates: candidatesWithSessions.length,
     totalInterviewSessions: allSessions.length,
     relation:
-      'public.candidates (1) ---> (Many) public.interview_sessions (1) ---> (Many) public.candidate_answers',
+      'public.candidates (1) ---> (Many) public.interview_sessions (each session stores its answer evaluations)',
     supabaseLiveJoinRows: supabaseRelationalData,
     candidates: candidatesWithSessions,
   });
@@ -7766,7 +7721,6 @@ async function checkSupabaseTables(): Promise<boolean> {
   const tables = [
     'candidates',
     'interview_sessions',
-    'candidate_answers',
     'interview_questions',
     'customer_service_questions',
     'virtual_assistant_questions',
