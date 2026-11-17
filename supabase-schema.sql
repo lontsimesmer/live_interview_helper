@@ -7,7 +7,8 @@
 -- 1c. public.technical_support_questions (10 IT / Technical Support questions + suggested answers)
 -- 2. public.candidates (one row per person. Email is the unique identity key.)
 -- 3. public.interview_sessions (each interview session, linked via candidate_id -> candidates.id)
--- 4. public.candidate_scorecards_summary (relational view joining candidates + interview_sessions)
+-- 4. public.candidate_answers (one queryable row per evaluated question)
+-- 5. public.candidate_scorecards_summary (relational view joining candidates + interview_sessions)
 --
 -- Safe to re-run: every statement is idempotent (IF NOT EXISTS / ON CONFLICT / DROP IF EXISTS).
 -- Role question banks are seeded by the backend on startup; universal questions live in code.
@@ -463,14 +464,42 @@ CREATE INDEX IF NOT EXISTS idx_interview_sessions_job_position ON public.intervi
 CREATE INDEX IF NOT EXISTS idx_interview_sessions_candidate_email ON public.interview_sessions (candidate_email);
 CREATE INDEX IF NOT EXISTS idx_interview_sessions_created_at ON public.interview_sessions (created_at DESC);
 
+-- Per-question answers and scores are stored here for reporting and candidate review.
+CREATE TABLE IF NOT EXISTS public.candidate_answers (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES public.interview_sessions(id) ON DELETE CASCADE,
+  candidate_id TEXT REFERENCES public.candidates(id) ON DELETE CASCADE,
+  candidate_email TEXT NOT NULL,
+  candidate_name TEXT NOT NULL,
+  job_position TEXT NOT NULL,
+  question_id TEXT,
+  question_number INTEGER NOT NULL,
+  question_category TEXT,
+  question_text TEXT NOT NULL,
+  candidate_answer TEXT,
+  suggested_answer TEXT,
+  score_out_of_5 NUMERIC(3,1) NOT NULL DEFAULT 0,
+  score_contribution_out_of_20 NUMERIC(5,2) NOT NULL DEFAULT 0,
+  alignment_percent INTEGER,
+  matched_points JSONB NOT NULL DEFAULT '[]'::jsonb,
+  missed_points JSONB NOT NULL DEFAULT '[]'::jsonb,
+  feedback TEXT,
+  improvement_tip TEXT,
+  attempts_used INTEGER NOT NULL DEFAULT 0,
+  timed_out BOOLEAN NOT NULL DEFAULT FALSE,
+  grading_method TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT candidate_answers_session_question_unique UNIQUE (session_id, question_number)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_answers_candidate_id ON public.candidate_answers (candidate_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_answers_email ON public.candidate_answers (candidate_email);
+CREATE INDEX IF NOT EXISTS idx_candidate_answers_question_id ON public.candidate_answers (question_id);
+
 -- The old combined question table duplicated the role banks below and is not queried.
 DROP TABLE IF EXISTS public.interview_questions;
 
--- Per-question answers and scores already live in interview_sessions.question_evaluations.
--- Remove the old duplicate relational table; keep interview_sessions as the source of truth.
-DROP TABLE IF EXISTS public.candidate_answers;
-
--- 4. Relational Summary View Joining public.candidates and public.interview_sessions
+-- 5. Relational Summary View Joining public.candidates and public.interview_sessions
 DROP VIEW IF EXISTS public.candidate_scorecards_summary;
 CREATE VIEW public.candidate_scorecards_summary AS
 SELECT
@@ -506,6 +535,7 @@ ALTER TABLE public.virtual_assistant_questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.technical_support_questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.candidates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.interview_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.candidate_answers ENABLE ROW LEVEL SECURITY;
 
 -- Remove the old wide-open policies (they allowed anon full read/write)
 DROP POLICY IF EXISTS "Allow backend read/write customer_service_questions" ON public.customer_service_questions;
@@ -517,6 +547,7 @@ REVOKE ALL ON TABLE public.virtual_assistant_questions FROM anon, authenticated;
 REVOKE ALL ON TABLE public.technical_support_questions FROM anon, authenticated;
 REVOKE ALL ON TABLE public.candidates FROM anon, authenticated;
 REVOKE ALL ON TABLE public.interview_sessions FROM anon, authenticated;
+REVOKE ALL ON TABLE public.candidate_answers FROM anon, authenticated;
 REVOKE ALL ON public.candidate_scorecards_summary FROM anon, authenticated;
 
 GRANT USAGE ON SCHEMA public TO service_role;
@@ -525,6 +556,7 @@ GRANT ALL ON TABLE public.virtual_assistant_questions TO service_role;
 GRANT ALL ON TABLE public.technical_support_questions TO service_role;
 GRANT ALL ON TABLE public.candidates TO service_role;
 GRANT ALL ON TABLE public.interview_sessions TO service_role;
+GRANT ALL ON TABLE public.candidate_answers TO service_role;
 GRANT SELECT ON public.candidate_scorecards_summary TO service_role;
 
 -- The view runs with the caller's permissions (Postgres 15+), so it can never bypass RLS.
