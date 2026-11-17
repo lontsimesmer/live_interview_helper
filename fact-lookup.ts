@@ -14,6 +14,14 @@ import { generateWithFallback } from './gemini-call.js';
 // Wikipedia asks API clients to identify themselves with a User-Agent.
 const WIKI_HEADERS = { 'User-Agent': 'InterviewAssistant/1.0 (server-side fact lookup)' };
 const UNKNOWN = 'UNKNOWN';
+const WIKIPEDIA_NETWORK_COOLDOWN_MS = 30_000;
+let wikipediaUnavailableUntil = 0;
+
+function isNetworkFailure(err: any): boolean {
+  return /fetch failed|ETIMEDOUT|ENETUNREACH|ECONNRESET|EAI_AGAIN|EHOSTUNREACH|TimeoutError|timed out/i.test(
+    `${err?.message || err} ${err?.cause?.code || ''}`
+  );
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
@@ -61,7 +69,14 @@ async function likelyArticleTitles(ai: GoogleGenAI, question: string): Promise<s
         contents: `Today is ${todayText()}. List up to 3 exact English Wikipedia article titles most likely to state the answer to this question (for example "President of the United States", "2026 Ballon d'Or", "2026 FIFA World Cup"). Reply with a JSON array of strings only.\n\nQuestion: ${question}`,
         config: { temperature: 0, responseMimeType: 'application/json' },
       },
-      { passes: 1, timeoutMs: 6000, deadlineMs: 8000, urgent: true, label: 'fact lookup (titles)' }
+      {
+        models: ['gemini-3.5-flash'],
+        passes: 1,
+        timeoutMs: 6000,
+        deadlineMs: 7000,
+        urgent: true,
+        label: 'fact lookup (titles)',
+      }
     );
     const parsed = JSON.parse(resp.text || '[]');
     return Array.isArray(parsed) ? parsed.map((t) => String(t).trim()).filter(Boolean).slice(0, 3) : [];
@@ -71,12 +86,13 @@ async function likelyArticleTitles(ai: GoogleGenAI, question: string): Promise<s
 }
 
 async function keywordSearchTitles(question: string): Promise<string[]> {
+  if (Date.now() < wikipediaUnavailableUntil) return [];
   const search = await withTimeout(
     fetch(
       `https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=2&srsearch=${encodeURIComponent(
         question
       )}`,
-      { headers: WIKI_HEADERS }
+      { headers: WIKI_HEADERS, signal: AbortSignal.timeout(5000) }
     ),
     5000
   );
@@ -86,10 +102,15 @@ async function keywordSearchTitles(question: string): Promise<string[]> {
 }
 
 async function wikipediaContext(ai: GoogleGenAI, question: string): Promise<string> {
+  if (Date.now() < wikipediaUnavailableUntil) return '';
   const [suggested, searched] = await Promise.all([
     likelyArticleTitles(ai, question),
-    keywordSearchTitles(question).catch(() => [] as string[]),
+    keywordSearchTitles(question).catch((err) => {
+      if (isNetworkFailure(err)) wikipediaUnavailableUntil = Date.now() + WIKIPEDIA_NETWORK_COOLDOWN_MS;
+      return [] as string[];
+    }),
   ]);
+  if (Date.now() < wikipediaUnavailableUntil) return '';
   const titles = Array.from(new Set([...suggested, ...searched])).slice(0, 5);
   if (!titles.length) return '';
   const extracts = await withTimeout(
@@ -97,10 +118,13 @@ async function wikipediaContext(ai: GoogleGenAI, question: string): Promise<stri
       `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&format=json&titles=${encodeURIComponent(
         titles.join('|')
       )}`,
-      { headers: WIKI_HEADERS }
+      { headers: WIKI_HEADERS, signal: AbortSignal.timeout(5000) }
     ),
     5000
-  );
+  ).catch((err) => {
+    if (isNetworkFailure(err)) wikipediaUnavailableUntil = Date.now() + WIKIPEDIA_NETWORK_COOLDOWN_MS;
+    throw err;
+  });
   if (!extracts.ok) return '';
   const data: any = await extracts.json();
   // Map redirected titles back so the most relevant article comes first.

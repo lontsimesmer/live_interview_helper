@@ -25,6 +25,7 @@ import {
 import { candidateRecorders, pruneRecorders, recorderFor } from './candidate-audio.js';
 import { wordCount } from './answer-grading.js';
 import { lookUpFact } from './fact-lookup.js';
+import { generateWithFallback } from './gemini-call.js';
 import mammoth from 'mammoth';
 import path from 'path';
 import fs from 'fs';
@@ -248,6 +249,7 @@ async function provisionSupabaseTablesViaManagementApi(): Promise<{
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ query: sqlQuery }),
+        signal: AbortSignal.timeout(12_000),
       }
     );
 
@@ -831,6 +833,7 @@ async function postgrestUpsert(
         Prefer: 'resolution=merge-duplicates,return=minimal',
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
     });
 
   try {
@@ -876,6 +879,7 @@ async function postgrestSelect<T = any>(pathAndQuery: string): Promise<T[] | nul
         Authorization: `Bearer ${config.key}`,
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(8_000),
     });
     if (!resp.ok) return null;
     const data = await resp.json();
@@ -1387,8 +1391,10 @@ async function sendResendAssessmentEmail(
         });
       } catch (netErr: any) {
         lastProblem = `network error: ${netErr?.message || netErr}`;
-        console.warn('Resend request failed (will retry):', lastProblem);
-        continue;
+        console.warn('Resend request failed; will retry later:', lastProblem);
+        // A connection-level failure is unlikely to recover in a few seconds. The
+        // idempotent background retry runs later, without three duplicate timeouts now.
+        break;
       }
       if (response.ok) {
         const resData = (await response.json().catch(() => ({}))) as { id?: string };
@@ -5547,8 +5553,9 @@ CRITICAL INSTRUCTIONS:
 4. Generate 5 tailored interview questions specifically for their "detectedRole" and referencing their essential skills.`,
       });
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+      const generated = await generateWithFallback(
+        ai,
+        {
         contents: [{ role: 'user', parts }],
         config: {
           responseMimeType: 'application/json',
@@ -5595,9 +5602,18 @@ CRITICAL INSTRUCTIONS:
             required: ['isResumeDocument', 'detectedRole', 'candidateExperienceSummary', 'keySkills', 'questions'],
           },
         },
-      });
+        },
+        {
+          models: ['gemini-3-flash-preview'],
+          passes: 1,
+          timeoutMs: 12_000,
+          deadlineMs: 12_000,
+          urgent: true,
+          label: 'resume examination',
+        }
+      );
 
-      const parsed = JSON.parse(response.text || '{}');
+      const parsed = JSON.parse(generated.text || '{}');
       if (parsed.isResumeDocument === false) {
         throw new ResumeValidationError(
           parsed.rejectionReason ||
@@ -5639,7 +5655,10 @@ CRITICAL INSTRUCTIONS:
       if (aiErr instanceof ResumeValidationError) {
         throw aiErr;
       }
-      console.warn('Gemini resume examination fallback to structural parser:', aiErr);
+      console.warn(
+        'Gemini resume examination fallback to structural parser:',
+        (aiErr as any)?.message || String(aiErr)
+      );
     }
   }
 
@@ -7757,25 +7776,34 @@ async function checkSupabaseTables(): Promise<boolean> {
     'virtual_assistant_questions',
     'technical_support_questions',
   ];
-  const missing: string[] = [];
-  let authProblem = '';
-  for (const table of tables) {
+  const checks = await Promise.all(tables.map(async (table) => {
     try {
       const resp = await fetch(`${config.url}/rest/v1/${table}?select=id&limit=1`, {
+        method: 'HEAD',
         headers: { apikey: config.key, Authorization: `Bearer ${config.key}` },
+        signal: AbortSignal.timeout(8_000),
       });
       if (resp.status === 401 || resp.status === 403) {
-        authProblem = `HTTP ${resp.status} — check that SUPABASE_SERVICE_ROLE_KEY is the secret (service role) key`;
-        break;
+        return { table, kind: 'auth' as const, detail: `HTTP ${resp.status}` };
       }
-      if (!resp.ok) missing.push(table);
+      if (resp.status === 404) return { table, kind: 'missing' as const, detail: 'HTTP 404' };
+      if (!resp.ok) return { table, kind: 'unavailable' as const, detail: `HTTP ${resp.status}` };
+      return { table, kind: 'ok' as const, detail: '' };
     } catch (err: any) {
-      authProblem = `cannot reach ${config.url}: ${err?.message || err}`;
-      break;
+      return { table, kind: 'unavailable' as const, detail: err?.message || 'request failed' };
     }
-  }
+  }));
+  const missing = checks.filter((r) => r.kind === 'missing').map((r) => r.table);
+  const authProblem = checks.find((r) => r.kind === 'auth');
+  const unavailable = checks.filter((r) => r.kind === 'unavailable');
   if (authProblem) {
-    console.warn(`[Supabase] ${authProblem}`);
+    console.warn(`[Supabase] ${authProblem.detail}; check SUPABASE_SERVICE_ROLE_KEY permissions.`);
+    return false;
+  }
+  if (unavailable.length) {
+    console.warn(
+      `[Supabase] Could not verify tables because the service is unreachable (${unavailable.map((r) => `${r.table}: ${r.detail}`).join('; ')}). This is a network/service issue, not proof that the tables are missing.`
+    );
     return false;
   }
   if (missing.length) {
@@ -8512,9 +8540,14 @@ async function startServer() {
     }
     void retryUnsentResultEmails().catch((e) => console.warn('Results email retry failed:', e?.message || e));
     provisionSupabaseTablesViaManagementApi()
-      .then(() => checkSupabaseTables())
-      .then((ready) => (ready ? seedCustomerServiceQuestionsToSupabase() : undefined))
-      .catch(() => {});
+      .then(async (provision) => {
+        if (!provision.provisioned) {
+          console.warn(`[Supabase] Schema auto-provisioning unavailable: ${provision.message}`);
+        }
+        const ready = await checkSupabaseTables();
+        if (ready) await seedCustomerServiceQuestionsToSupabase();
+      })
+      .catch((err) => console.warn('[Supabase] Startup check failed:', err?.message || err));
   });
 
   // Load Vite middleware in development with retry in case container is still unpacking node_modules

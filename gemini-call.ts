@@ -27,9 +27,11 @@ const OVERLOAD_COOLDOWN_MS = 20_000;
 const MIN_QUOTA_COOLDOWN_MS = 60_000;
 const MAX_QUOTA_COOLDOWN_MS = 24 * 60 * 60_000;
 const MAX_CONCURRENT = 3;
+const NETWORK_COOLDOWN_MS = 30_000;
 
 /** model -> time (ms) until which it is not tried, unless every model is cooling down. */
 const unavailableUntil = new Map<string, number>();
+let networkUnavailableUntil = 0;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: NodeJS.Timeout;
@@ -43,6 +45,11 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 function errorText(err: any): string {
   return String(err?.message || err);
+}
+
+function isNetworkFailure(err: any): boolean {
+  const text = `${errorText(err)} ${err?.cause?.code || ''}`;
+  return /fetch failed|ETIMEDOUT|ENETUNREACH|ECONNRESET|EAI_AGAIN|EHOSTUNREACH/i.test(text);
 }
 
 function shortError(err: any): string {
@@ -69,7 +76,9 @@ function retryDelayMs(text: string): number | null {
 
 function noteFailure(model: string, err: any): void {
   const text = errorText(err);
-  if (/\b429\b|RESOURCE_EXHAUSTED|exceeded your current quota/i.test(text)) {
+  if (isNetworkFailure(err)) {
+    networkUnavailableUntil = Date.now() + NETWORK_COOLDOWN_MS;
+  } else if (/\b429\b|RESOURCE_EXHAUSTED|exceeded your current quota/i.test(text)) {
     const perDay = /PerDay|per day/i.test(text);
     const wait = Math.min(
       MAX_QUOTA_COOLDOWN_MS,
@@ -124,6 +133,9 @@ export async function generateWithFallback(
     urgent?: boolean;
   } = {}
 ): Promise<{ text: string; model: string; raw: any }> {
+  if (Date.now() < networkUnavailableUntil) {
+    throw new Error('Gemini requests are temporarily paused after a network connection failure.');
+  }
   const models = opts.models || TEXT_MODELS;
   const passes = opts.passes ?? 3;
   const timeoutMs = opts.timeoutMs ?? 45000;
@@ -153,11 +165,16 @@ export async function generateWithFallback(
       } catch (err: any) {
         lastErr = err;
         noteFailure(model, err);
+        if (isNetworkFailure(err)) {
+          console.warn(`[Gemini] ${opts.label || 'request'}: network connection failed; skipping model fallbacks for 30 seconds.`);
+          break;
+        }
         console.warn(`[Gemini] ${opts.label || 'request'} on ${model} failed: ${shortError(err)}`);
       } finally {
         if (!opts.urgent) release();
       }
     }
+    if (Date.now() < networkUnavailableUntil) break;
   }
   throw lastErr || new Error('All Gemini models failed');
 }
