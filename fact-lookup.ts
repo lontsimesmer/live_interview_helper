@@ -163,10 +163,43 @@ ${context}`,
   return text && !text.toUpperCase().startsWith(UNKNOWN) ? text : null;
 }
 
+/** Free structured knowledge graph fallback, with no API key or Gemini title lookup. */
+async function viaDbpedia(ai: GoogleGenAI, question: string): Promise<string | null> {
+  // DBpedia is extracted from Wikimedia and can lag behind current events. Never use it
+  // for a question that explicitly asks for current or recently changing information.
+  if (/\b(current|currently|latest|today|now|this year|this season|who is|who won|202[5-9])\b/i.test(question)) return null;
+  const response = await withTimeout(
+    fetch(
+      `https://lookup.dbpedia.org/api/search?format=JSON&maxResults=3&query=${encodeURIComponent(question)}`,
+      { headers: { Accept: 'application/json', 'User-Agent': 'GlobalHire360/1.0 (fact lookup)' }, signal: AbortSignal.timeout(3000) }
+    ),
+    3000
+  );
+  if (!response.ok) return null;
+  const data: any = await response.json();
+  const context = (data?.docs || [])
+    .slice(0, 3)
+    .map((doc: any) => `${doc?.label?.[0] || ''}: ${doc?.comment?.[0] || ''}`)
+    .filter((text: string) => text.trim().length > 20)
+    .join('\n')
+    .slice(0, 5000);
+  if (!context) return null;
+  const resp = await generateWithFallback(
+    ai,
+    {
+      contents: `Answer in one short spoken sentence using only these DBpedia facts. If they do not answer the question, reply exactly ${UNKNOWN}.\nQuestion: ${question}\nFacts:\n${context}`,
+      config: { temperature: 0 },
+    },
+    { models: ['gemini-3.5-flash'], passes: 1, timeoutMs: 4000, deadlineMs: 4500, urgent: true, label: 'fact lookup (DBpedia)' }
+  );
+  const text = resp.text.trim();
+  return text && !text.toUpperCase().startsWith(UNKNOWN) ? text : null;
+}
+
 export async function lookUpFact(ai: GoogleGenAI | null, question: string): Promise<string> {
   const q = String(question || '').trim().slice(0, 300);
   if (!q || !ai) return UNKNOWN;
-  for (const source of [viaGoogleSearch, viaWikipedia]) {
+  for (const source of [viaGoogleSearch, viaDbpedia, viaWikipedia]) {
     try {
       const answer = await source(ai, q);
       if (answer) return answer;

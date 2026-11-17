@@ -6892,7 +6892,7 @@ async function runSessionFinalization(
     (a, b) => a.questionNumber - b.questionNumber
   );
 
-  // Every interview is marked on 20, whether 4 or 5 questions were asked.
+  // Every interview score is normalized to /20, including adaptive early finishes.
   const terminatedForSilence = session.liveEndReason === 'terminated_silence';
   const { totalOutOf20: totalScore } = recomputeSessionScore(session, {
     forceZero: terminatedForMisconduct || terminatedForSilence,
@@ -7868,7 +7868,7 @@ async function startServer() {
       },
     });
 
-    const totalQuestions = session.questions.length || DEFAULT_QUESTION_COUNT;
+    let totalQuestions = session.questions.length || DEFAULT_QUESTION_COUNT;
     let geminiSession: any = null;
     let geminiGeneration = 0;
     let resumptionHandle: string | null = null;
@@ -8118,7 +8118,7 @@ async function startServer() {
           const qNum = Number(call.args?.questionNumber) || currentQuestionNumber + 1;
           setCurrentQuestion(qNum);
           await respond(
-            `Question ${Math.min(totalQuestions, qNum)} of ${totalQuestions} started. Ask it exactly as written, then wait for the answer.`
+            `The next main question is ready. Connect it briefly to the candidate's last answer, ask the selected question guide naturally, then listen without interrupting.`
           );
         } else if (call.name === 'report_candidate_misconduct') {
           const action = String(call.args?.action || 'deduct_points_warning');
@@ -8179,7 +8179,7 @@ async function startServer() {
           // Capped so the candidate is never left waiting in silence for long.
           const answer = await Promise.race([
             lookUpFact(getGenAIClientOrNull(), question),
-            new Promise<string>((resolve) => setTimeout(() => resolve('UNKNOWN'), 14000)),
+            new Promise<string>((resolve) => setTimeout(() => resolve('UNKNOWN'), 8000)),
           ]);
           await respond(
             answer === 'UNKNOWN'
@@ -8198,8 +8198,9 @@ async function startServer() {
           let reason: NonNullable<InterviewSessionRecord['liveEndReason']> =
             endingReason || (allowed.includes(asked) ? asked : 'completed_all_questions');
 
-          // Keep the interview going until all questions were asked (or time is up):
-          // the model is not allowed to cut the call short by mistake.
+          // The interviewer may conclude after three completed answers when the conversation
+          // shows enough evidence. Remove unused questions so the score is normalized over
+          // the questions actually asked. Earlier endings remain blocked.
           if (
             !endingReason &&
             reason === 'completed_all_questions' &&
@@ -8207,11 +8208,16 @@ async function startServer() {
             secondsLeft() > 60 &&
             !rejectedEarlyEnd
           ) {
-            rejectedEarlyEnd = true;
-            await respond(
-              `The call cannot end yet: only ${currentQuestionNumber} of ${totalQuestions} questions have been asked. Continue the interview now with Question ${currentQuestionNumber + 1} exactly as written.`
-            );
-            continue;
+            if (currentQuestionNumber >= 3) {
+              session.questions = session.questions.slice(0, currentQuestionNumber);
+              totalQuestions = session.questions.length;
+            } else {
+              rejectedEarlyEnd = true;
+              await respond(
+                `Continue the interview with a relevant question. At least three main questions are needed before closing.`
+              );
+              continue;
+            }
           }
           if (reason === 'time_up' && secondsLeft() > 30) reason = 'completed_all_questions';
           // Ending for off-topic answers is only allowed once the platform counted two on a question.
@@ -8331,6 +8337,7 @@ async function startServer() {
         resumptionHandle,
         functionDeclarations: [
           endCallFunctionDeclaration,
+          advanceQuestionFunctionDeclaration,
           reportMisconductFunctionDeclaration,
           flagOffTopicAnswerDeclaration,
           lookUpFactDeclaration,
