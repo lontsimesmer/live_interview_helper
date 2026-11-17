@@ -8211,6 +8211,11 @@ async function startServer() {
             if (currentQuestionNumber >= 3) {
               session.questions = session.questions.slice(0, currentQuestionNumber);
               totalQuestions = session.questions.length;
+              sendToClient({
+                type: 'question_advanced',
+                questionNumber: currentQuestionNumber,
+                totalQuestions,
+              });
             } else {
               rejectedEarlyEnd = true;
               await respond(
