@@ -713,8 +713,9 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
                 1
               </span>
               <span>
-                Join from a quiet place. Only you may answer. Wait until the
-                interviewer finishes speaking before you respond.
+                Sit in a quiet place and answer every question yourself, with
+                no help from anyone. Let the interviewer finish speaking, then
+                give your answer.
               </span>
             </li>
             <li className="flex items-start gap-2.5">
@@ -896,31 +897,24 @@ const HomePage: React.FC<HomePageProps> = ({ onSessionStarted }) => {
               !examinedResume &&
               recognizedCandidate?.hasSavedProfile && (
                 <div className="mt-3 p-3.5 rounded-lg bg-[#339A05]/10 border border-[#339A05]/30">
-                  <label className="block text-xs font-bold uppercase tracking-wider text-[#041E41] mb-1">
+                  <div className="block text-xs font-bold uppercase tracking-wider text-[#041E41] mb-1">
                     Job Position (from your saved profile)
-                  </label>
-                  <input
-                    type="text"
-                    value={confirmedJobPosition}
-                    maxLength={120}
-                    onChange={(e) => setConfirmedJobPosition(e.target.value)}
-                    className="w-full px-3 py-2 rounded-md border border-[#339A05]/40 bg-white text-sm font-bold text-[#041E41] focus:outline-none focus:border-[#041E41]"
-                  />
+                  </div>
+                  <div className="w-full px-3 py-2 rounded-md border border-[#339A05]/40 bg-white text-sm font-bold text-[#041E41]">
+                    {confirmedJobPosition || recognizedCandidate.savedJobPosition}
+                  </div>
                 </div>
               )}
 
             {!isExaminingResume && examinedResume && !rejectedDocumentInfo && (
               <div className="mt-3 p-3.5 rounded-lg bg-[#339A05]/10 border border-[#339A05]/30 space-y-3">
                 <div>
-                  <label className="block text-xs font-bold uppercase tracking-wider text-[#041E41] mb-1">
+                  <div className="block text-xs font-bold uppercase tracking-wider text-[#041E41] mb-1">
                     Job Position
-                  </label>
-                  <input
-                    type="text"
-                    value={confirmedJobPosition}
-                    onChange={(e) => setConfirmedJobPosition(e.target.value)}
-                    className="w-full px-3 py-2 rounded-md border border-[#339A05]/40 bg-white text-sm font-bold text-[#041E41] focus:outline-none focus:border-[#041E41]"
-                  />
+                  </div>
+                  <div className="w-full px-3 py-2 rounded-md border border-[#339A05]/40 bg-white text-sm font-bold text-[#041E41]">
+                    {confirmedJobPosition || examinedResume.detectedRole}
+                  </div>
                 </div>
 
                 {examinedResume.keySkills.length > 0 && (
@@ -2030,6 +2024,25 @@ const InterviewRoomPage: React.FC<InterviewRoomPageProps> = ({
                   ...prev,
                   currentPhase: "questioning",
                   currentQuestionIndex: qIdx,
+                };
+                sessionRef.current = updated;
+                return updated;
+              });
+              return;
+            }
+
+            // Sarah finished the main questions (all, or 3+ when she had enough):
+            // the per-question timer stops and the conversation is open.
+            if (msg.type === "main_questions_finished") {
+              questionSecondsRef.current = 0;
+              setQuestionSecondsLeft(0);
+              setSession((prev) => {
+                if (!prev) return prev;
+                const asked = Number(msg.questionsAsked) || prev.questions.length;
+                const updated: InterviewSessionRecord = {
+                  ...prev,
+                  currentPhase: "candidate_questions",
+                  questions: prev.questions.slice(0, Math.max(1, asked)),
                 };
                 sessionRef.current = updated;
                 return updated;

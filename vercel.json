@@ -1,5 +1,4 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "node",
   "buildCommand": "npm run build && cp -R dist/. public/",
   "functions": {

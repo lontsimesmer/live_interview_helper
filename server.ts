@@ -1,5 +1,6 @@
 import express from 'express';
 import http from 'http';
+import net from 'net';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   GoogleGenAI,
@@ -19,10 +20,10 @@ import {
   interviewerTextAsksQuestion,
   recentSpeechAsksQuestion,
   buildTranscriptionVocabulary,
-  flagOffTopicAnswerDeclaration,
-  lookUpFactDeclaration,
+  INTERVIEWER_TOOLS,
 } from './interviewer-agent.js';
 import { candidateRecorders, pruneRecorders, recorderFor } from './candidate-audio.js';
+import { connectElevenLabsLive, isElevenLabsConfigured } from './elevenlabs-live.js';
 import { wordCount } from './answer-grading.js';
 import { lookUpFact } from './fact-lookup.js';
 import { generateWithFallback } from './gemini-call.js';
@@ -34,6 +35,11 @@ import crypto from 'crypto';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 
 dotenv.config();
+
+// Node's "happy eyeballs" gives each resolved address only 250 ms to connect. Google's API
+// hosts resolve to 16 addresses and connects here take ~120–250 ms, so a slightly slow moment
+// aborts every attempt and fetch/WebSocket fail with ETIMEDOUT. Give each attempt more time.
+net.setDefaultAutoSelectFamilyAttemptTimeout(2000);
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -338,6 +344,8 @@ export interface InterviewSessionRecord {
   createdAt: string;
   completedAt?: string;
   maxDurationSeconds?: number;
+  /** Address of the interview app the candidate used (for "retake" links in emails). */
+  appOrigin?: string;
   candidateName: string;
   candidateEmail: string;
   candidateGoogleAvatarUrl?: string;
@@ -1241,6 +1249,31 @@ function singleLine(value: unknown, max = 160): string {
  *     instances race, Resend itself delivers only one email (24h idempotency window).
  *  4. No manual resend: candidates cannot trigger it; failed sends are retried automatically.
  */
+/**
+ * Home page of the live interview app, for links in emails: APP_URL if set, otherwise the
+ * address the candidate used to start the interview, otherwise Vercel's production domain.
+ */
+function interviewAppUrl(session?: Pick<InterviewSessionRecord, 'appOrigin'>): string {
+  const candidates = [
+    process.env.APP_URL,
+    session?.appOrigin,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL && `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`,
+    process.env.VERCEL_URL && `https://${process.env.VERCEL_URL}`,
+  ];
+  const url = candidates.map((c) => String(c || '').trim()).find((c) => /^https?:\/\/[^\s"'<>]+$/i.test(c));
+  return `${(url || 'http://localhost:3000').replace(/\/+$/, '')}/`;
+}
+
+/** Origin the browser used for this request (behind Vercel's proxy too). */
+function requestOrigin(req: express.Request): string | undefined {
+  const origin = String(req.headers.origin || '').trim();
+  if (/^https?:\/\/[a-z0-9.-]+(:\d+)?$/i.test(origin)) return origin;
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  if (!/^[a-z0-9.-]+(:\d+)?$/i.test(host)) return undefined;
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+  return `${proto === 'http' ? 'http' : 'https'}://${host}`;
+}
+
 async function sendResendAssessmentEmail(
   session: InterviewSessionRecord
 ): Promise<{ sent: boolean; note: string; emailId?: string; inProgress?: boolean }> {
@@ -1291,7 +1324,8 @@ async function sendResendAssessmentEmail(
     const formatFromHeader = (emailAddr: string) =>
       emailAddr.includes('<') ? emailAddr : `${senderName} <${emailAddr}>`;
 
-    const appUrl = (process.env.APP_URL || 'https://www.globalhire360.com').replace(/\/+$/, '');
+    // "Retake" leads back to the live interview app's home page (never the company website).
+    const appUrl = interviewAppUrl(session);
     const passed = Boolean(session.successful);
     const name = escapeHtml(session.candidateName);
     const role = escapeHtml(session.detectedRole);
@@ -1322,11 +1356,11 @@ async function sendResendAssessmentEmail(
           </div>
           <div style="font-size: 14px; font-weight: 700; color: #1E293B; margin-top: 4px;">${appreciationTitle}</div>
           <p style="font-size: 13px; color: #475569; line-height: 1.55; margin: 8px 0 0 0;">${escapeHtml(appreciationBodyText)}</p>
-        </div>
-
-        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 16px; margin-bottom: 24px;">
-          <div style="font-size: 12px; font-weight: 700; color: #041E41; text-transform: uppercase; margin-bottom: 6px;">Summary of Your Call (${role})</div>
-          <p style="font-size: 13px; color: #334155; line-height: 1.6; margin: 0;">${escapeHtml(session.interviewerFinalImpression)}</p>
+          ${
+            session.interviewerFinalImpression
+              ? `<p style="font-size: 13px; color: #334155; line-height: 1.6; margin: 12px 0 0 0;"><strong style="color: #041E41;">Summary of your call (${role}):</strong> ${escapeHtml(session.interviewerFinalImpression)}</p>`
+              : ''
+          }
         </div>
 
         <div style="text-align: center; margin: 26px 0 10px 0;">
@@ -5550,7 +5584,7 @@ CRITICAL INSTRUCTIONS:
    - If the resume only has 1, 2, or 3 essential skills, return only those 1, 2, or 3 skills.
    - Return at most 5 skills maximum (1 to 5 max).
 3. Write a concise 2-sentence summary of their experience in "candidateExperienceSummary".
-4. Generate 5 tailored interview questions specifically for their "detectedRole" and referencing their essential skills.`,
+4. Generate 5 tailored interview questions specifically for their "detectedRole" and referencing their essential skills. They must work as one coherent conversation: order them so each one follows naturally from the previous (background and role fit first, then concrete examples of the key skills, then motivation and why they should be hired), with no two questions covering the same ground. Put the most important ones first, because the interviewer may stop after the third or fourth question when the answers are strong.`,
       });
 
       const generated = await generateWithFallback(
@@ -5604,10 +5638,13 @@ CRITICAL INSTRUCTIONS:
         },
         },
         {
-          models: ['gemini-3-flash-preview'],
+          // One slow/overloaded model should not drop the candidate to the structural parser:
+          // try the next ones within the overall budget.
+          models: ['gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-flash-latest'],
           passes: 1,
-          timeoutMs: 12_000,
-          deadlineMs: 12_000,
+          // 10 s per model so all three get a real try within the budget.
+          timeoutMs: 10_000,
+          deadlineMs: 32_000,
           urgent: true,
           label: 'resume examination',
         }
@@ -5802,7 +5839,7 @@ function buildResumeResponse(session: InterviewSessionRecord) {
     accessToken: session.accessToken,
     interviewerMessage: continueLine,
     remainingSeconds: remainingSessionSeconds(session),
-    liveWsAvailable: Boolean(getGenAIClientOrNull()),
+    liveWsAvailable: Boolean(getGenAIClientOrNull()) || isElevenLabsConfigured(),
   };
 }
 
@@ -5977,6 +6014,7 @@ app.post('/api/start-interview-session', async (req, res) => {
         candidateId: candidateRecord.id,
         createdAt: new Date().toISOString(),
         maxDurationSeconds: 600, // 10 minutes max session duration
+        appOrigin: requestOrigin(req),
         candidateName,
         candidateEmail,
         candidateGoogleAvatarUrl:
@@ -6029,7 +6067,7 @@ app.post('/api/start-interview-session', async (req, res) => {
           accessToken: newSession.accessToken,
           interviewerMessage: greetingText,
           remainingSeconds: newSession.maxDurationSeconds,
-          liveWsAvailable: Boolean(getGenAIClientOrNull()),
+          liveWsAvailable: Boolean(getGenAIClientOrNull()) || isElevenLabsConfigured(),
         },
       };
     });
@@ -7692,63 +7730,7 @@ app.post('/api/interviewer-tts', async (req, res) => {
 // ============================================================================
 // 6. LUNA v2 REAL-TIME VOICE WEBSOCKET BRIDGE (/api/live-ws) — GEMINI-3.8-LIVE
 // ============================================================================
-const endCallFunctionDeclaration: FunctionDeclaration = {
-  name: 'end_call',
-  description:
-    'Ends the live interview call. Call it only AFTER you have spoken your closing words. After calling it you must stay completely silent.',
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      reason: {
-        type: Type.STRING,
-        description:
-          'completed_all_questions (normal end after the closing), time_up (the 10 minutes are over), terminated_rules_violation (the interview rules were broken again after a warning), terminated_after_two_attempts (the platform said to end after a second off-topic answer), or terminated_misconduct (abusive / repeated inappropriate language).',
-      },
-    },
-    required: ['reason'],
-  },
-};
-
-const advanceQuestionFunctionDeclaration: FunctionDeclaration = {
-  name: 'advance_question',
-  description:
-    'Call this in the same turn, right before you ask a new main interview question, with that question number. Do NOT call it when you only repeat or rephrase the current question.',
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      questionNumber: {
-        type: Type.NUMBER,
-        description: 'The number of the main question you are about to ask.',
-      },
-    },
-    required: ['questionNumber'],
-  },
-};
-
-const reportMisconductFunctionDeclaration: FunctionDeclaration = {
-  name: 'report_candidate_misconduct',
-  description:
-    'Call this IMMEDIATELY if the candidate uses profanity, inappropriate language, insults, or disrespectful conduct during the interview.',
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      action: {
-        type: Type.STRING,
-        description:
-          'deduct_points_warning (for 1st mild offense: deducts 3 points and warns candidate) or terminate_and_suspend_24h (for severe profanity/insults or a 2nd offense: ends call and suspends candidate for 24 hours).',
-      },
-      pointsDeducted: {
-        type: Type.NUMBER,
-        description: 'Points deducted for misconduct (default 3 for warning, 25 for termination).',
-      },
-      reason: {
-        type: Type.STRING,
-        description: 'Brief explanation of the inappropriate language or misconduct.',
-      },
-    },
-    required: ['action', 'reason'],
-  },
-};
+// end_call, advance_question and report_candidate_misconduct are declared in interviewer-agent.ts.
 
 // Recorded candidate audio is only needed until the interview is graded.
 setInterval(() => {
@@ -7844,12 +7826,15 @@ async function startServer() {
         ? candidateSession
         : undefined;
 
-    const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || !session) {
+    const rawGeminiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+    const apiKey = rawGeminiKey === 'MY_GEMINI_API_KEY' ? '' : rawGeminiKey;
+    // Sarah's voice: ElevenLabs when configured (see elevenlabs-live.ts), else Gemini Live.
+    let useElevenLabs = isElevenLabsConfigured();
+    if ((!apiKey && !useElevenLabs) || !session) {
       clientWs.send(
         JSON.stringify({
           type: 'fallback_required',
-          reason: !apiKey ? 'GEMINI_API_KEY not configured' : 'Session not found',
+          reason: !session ? 'Session not found' : 'No live voice provider configured',
         })
       );
       clientWs.close();
@@ -7860,13 +7845,15 @@ async function startServer() {
     // (second tab, page reload, reconnect) so two Sarahs can never talk at the same time.
     liveVoiceConnections.get(session.id)?.shutdown();
 
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        apiVersion: 'v1alpha', // needed for affective dialog & proactive audio
-        headers: { 'User-Agent': 'aistudio-build' },
-      },
-    });
+    const ai = apiKey
+      ? new GoogleGenAI({
+          apiKey,
+          httpOptions: {
+            apiVersion: 'v1alpha', // needed for affective dialog & proactive audio
+            headers: { 'User-Agent': 'aistudio-build' },
+          },
+        })
+      : null;
 
     let totalQuestions = session.questions.length || DEFAULT_QUESTION_COUNT;
     let geminiSession: any = null;
@@ -7955,6 +7942,42 @@ async function startServer() {
     let candidateWordsThisQuestion = 0;
     let silenceCheckTimer: NodeJS.Timeout | null = null;
     let candidateAnsweredCurrentQuestion = false;
+    // When the candidate's speech was last transcribed: platform notes never make Sarah talk
+    // over a candidate who is still answering.
+    let lastCandidateSpeechAt = 0;
+    const candidateIsSpeaking = () => Date.now() - lastCandidateSpeechAt < 6000;
+    // Gemini's transcript of the candidate often arrives only when they finish talking, so it
+    // cannot tell whether someone is answering right now. The microphone audio can: a frame
+    // loud enough to be speech (outside the time Sarah's own audio is playing) counts as the
+    // candidate talking. Without this, the silence check asked "Are you still there?" and
+    // repeated the question while the candidate was in the middle of a good answer.
+    const VOICE_RMS_THRESHOLD = 600; // 16-bit PCM; room noise is ~50-300, speech ~1000+
+    let interviewerAudioUntil = 0; // estimated end of Sarah's audio playback in the browser
+    let voicedMsThisQuestion = 0;
+    const noteCandidateAudio = (pcm: Buffer) => {
+      const samples = Math.floor(pcm.length / 2);
+      if (samples < 64 || microphoneMuted) return;
+      const now = Date.now();
+      if (now < interviewerAudioUntil + 400) return; // probably Sarah's voice coming back
+      let sum = 0;
+      for (let i = 0; i < samples; i++) {
+        const v = pcm.readInt16LE(i * 2);
+        sum += v * v;
+      }
+      if (Math.sqrt(sum / samples) < VOICE_RMS_THRESHOLD) return;
+      lastCandidateSpeechAt = now;
+      if (currentQuestionNumber > 0) {
+        voicedMsThisQuestion += (samples / 16000) * 1000;
+        // About a second of speech after the question = the candidate is answering.
+        if (voicedMsThisQuestion >= 1000 && !candidateAnsweredCurrentQuestion) {
+          candidateAnsweredCurrentQuestion = true;
+          clearSilenceCheck();
+        }
+      }
+    };
+    // Set once Sarah has finished the main questions (all of them, or 3+ when she has enough):
+    // from then on the conversation is open and no question timer applies.
+    let mainQuestionsFinished = false;
     let microphoneMuted = false;
     const clearSilenceCheck = () => {
       if (silenceCheckTimer) clearTimeout(silenceCheckTimer);
@@ -7967,7 +7990,36 @@ async function startServer() {
     // Only one question detection per interviewer turn.
     let questionDetectedThisTurn = false;
 
+    // Sarah chooses the prepared question that follows best from each answer, so they are not
+    // always asked in order. `promptQuestions` is the list exactly as numbered in her prompt;
+    // `askedOriginals` the prompt numbers in the order she asked them. session.questions is
+    // kept as "asked ones first, in asked order, then the rest", so position N is always the
+    // N-th question asked and its answer is graded against the question really asked.
+    const promptQuestions = session.questions.map((q) => ({ ...q }));
+    const askedOriginals: number[] = promptQuestions.slice(0, currentQuestionNumber).map((q) => q.number);
+    const askPromptQuestion = (promptNumber: number) => {
+      if (mainQuestionsFinished) return;
+      const already = askedOriginals.indexOf(promptNumber);
+      if (already >= 0) {
+        setCurrentQuestion(already + 1); // a re-ask of a question already asked
+        return;
+      }
+      if (currentQuestionNumber > 0 && !candidateAnsweredCurrentQuestion) {
+        // Never skip ahead before the current question was answered: treat it as a rephrase.
+        setCurrentQuestion(currentQuestionNumber);
+        return;
+      }
+      askedOriginals.push(promptNumber);
+      const rest = promptQuestions.filter((q) => !askedOriginals.includes(q.number));
+      session.questions = [
+        ...askedOriginals.map((n) => promptQuestions.find((q) => q.number === n)!),
+        ...rest,
+      ].map((q, i) => ({ ...q, number: i + 1 }));
+      setCurrentQuestion(askedOriginals.length);
+    };
+
     const setCurrentQuestion = (n: number) => {
+      if (mainQuestionsFinished) return;
       const qn = Math.max(1, Math.min(totalQuestions, Math.round(n)));
       if (qn < currentQuestionNumber) return;
       if (qn === currentQuestionNumber) {
@@ -7981,6 +8033,7 @@ async function startServer() {
       currentQuestionNumber = qn;
       candidateWordsThisQuestion = 0;
       candidateAnsweredCurrentQuestion = false;
+      voicedMsThisQuestion = 0;
       clearSilenceCheck();
       session.currentPhase = 'questioning';
       session.currentQuestionIndex = qn - 1;
@@ -8004,21 +8057,36 @@ async function startServer() {
     const beginSilenceCheck = (questionNumber: number) => {
       clearSilenceCheck();
       if (microphoneMuted || candidateAnsweredCurrentQuestion || questionNumber !== currentQuestionNumber) return;
-      silenceCheckTimer = setTimeout(() => {
-        if (stopped || callEnded || endingReason || microphoneMuted || candidateAnsweredCurrentQuestion || questionNumber !== currentQuestionNumber) return;
+      const stillWaiting = () =>
+        !stopped && !callEnded && !endingReason && !microphoneMuted && !candidateAnsweredCurrentQuestion && questionNumber === currentQuestionNumber;
+      // Each step gives the candidate 10 full seconds AFTER Sarah's audio has finished playing:
+      // Gemini sends her words seconds before the browser has played them, so counting from the
+      // words made "Are you still there?" come while the candidate had just heard the question.
+      const afterSarahThen = (step: () => void, firstWaitMs = 0) => {
+        const tick = () => {
+          if (!stillWaiting()) return;
+          if (Date.now() < interviewerAudioUntil + 300 || candidateIsSpeaking()) {
+            silenceCheckTimer = setTimeout(tick, 500);
+            return;
+          }
+          silenceCheckTimer = setTimeout(() => {
+            if (!stillWaiting()) return;
+            if (Date.now() < interviewerAudioUntil || candidateIsSpeaking()) return tick();
+            step();
+          }, 10_000);
+        };
+        silenceCheckTimer = setTimeout(tick, firstWaitMs);
+      };
+      afterSarahThen(() => {
         void sendSystemNote(
           'The candidate has not spoken for 10 seconds after the question. Ask, "Are you still there?" in one short sentence, then wait for a response.',
           true
         );
-        silenceCheckTimer = setTimeout(() => {
-          if (stopped || callEnded || endingReason || microphoneMuted || candidateAnsweredCurrentQuestion || questionNumber !== currentQuestionNumber) return;
+        // 1.5 s for Sarah to start speaking her check-in, then wait until she has finished.
+        afterSarahThen(() => {
           const question = session.questions.find((q) => q.number === questionNumber)?.question;
-          void sendSystemNote(
-            `There is still no response. Repeat this exact question and wait: "${question || ''}"`,
-            true
-          );
-          silenceCheckTimer = setTimeout(() => {
-            if (stopped || callEnded || endingReason || microphoneMuted || candidateAnsweredCurrentQuestion || questionNumber !== currentQuestionNumber) return;
+          void sendSystemNote(`There is still no response. Repeat this exact question and wait: "${question || ''}"`, true);
+          afterSarahThen(() => {
             const reason = 'Interview ended after no response to the question or its repeat.';
             session.status = 'terminated_silence';
             session.suspendedUntil = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
@@ -8037,9 +8105,9 @@ async function startServer() {
               `The candidate did not respond after you checked in and repeated the question. Tell ${session.candidateName} in one calm sentence that the call is ending and the account is suspended for 24 hours. Then call end_call with reason "terminated_silence".`,
               9000
             );
-          }, 10_000);
-        }, 10_000);
-      }, 10_000);
+          }, 1500);
+        }, 1500);
+      });
     };
 
     let drainUntil = 0;
@@ -8115,11 +8183,60 @@ async function startServer() {
         };
 
         if (call.name === 'advance_question') {
-          const qNum = Number(call.args?.questionNumber) || currentQuestionNumber + 1;
-          setCurrentQuestion(qNum);
+          if (mainQuestionsFinished) {
+            await respond('The interview questions are already finished. Stay in the open conversation; do not ask another interview question.');
+            continue;
+          }
+          if (currentQuestionNumber > 0 && !candidateAnsweredCurrentQuestion) {
+            await respond(
+              `Not yet: ${session.candidateName} has not answered the current question. Do not ask a new question. Wait quietly for their answer.`
+            );
+            continue;
+          }
+          // One question per turn: if Sarah already asked something in this turn ("Ready to
+          // start?"), the candidate must be able to reply before the interview question comes.
+          const askedThisTurn = interviewerTurnText.includes('?');
+          if (askedThisTurn) {
+            await respond(
+              `Not now: you just asked ${session.candidateName} a question in this turn. Stop talking and wait for their reply. Ask the interview question in your next turn, after they answer.`
+            );
+            continue;
+          }
+          const requested = Math.round(Number(call.args?.questionNumber));
+          const firstUnasked = promptQuestions.find((q) => !askedOriginals.includes(q.number))?.number;
+          const qNum = promptQuestions.some((q) => q.number === requested) ? requested : firstUnasked;
+          if (qNum) askPromptQuestion(qNum);
           await respond(
             `The next main question is ready. Connect it briefly to the candidate's last answer, ask the selected question guide naturally, then listen without interrupting.`
           );
+        } else if (call.name === 'finish_main_questions') {
+          if (mainQuestionsFinished) {
+            await respond('Already recorded. Continue the open conversation.');
+            continue;
+          }
+          if (currentQuestionNumber > 0 && !candidateAnsweredCurrentQuestion) {
+            await respond(
+              `Not yet: ${session.candidateName} has not answered the current question. Wait for their answer first.`
+            );
+            continue;
+          }
+          if (currentQuestionNumber < Math.min(3, totalQuestions)) {
+            await respond(
+              'Not yet: at least three main questions are needed. Continue with the next question that connects best to what the candidate just said.'
+            );
+            continue;
+          }
+          mainQuestionsFinished = true;
+          clearSilenceCheck();
+          // Only the questions actually asked are graded.
+          if (currentQuestionNumber < totalQuestions) {
+            session.questions = session.questions.slice(0, currentQuestionNumber);
+            totalQuestions = session.questions.length;
+          }
+          session.currentPhase = 'candidate_questions';
+          sendToClient({ type: 'main_questions_finished', questionsAsked: totalQuestions });
+          flushCandidatesAndSessionsToDisk();
+          await respond(LIVE_NOTES.openConversation(secondsLeft() > 75));
         } else if (call.name === 'report_candidate_misconduct') {
           const action = String(call.args?.action || 'deduct_points_warning');
           const reason = clampText(call.args?.reason || 'Unprofessional language during live interview', 300);
@@ -8146,8 +8263,10 @@ async function startServer() {
             await respond(`Warning recorded. Total penalty points: ${session.misconductPenaltyPoints}. Calmly warn the candidate once, then continue the interview.`);
           }
         } else if (call.name === 'flag_off_topic_answer') {
-          const qNum = Math.round(Number(call.args?.questionNumber)) || currentQuestionNumber;
-          if (endingReason || qNum < 1 || qNum !== currentQuestionNumber) {
+          // Sarah numbers questions as in her prompt; the platform numbers them in asked order.
+          // A follow-up belongs to the question being answered, so the current one is used.
+          const qNum = currentQuestionNumber;
+          if (endingReason || mainQuestionsFinished || qNum < 1) {
             await respond('Not recorded: that is not the question being answered now. Continue the interview normally.');
             continue;
           }
@@ -8172,7 +8291,7 @@ async function startServer() {
         } else if (call.name === 'look_up_fact') {
           const question = clampText(call.args?.question, 300);
           // Questions are kept for the end: during the questions Sarah parks them.
-          if (currentQuestionNumber < totalQuestions) {
+          if (!mainQuestionsFinished && currentQuestionNumber < totalQuestions) {
             await respond('Not now: the interview questions are not finished. Tell the candidate kindly you will come back to it at the end, and continue the current question.');
             continue;
           }
@@ -8272,6 +8391,16 @@ async function startServer() {
 
       const serverContent = message?.serverContent;
       if (serverContent?.modelTurn || serverContent?.outputTranscription) recorder.closeTurn();
+      // Track when Sarah's audio finishes playing in the browser (24 kHz, 16-bit mono), plus
+      // a small margin, so her own voice picked up by the microphone is not taken as the candidate.
+      for (const part of serverContent?.modelTurn?.parts || []) {
+        const b64 = part?.inlineData?.data;
+        if (typeof b64 === 'string' && b64.length) {
+          const ms = ((b64.length * 3) / 4 / 48000) * 1000;
+          interviewerAudioUntil = Math.max(Date.now(), interviewerAudioUntil) + ms;
+        }
+      }
+      if (serverContent?.interrupted) interviewerAudioUntil = Date.now();
       const interviewerChunk = serverContent?.outputTranscription?.text;
       if (interviewerChunk) {
         appendTranscript('interviewer', interviewerChunk);
@@ -8280,14 +8409,19 @@ async function startServer() {
         // question, the 90-second timer starts and the answer that follows is filed under it.
         // Look at the next question first, then one further (in case one was missed), and at
         // the current one (a re-ask before it was answered restarts its timer).
-        if (!questionDetectedThisTurn) {
-          for (const ahead of [0, 1, -1]) {
-            const qn = currentQuestionNumber + 1 + ahead;
-            const candidateQ = qn >= 1 ? session.questions[qn - 1] : undefined;
-            if (candidateQ && recentSpeechAsksQuestion(interviewerTurnText, candidateQ.question)) {
+        // Sarah may pick any prepared question that follows best from the answer, so every
+        // question not asked yet is checked (in order), plus the current one (a re-ask).
+        if (!questionDetectedThisTurn && !mainQuestionsFinished) {
+          const current = currentQuestionNumber > 0 ? askedOriginals[currentQuestionNumber - 1] : undefined;
+          const toCheck = [
+            ...promptQuestions.filter((q) => !askedOriginals.includes(q.number)),
+            ...promptQuestions.filter((q) => q.number === current),
+          ];
+          for (const q of toCheck) {
+            if (recentSpeechAsksQuestion(interviewerTurnText, q.question)) {
               questionDetectedThisTurn = true;
-              setCurrentQuestion(qn);
-              beginSilenceCheck(qn);
+              askPromptQuestion(q.number);
+              beginSilenceCheck(currentQuestionNumber);
               break;
             }
           }
@@ -8302,6 +8436,7 @@ async function startServer() {
       if (candidateChunk && !endingReason) {
         if (candidateChunk.trim()) {
           candidateAnsweredCurrentQuestion = true;
+          lastCandidateSpeechAt = Date.now();
           clearSilenceCheck();
         }
         appendTranscript('candidate', candidateChunk);
@@ -8340,13 +8475,7 @@ async function startServer() {
         systemInstruction: buildInterviewerPrompt(session, DEFAULT_QUESTION_COUNT),
         voiceName: liveVoiceName, // NotebookLM female voice ("Aoede")
         resumptionHandle,
-        functionDeclarations: [
-          endCallFunctionDeclaration,
-          advanceQuestionFunctionDeclaration,
-          reportMisconductFunctionDeclaration,
-          flagOffTopicAnswerDeclaration,
-          lookUpFactDeclaration,
-        ],
+        functionDeclarations: INTERVIEWER_TOOLS,
         vocabulary: buildTranscriptionVocabulary(session),
       });
 
@@ -8359,6 +8488,8 @@ async function startServer() {
       const generation = ++geminiGeneration;
       let gotMessage = false;
       let modelIndex = startAt;
+      // ElevenLabs (when configured) is Sarah's voice; Gemini Live is the automatic backup.
+      let onElevenLabs = useElevenLabs;
       const callbacks = {
         onopen: () => {
           if (generation === geminiGeneration) sendToClient({ type: 'connected' });
@@ -8370,11 +8501,30 @@ async function startServer() {
         },
         onerror: (err: any) => {
           if (generation !== geminiGeneration) return;
-          console.warn('Gemini Live WebSocket error:', err?.message || err);
+          // Never log the raw ErrorEvent: it includes the socket URL, which carries the API key.
+          const cause = err?.error;
+          console.warn('Gemini Live WebSocket error:', err?.message || cause?.code || cause?.message || 'unknown error');
         },
         onclose: (event: any) => {
           if (generation !== geminiGeneration || stopped || callEnded) return;
           geminiSession = null;
+          if (onElevenLabs) {
+            if (!gotMessage && ai) {
+              console.warn(`[ElevenLabs] conversation closed at startup (${event?.reason || event?.code || 'no reason'}); switching to Gemini Live.`);
+              useElevenLabs = false;
+              connectGemini(0)
+                .then(() => (openingNote ? sendSystemNote(openingNote, true) : undefined))
+                .catch(() => {
+                  sendToClient({ type: 'live_dropped' });
+                  shutdown();
+                });
+              return;
+            }
+            // ElevenLabs has no session resumption: the browser reconnects with recent context.
+            sendToClient({ type: 'live_dropped' });
+            shutdown();
+            return;
+          }
           // Closed before saying anything (quota, unsupported setting...): try the next model.
           if (!gotMessage && !resumptionHandle && modelIndex + 1 < LIVE_MODELS.length) {
             console.warn(`Gemini Live model ${LIVE_MODELS[modelIndex]} closed at startup (${event?.reason || 'no reason'}); trying ${LIVE_MODELS[modelIndex + 1]}.`);
@@ -8399,6 +8549,27 @@ async function startServer() {
           shutdown();
         },
       };
+      if (onElevenLabs) {
+        try {
+          const voice = await connectElevenLabsLive({
+            systemInstruction: buildInterviewerPrompt(session, DEFAULT_QUESTION_COUNT, 'elevenlabs'),
+            vocabulary: buildTranscriptionVocabulary(session),
+            callbacks,
+          });
+          if (stopped) {
+            voice.close();
+            return;
+          }
+          geminiSession = voice;
+          return;
+        } catch (e: any) {
+          onElevenLabs = false;
+          useElevenLabs = false;
+          if (!ai) throw e;
+          console.warn(`[ElevenLabs] ${e?.message || e}; using Gemini Live for this call.`);
+        }
+      }
+      if (!ai) throw new Error('GEMINI_API_KEY not configured');
       const config = buildLiveConfig();
       let connected: any;
       // Fastest model first, then the backups (see LIVE_MODELS in interviewer-agent.ts).
@@ -8489,24 +8660,26 @@ async function startServer() {
           const audio = msg.realtimeInput.audio || msg.realtimeInput.mediaChunks?.[0];
           if (!audio?.data || typeof audio.data !== 'string') return;
           if (audio.data.length <= 64_000) {
-            recorder.addFrame(
-              Buffer.from(audio.data, 'base64'),
-              currentQuestionNumber > 0 ? currentQuestionNumber - 1 : undefined
-            );
+            const pcm = Buffer.from(audio.data, 'base64');
+            recorder.addFrame(pcm, currentQuestionNumber > 0 ? currentQuestionNumber - 1 : undefined);
+            noteCandidateAudio(pcm);
           }
           await geminiSession.sendRealtimeInput({
             audio: { data: audio.data, mimeType: 'audio/pcm;rate=16000' },
           });
         } else if (msg?.type === 'timer_expired') {
-          if (endingReason) return;
+          if (endingReason || mainQuestionsFinished) return;
           const expired = Number(msg.currentQuestionIndex) + 1;
           // Ignore stale or repeated timer messages.
           if (expired !== currentQuestionNumber || expired === lastExpiredQuestion) return;
           lastExpiredQuestion = expired;
+          // A candidate who is still answering is never cut off: the note only takes effect
+          // when they finish (turnComplete=false lets Gemini read it at its next turn).
+          const stillTalking = candidateIsSpeaking();
           if (expired < totalQuestions) {
-            await sendSystemNote(LIVE_NOTES.questionTimeUp(expired + 1), true);
+            await sendSystemNote(LIVE_NOTES.questionTimeUp(expired + 1, stillTalking), !stillTalking);
           } else {
-            await sendSystemNote(LIVE_NOTES.lastQuestionTimeUp(secondsLeft() > 75), true);
+            await sendSystemNote(LIVE_NOTES.lastQuestionTimeUp(secondsLeft() > 75, stillTalking), !stillTalking);
           }
         } else if (msg?.type === 'request_rephrase') {
           if (endingReason || currentQuestionNumber < 1) return;
